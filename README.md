@@ -1,4 +1,4 @@
-# ChatGPT Desktop Web Wrapper
+# ChatGPT Web Desktop
 
 Use ChatGPT Web as a desktop app, so you can choose advanced/high thinking controls when the native app does not expose them.
 
