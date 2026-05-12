@@ -20,11 +20,10 @@ swift/
   Native macOS AppKit + WKWebView implementation.
 
 tauri/
-  Rust + Tauri v2 implementation. Tested on macOS; intended to be a path toward
-  Windows and Linux support, but those platforms still need dedicated verification.
+  Rust + Tauri v2 cross-platform desktop implementation.
 ```
 
-The Swift version is macOS-only by design. The Tauri version is the better base for cross-platform work, but this repository currently treats macOS as the verified platform.
+The Swift version is a native macOS implementation. The Tauri version is the cross-platform implementation for desktop builds across macOS, Windows, and Linux.
 
 ## Privacy
 
@@ -53,9 +52,9 @@ npm run build:signed-dmg
 
 ## Status
 
-- macOS Swift wrapper: source included, native AppKit/WKWebView path.
-- macOS Tauri wrapper: source included, Rust/Tauri v2 path.
-- Windows/Linux Tauri builds: not yet verified in this repository.
+- Swift wrapper: native macOS AppKit/WKWebView path.
+- Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
+- Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.
 
 ## Disclaimer
 

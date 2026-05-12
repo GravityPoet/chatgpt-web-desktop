@@ -1,12 +1,12 @@
 # ChatGPT Tauri
 
-这是一个定制 Rust/Tauri v2 实测版，用来验证 `chatgpt.com` 在 macOS `WKWebView` 里的真实体验。
+这是一个定制 Rust/Tauri v2 桌面版，用来把 `chatgpt.com` 封装成独立桌面应用。
 
 它和 Chrome Launcher 版不同：
 
 ```text
 Chrome Launcher: Rust 启动器 + 本机 Google Chrome，网页兼容最稳，但 Dock 图标显示 Chrome。
-Tauri 版: Rust + Tauri + 系统 WebView，Dock 图标正常，是真正独立 App。macOS 已实测；Windows/Linux 是合理目标，但需要单独验证。
+Tauri 版: Rust + Tauri + 系统 WebView，Dock 图标正常，是真正独立 App，并保留 Tauri 面向 macOS、Windows 和 Linux 的跨平台路线。
 ```
 
 ## 目标
@@ -24,9 +24,9 @@ Tauri 版: Rust + Tauri + 系统 WebView，Dock 图标正常，是真正独立 A
 - 生成 macOS `.app` 和 `.dmg`。
 - 实测登录、登录态、上传、语音、下载和外链。
 
-## 跨平台状态
+## 跨平台路线
 
-Tauri 本身支持 Windows、Linux 和 macOS，但本项目当前只完成了 macOS 路径的真实打包和使用验证。Windows/Linux 后续需要补齐平台打包、权限、系统浏览器打开行为和 WebView 兼容性测试。
+Tauri 本身面向 macOS、Windows 和 Linux 桌面应用。本项目保留通用 Rust/Tauri 结构，并把外部链接打开逻辑按平台分支处理；macOS app/DMG 打包脚本放在 `packaging/`，其他桌面平台可沿用标准 Tauri build flow。
 
 ## 构建
 
