@@ -1,0 +1,17 @@
+{
+  "name": "chatgpt-rust",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A custom Rust/Tauri v2 macOS wrapper for ChatGPT.",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build --bundles app,dmg",
+    "build:signed-dmg": "./packaging/make-signed-dmg.sh",
+    "build:app": "tauri build --bundles app",
+    "build:dmg": "tauri build --bundles dmg"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.1"
+  }
+}

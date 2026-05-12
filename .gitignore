@@ -1,0 +1,33 @@
+.DS_Store
+*.log
+*.tmp
+
+# Local secrets and browser/session exports
+.env
+.env.*
+*.local
+*.pem
+*.p12
+*.mobileprovision
+*cookie*
+*cookies*
+*session*
+*token*
+*secret*
+
+# Build outputs and generated desktop bundles
+dist/
+build/
+*.dmg
+*.app/
+
+# Swift
+swift/.build/
+swift/.swiftpm/
+swift/dist/
+
+# Node / Tauri / Rust
+tauri/node_modules/
+tauri/dist/
+tauri/backups/
+tauri/src-tauri/target/

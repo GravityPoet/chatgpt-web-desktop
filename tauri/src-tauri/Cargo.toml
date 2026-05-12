@@ -1,0 +1,23 @@
+[package]
+name = "chatgpt-rust"
+version = "0.1.0"
+description = "Custom ChatGPT Rust wrapper for macOS using Tauri."
+authors = ["moonlitpoet"]
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "chatgpt_tauri_web_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "chatgpt-rust"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+tauri-plugin-window-state = "2"

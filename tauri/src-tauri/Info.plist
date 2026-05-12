@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>ChatGPT may request camera access for vision or WebRTC features.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>ChatGPT may request microphone access for voice conversations.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>ChatGPT may save downloaded files to your Downloads folder.</string>
+</dict>
+</plist>
+
