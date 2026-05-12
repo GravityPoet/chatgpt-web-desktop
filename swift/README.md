@@ -1,6 +1,6 @@
 # ChatGPT Swift
 
-原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，用来和 Tauri/Rust 版并排对比。
+原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，用来在桌面窗口里保留 ChatGPT Web 的模型选择器和进阶 / high 思考强度控制，并和 Tauri/Rust 版并排对比。
 
 ## 特点
 

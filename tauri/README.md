@@ -2,6 +2,8 @@
 
 这是一个定制 Rust/Tauri v2 桌面版，用来把 `chatgpt.com` 封装成独立桌面应用。
 
+核心价值：保留 ChatGPT Web 上的模型选择器和进阶 / high 思考强度控制，同时提供独立桌面窗口、独立 WebView 登录态、下载、缩放、单实例等桌面体验。它不绕过 ChatGPT 订阅、额度或账号权限，只是让你在桌面 App 里直接使用网页版能力。
+
 它和 Chrome Launcher 版不同：
 
 ```text
