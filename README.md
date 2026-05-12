@@ -17,6 +17,26 @@ It does not bypass ChatGPT subscriptions, usage limits, or account permissions. 
 - Handles external links through the system browser.
 - Adds desktop conveniences such as window restore, single-instance behavior, zoom shortcuts, and download handling.
 
+## Why Use This
+
+Use it when ChatGPT is part of your daily workflow and a normal browser tab is not enough.
+
+- You want access to ChatGPT Web's newest controls without waiting for a native desktop client to match them.
+- You want to choose advanced/high thinking for hard work instead of staying in a faster, lighter default mode.
+- You want a focused ChatGPT workspace that does not get buried among browser tabs.
+- You want a separate WebView profile, useful for keeping ChatGPT login state isolated from your main browser.
+- You want ChatGPT to feel like a real desktop app: Dock/taskbar presence, restored window position, zoom shortcuts, single-instance behavior, and predictable external-link handling.
+- You want a lightweight open-source wrapper that does not proxy your traffic, collect your credentials, or replace the official ChatGPT web app.
+- You want both a native macOS reference implementation and a Tauri/Rust implementation that can serve as a cross-platform base.
+
+## Good For
+
+- Developers who want stronger reasoning for debugging, architecture review, refactors, and code generation.
+- Writers and researchers who want longer, more careful answers without leaving a desktop workspace.
+- Power users who rely on ChatGPT Web features but prefer app-like window management.
+- People who use multiple browsers or accounts and want a clean, isolated ChatGPT surface.
+- Builders who want a small reference project for wrapping a complex web app with Swift/WKWebView or Tauri.
+
 ## Implementations
 
 ```text
