@@ -1,0 +1,65 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ChatGPT Rust",
+  "version": "0.1.0",
+  "identifier": "local.chatgpt-rust.tauri",
+  "mainBinaryName": "chatgpt-rust",
+  "build": {
+    "beforeDevCommand": "",
+    "beforeBuildCommand": "",
+    "frontendDist": "https://chatgpt.com/"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": ["main-capability"]
+    },
+    "windows": [
+      {
+        "label": "main",
+        "create": false,
+        "title": "ChatGPT Rust",
+        "url": "https://chatgpt.com/",
+        "width": 1280,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "maximizable": true,
+        "minimizable": true,
+        "closable": true,
+        "focus": true,
+        "decorations": true,
+        "devtools": true,
+        "dragDropEnabled": true,
+        "incognito": false
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": ["icons/icon.icns"],
+    "category": "Productivity",
+    "shortDescription": "ChatGPT Rust",
+    "longDescription": "A custom Rust/Tauri wrapper for ChatGPT.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "dmg": {
+        "windowSize": {
+          "width": 660,
+          "height": 400
+        },
+        "appPosition": {
+          "x": 180,
+          "y": 170
+        },
+        "applicationFolderPosition": {
+          "x": 480,
+          "y": 170
+        }
+      }
+    }
+  }
+}
