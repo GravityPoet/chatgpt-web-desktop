@@ -1,12 +1,16 @@
 # ChatGPT Desktop Web Wrapper
 
-Unofficial desktop wrappers for the ChatGPT web experience.
+Use ChatGPT Web as a desktop app, including the web UI's advanced/high thinking controls.
 
-This project is for people who prefer the ChatGPT web UI but still want a desktop-style app window. A common reason is that the web UI may expose controls earlier or more completely than a native desktop client, such as higher or advanced reasoning controls, while keeping normal browser features like login, file upload, voice permissions, downloads, and external-link handling.
+This project exists for one specific pain point: ChatGPT Web can expose richer reasoning controls than a native desktop client in some setups, including advanced thinking-time / high-effort modes. This wrapper keeps the full web experience available inside a dedicated desktop window, so you can choose the stronger reasoning mode when a task needs more compute and a smarter answer.
+
+It does not bypass ChatGPT subscriptions, usage limits, or account permissions. It simply wraps the official ChatGPT web app in a desktop shell, using your own ChatGPT account.
 
 ## What This Solves
 
-- Keeps the full ChatGPT web surface in a desktop shell.
+- Keeps ChatGPT Web's model picker and advanced/high thinking controls in a desktop app.
+- Lets you use deeper reasoning for coding, analysis, writing, planning, research, and other high-stakes tasks.
+- Avoids losing web-only controls just because you prefer a desktop-window workflow.
 - Uses a dedicated app window instead of a normal browser tab.
 - Keeps its WebView storage separate from Chrome, Safari, and other wrappers.
 - Preserves login/OAuth flows inside the app when possible.
