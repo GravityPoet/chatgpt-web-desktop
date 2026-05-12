@@ -86,4 +86,4 @@ npm run build:signed-dmg
 
 ## Disclaimer
 
-This is an unofficial project and is not affiliated with, endorsed by, or sponsored by OpenAI. ChatGPT, OpenAI, and related marks belong to OpenAI. Do not use OpenAI logos or branding in a way that implies endorsement.
+This is an unofficial project and is not affiliated with, endorsed by, or sponsored by OpenAI. ChatGPT, OpenAI, and related marks belong to OpenAI. References to ChatGPT and OpenAI are used only to describe compatibility with the official ChatGPT web app.
