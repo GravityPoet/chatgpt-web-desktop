@@ -31,7 +31,7 @@
         "closable": true,
         "focus": true,
         "decorations": true,
-        "devtools": true,
+        "devtools": false,
         "dragDropEnabled": true,
         "incognito": false
       }

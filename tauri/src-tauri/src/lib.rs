@@ -25,9 +25,12 @@ const MAX_WEBVIEW_ZOOM: f64 = 1.40;
 #[tauri::command]
 fn save_blob_download(
     app: AppHandle<Wry>,
+    window: WebviewWindow<Wry>,
     filename: String,
     bytes: Vec<u8>,
 ) -> Result<String, String> {
+    ensure_trusted_command_window(&window)?;
+
     if bytes.is_empty() {
         return Err("download payload is empty".to_string());
     }
@@ -49,6 +52,8 @@ fn save_blob_download(
 
 #[tauri::command]
 fn set_native_webview_zoom(window: WebviewWindow<Wry>, scale: f64) -> Result<f64, String> {
+    ensure_trusted_command_window(&window)?;
+
     let clamped = scale.clamp(MIN_WEBVIEW_ZOOM, MAX_WEBVIEW_ZOOM);
     window
         .set_zoom(clamped)
@@ -185,8 +190,14 @@ fn handle_navigation(app: &AppHandle<Wry>, url: &Url) -> bool {
 
 fn should_stay_inside_app(url: &Url) -> bool {
     match url.scheme() {
-        "http" | "https" => {}
+        "https" => {}
         "about" | "blob" | "data" => return true,
+        "http" => {
+            let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
+                return false;
+            };
+            return host == "localhost" || host == "127.0.0.1";
+        }
         _ => return false,
     }
 
@@ -198,7 +209,7 @@ fn should_stay_inside_app(url: &Url) -> bool {
         return true;
     }
 
-    host == "localhost" || host == "127.0.0.1"
+    false
 }
 
 fn is_chatgpt_host(host: &str) -> bool {
@@ -232,12 +243,39 @@ fn is_oauth_host(host: &str, path: &str) -> bool {
     }
 
     let path = path.to_ascii_lowercase();
-    path.contains("oauth")
-        || path.contains("auth")
-        || path.contains("authorize")
-        || path.contains("login")
-        || path.contains("signin")
-        || path == "/"
+    let oauth_like_markers = [
+        "oauth",
+        "auth",
+        "authorize",
+        "login",
+        "signin",
+        "account",
+    ];
+
+    oauth_like_markers
+        .iter()
+        .any(|marker| path.contains(marker))
+}
+
+fn ensure_trusted_command_window(window: &WebviewWindow<Wry>) -> Result<(), String> {
+    let url = window
+        .url()
+        .map_err(|error| format!("failed to read webview URL: {error}"))?;
+    if is_trusted_command_url(&url) {
+        Ok(())
+    } else {
+        Err("native bridge is only available on ChatGPT pages".to_string())
+    }
+}
+
+fn is_trusted_command_url(url: &Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+
+    url.host_str()
+        .map(|host| is_chatgpt_host(&host.to_ascii_lowercase()))
+        .unwrap_or(false)
 }
 
 fn handle_download_event(app: &AppHandle<Wry>, event: DownloadEvent<'_>) -> bool {
@@ -403,6 +441,7 @@ mod tests {
             "https://accounts.google.com/o/oauth2/v2/auth",
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             "https://appleid.apple.com/auth/authorize",
+            "https://github.com/login/oauth/authorize",
         ];
 
         for url in urls {
@@ -416,6 +455,8 @@ mod tests {
         let urls = [
             "https://example.com/",
             "https://help.openai.com/",
+            "http://chatgpt.com/",
+            "https://github.com/",
             "https://github.com/tw93/Pake",
         ];
 
@@ -430,5 +471,16 @@ mod tests {
         assert_eq!(sanitize_filename("../a:b\\c.txt"), "_a_b_c.txt");
         assert_eq!(sanitize_filename("..."), "chatgpt-download");
         assert_eq!(sanitize_filename(" report.csv "), "report.csv");
+    }
+
+    #[test]
+    fn native_bridge_is_limited_to_chatgpt_pages() {
+        let trusted = Url::parse("https://chatgpt.com/c/123").expect("test URL should parse");
+        let auth_page = Url::parse("https://accounts.google.com/o/oauth2/v2/auth").expect("test URL should parse");
+        let external = Url::parse("https://example.com/").expect("test URL should parse");
+
+        assert!(is_trusted_command_url(&trusted));
+        assert!(!is_trusted_command_url(&auth_page));
+        assert!(!is_trusted_command_url(&external));
     }
 }

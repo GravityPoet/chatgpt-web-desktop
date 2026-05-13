@@ -1,7 +1,32 @@
 (function () {
-  const marker = "__CHATGPT_TAURI_WEB_PATCHED__";
+  const marker = "__WK_TAURI_WEB_PATCHED__";
   if (window[marker]) return;
-  window[marker] = true;
+  try {
+    Object.defineProperty(window, marker, {
+      value: true,
+      configurable: false,
+      writable: false,
+    });
+  } catch (_) {
+    window[marker] = true;
+  }
+
+  function isTrustedPage() {
+    try {
+      const host = window.location.hostname.toLowerCase();
+      return (
+        window.location.protocol === "https:" &&
+        (host === "chatgpt.com" ||
+          host.endsWith(".chatgpt.com") ||
+          host === "chat.openai.com" ||
+          host.endsWith(".chat.openai.com"))
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
+  if (!isTrustedPage()) return;
 
   const maxBlobDownloadBytes = 200 * 1024 * 1024;
   const zoomStorageKey = "chatgptWebviewZoom";
@@ -41,7 +66,7 @@
 
     if (!buffer || buffer.byteLength === 0) return false;
     if (buffer.byteLength > maxBlobDownloadBytes) {
-      console.error("ChatGPT Rust download is too large for IPC bridge");
+      console.error("WebView download is too large for IPC bridge");
       return false;
     }
 
@@ -67,7 +92,7 @@
       const buffer = await specialUrlToBuffer(url);
       return await saveBytes(filename, buffer);
     } catch (error) {
-      console.error("ChatGPT Rust special download failed", error);
+      console.error("WebView special download failed", error);
       return false;
     }
   }
@@ -135,7 +160,7 @@
       window.localStorage.setItem(zoomStorageKey, String(clamped));
       return clamped;
     } catch (error) {
-      console.error("ChatGPT Rust native zoom failed", error);
+      console.error("WebView native zoom failed", error);
       return scale;
     }
   }

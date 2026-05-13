@@ -12,17 +12,20 @@ private let minimumWebZoom: CGFloat = 0.85
 private let maximumWebZoom: CGFloat = 1.40
 private let webZoomStep: CGFloat = 0.05
 private let maximumCookieImportBytes = 2 * 1024 * 1024
+private let maximumBridgeDownloadBytes = 200 * 1024 * 1024
+private let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
 private let cookieImportErrorDomain = "ChatGPTSwiftWeb.CookieImport"
 private let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"
 private let currentProfileDefaultsKey = "ChatGPTSwiftWeb.CurrentProfileID"
 private let defaultProfileID = "default"
 private let profileHomepageDefaultsPrefix = "ChatGPTSwiftWeb.ProfileHomepage."
 private let profileFingerprintDefaultsPrefix = "ChatGPTSwiftWeb.ProfileFingerprint."
+private let profileFingerprintDisabledDefaultsPrefix = "ChatGPTSwiftWeb.ProfileFingerprintDisabled."
 private let profileEnhancedPrivacyDefaultsPrefix = "ChatGPTSwiftWeb.ProfileEnhancedPrivacy."
 private let webRTCProtectionDefaultsKey = "ChatGPTSwiftWeb.WebRTCProtectionEnabled"
 private var singleInstanceLockFileDescriptor: CInt = -1
 
-final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     private var mainController: BrowserWindowController?
     private var incognitoControllers: [BrowserWindowController] = []
     private var keyMonitor: Any?
@@ -34,6 +37,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buildMenu()
         installKeyboardZoomShortcuts()
         let needsIsolationFallbackNotice = reconcileProfileIsolationOnLaunch()
+        ProfileStore.ensurePrivacyBaseline()
 
         let profile = ProfileStore.currentProfile()
         let controller = BrowserWindowController(
@@ -114,7 +118,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         importCookiesItem.target = self
         let exportCookiesItem = fileMenu.addItem(withTitle: "导出 Cookies...", action: #selector(exportCookiesMenu(_:)), keyEquivalent: "")
         exportCookiesItem.target = self
-        let clearWebsiteDataItem = fileMenu.addItem(withTitle: "清空当前账号空间网站数据...", action: #selector(clearChatGPTWebsiteData(_:)), keyEquivalent: "")
+        let clearWebsiteDataItem = fileMenu.addItem(withTitle: "焚烧当前空间...", action: #selector(burnCurrentProfileData(_:)), keyEquivalent: "")
         clearWebsiteDataItem.target = self
         fileMenu.addItem(NSMenuItem.separator())
         let goToURLItem = fileMenu.addItem(withTitle: "前往网址...", action: #selector(goToURLAction(_:)), keyEquivalent: "l")
@@ -148,6 +152,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "视图")
+        let backItem = viewMenu.addItem(withTitle: "后退", action: #selector(goBackAction(_:)), keyEquivalent: "[")
+        backItem.target = self
+        let forwardItem = viewMenu.addItem(withTitle: "前进", action: #selector(goForwardAction(_:)), keyEquivalent: "]")
+        forwardItem.target = self
+        let homeItem = viewMenu.addItem(withTitle: "回到首页", action: #selector(goHomeAction(_:)), keyEquivalent: "h")
+        homeItem.keyEquivalentModifierMask = [.command, .shift]
+        homeItem.target = self
+        viewMenu.addItem(NSMenuItem.separator())
         viewMenu.addItem(withTitle: "重新加载", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
         viewMenu.addItem(NSMenuItem.separator())
         viewMenu.addItem(withTitle: "放大", action: #selector(BrowserWindowController.zoomIn(_:)), keyEquivalent: "=")
@@ -183,15 +195,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func installKeyboardZoomShortcuts() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            guard Self.isCommandOnlyShortcut(event) else {
-                return event
-            }
-
             guard let controller = BrowserWindowController.keyWindowController() else {
                 return event
             }
 
+            if Self.isCommandShiftShortcut(event),
+               event.charactersIgnoringModifiers?.lowercased() == "h" {
+                controller.goHome(nil)
+                return nil
+            }
+
+            guard Self.isCommandOnlyShortcut(event) else {
+                return event
+            }
+
             switch event.charactersIgnoringModifiers {
+            case "[":
+                controller.goBack(nil)
+                return nil
+            case "]":
+                controller.goForward(nil)
+                return nil
             case "=", "+":
                 controller.zoomIn(nil)
                 return nil
@@ -214,6 +238,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             && !flags.contains(.option)
     }
 
+    private static func isCommandShiftShortcut(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        return flags.contains(.command)
+            && flags.contains(.shift)
+            && !flags.contains(.control)
+            && !flags.contains(.option)
+    }
+
     @objc private func importCookiesMenu(_ sender: Any?) {
         mainController?.importCookiesFromPanel()
     }
@@ -222,8 +254,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mainController?.exportCookiesViaPanel()
     }
 
-    @objc private func clearChatGPTWebsiteData(_ sender: Any?) {
-        mainController?.confirmClearWebsiteData()
+    @objc private func burnCurrentProfileData(_ sender: Any?) {
+        mainController?.confirmBurnCurrentProfileData { [weak self] in
+            guard let self else {
+                return
+            }
+            let profileID = ProfileStore.currentProfileID()
+            ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profileID)
+            self.rebuildMainController()
+            self.presentInfo("已焚烧当前空间浏览现场，并为当前空间重新随机化指纹。空间名称、首页和增强隐私设置已保留。")
+        }
     }
 
     @objc private func toggleWebRTCProtection(_ sender: Any?) {
@@ -240,9 +280,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fingerprint = ProfileStore.fingerprint(for: profile.id)
         let fingerprintText = fingerprint?.displayName ?? "默认 Safari（不混淆）"
         let enhancedPrivacyText = ProfileStore.isEnhancedPrivacyEnabled(for: profile.id) ? "开启" : "关闭"
-        let webRTCText = PrivacySettings.isWebRTCProtectionEnabled(profileID: profile.id)
-            ? (fingerprint == nil ? "开启" : "开启（当前指纹预设强制）")
-            : "关闭"
+        let webRTCText = PrivacySettings.isWebRTCProtectionEnabled() ? "开启" : "关闭"
+        let assessment = FingerprintCatalog.privacyAssessment(
+            fingerprint: fingerprint,
+            enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
+            webRTCProtectionEnabled: PrivacySettings.isWebRTCProtectionEnabled()
+        )
         let isolation: String
         if #available(macOS 14.0, *) {
             isolation = profile.id == defaultProfileID ? "默认空间使用本 App 默认 WebView 数据仓库" : "当前空间使用独立 WKWebsiteDataStore"
@@ -261,8 +304,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         GPC：JS 信号开启；主导航请求头 Sec-GPC 开启
         URL 追踪参数清理：开启，仅处理顶层导航
         Referrer 控制：开启，跨站顶层导航最多保留来源站点 origin
-        Accept-Language：仅 JS 层覆盖；HTTP Accept-Language 仍由 WKWebView / 系统决定
+        Accept-Language：JS 层覆盖；本 App 发起的顶层导航请求会带当前空间语言头，子资源仍由 WKWebView / 系统决定
         Tracker blocking：未启用
+
+        一致性评估：
+        \(assessment)
         """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "知道了")
@@ -290,6 +336,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    @objc private func goBackAction(_ sender: Any?) {
+        BrowserWindowController.keyWindowController()?.goBack(sender)
+    }
+
+    @objc private func goForwardAction(_ sender: Any?) {
+        BrowserWindowController.keyWindowController()?.goForward(sender)
+    }
+
+    @objc private func goHomeAction(_ sender: Any?) {
+        BrowserWindowController.keyWindowController()?.goHome(sender)
+    }
+
     @objc private func setProfileHomepageAction(_ sender: Any?) {
         let profile = ProfileStore.currentProfile()
         let initial = UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + profile.id) ?? ""
@@ -309,6 +367,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func resetProfileHomepageAction(_ sender: Any?) {
         let profile = ProfileStore.currentProfile()
         ProfileStore.removeHomepage(for: profile.id)
+        mainController?.goHome(sender)
     }
 
     @objc private func openIncognitoWindow(_ sender: Any?) {
@@ -344,7 +403,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let profileID = ProfileStore.currentProfileID()
         if presetID == FingerprintCatalog.offPresetID {
-            ProfileStore.setFingerprint(nil, for: profileID)
+            ProfileStore.disableFingerprint(for: profileID)
         } else if let preset = FingerprintCatalog.preset(for: presetID) {
             ProfileStore.setFingerprint(preset, for: profileID)
         }
@@ -455,15 +514,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let alert = NSAlert()
         alert.messageText = "指纹混淆能挡什么，不能挡什么"
         alert.informativeText = """
-        能挡：UA、屏幕、硬件信息、触控信息、时区这类简单 hash 拼出的设备 ID。
+        能加强：每个空间固定一套 Safari/WebKit 家族指纹，覆盖 UA、navigator、screen、Intl、触控、Canvas、WebGL、AudioContext、GPC、WebRTC 暴露面等常见 JS 层信号。
+
+        推荐做法：保持每个空间长期使用同一套指纹，只在「焚烧当前空间」后重新随机化。不要频繁切换成完全不同设备。
 
         挡不住：
         - TLS 指纹（JA3 / JA4）：WKWebView 使用系统网络栈，App 无法逐站点修改。
-        - HTTP/2 帧顺序、ClientHints 缺失：仍会暴露 WebKit 引擎特征。
-        - Canvas / WebGL / AudioContext 像素级指纹：本期不做噪声注入。
+        - HTTP/2 帧顺序和 WebKit 渲染细节：仍会暴露 Safari/WebKit 引擎特征。
+        - Worker、字体、GPU、窗口尺寸、行为模式等强风控信号：只能降低暴露，不能保证隐藏。
         - IP 地址：同一出口 IP 仍可能把不同账号关联到同一网络环境。
 
-        HTTP Accept-Language 没有公开的 WKWebView per-profile API，本期只覆盖 JS 层 navigator.language / navigator.languages。
+        所以本 App 只做「Safari-only 一致性隐私指纹」，不做 Chrome / Firefox 跨引擎伪装。
         """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "知道了")
@@ -486,6 +547,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let profile = WebProfile(id: UUID().uuidString, name: name, createdAt: Date())
             profiles.append(profile)
             ProfileStore.save(profiles)
+            ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profile.id)
+            ProfileStore.setEnhancedPrivacyEnabled(true, for: profile.id)
             ProfileStore.setCurrentProfileID(profile.id)
             self.rebuildMainController()
         }
@@ -570,6 +633,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         rebuildProfilesMenu(menu)
     }
 
+    func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
+        switch menuItem.action {
+        case #selector(goBackAction(_:)):
+            return BrowserWindowController.keyWindowController()?.canGoBack ?? false
+        case #selector(goForwardAction(_:)):
+            return BrowserWindowController.keyWindowController()?.canGoForward ?? false
+        default:
+            return true
+        }
+    }
+
     private func rebuildProfilesMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let isolationAvailable: Bool
@@ -600,7 +674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(NSMenuItem.separator())
         let setHomeItem = menu.addItem(withTitle: "设置当前空间首页…", action: #selector(setProfileHomepageAction(_:)), keyEquivalent: "")
         setHomeItem.target = self
-        let resetHomeItem = menu.addItem(withTitle: "清除当前空间首页", action: #selector(resetProfileHomepageAction(_:)), keyEquivalent: "")
+        let resetHomeItem = menu.addItem(withTitle: "恢复默认首页并打开", action: #selector(resetProfileHomepageAction(_:)), keyEquivalent: "")
         resetHomeItem.target = self
         let hasHomepage = UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + currentID) != nil
         resetHomeItem.isEnabled = hasHomepage
@@ -699,10 +773,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func updateWebRTCProtectionMenuItem() {
-        let profileID = ProfileStore.currentProfileID()
-        let forced = ProfileStore.fingerprint(for: profileID) != nil
-        webRTCProtectionItem?.title = forced ? "启用 WebRTC 防护（当前指纹强制开启）" : "启用 WebRTC 防护"
-        webRTCProtectionItem?.state = PrivacySettings.isWebRTCProtectionEnabled(profileID: profileID) ? .on : .off
+        webRTCProtectionItem?.title = "启用 WebRTC 防护"
+        webRTCProtectionItem?.state = PrivacySettings.isWebRTCProtectionEnabled() ? .on : .off
     }
 
     private func createProfileFromCurrent(named name: String, copyCookies: Bool) {
@@ -745,6 +817,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             name: profile.name,
             homepage: ProfileStore.homepageString(for: profile.id),
             fingerprint: ProfileStore.fingerprint(for: profile.id),
+            fingerprintDisabled: ProfileStore.isFingerprintDisabled(for: profile.id),
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id)
         )
 
@@ -782,7 +855,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                url.scheme?.lowercased() == "https" {
                 ProfileStore.setHomepage(url, for: profile.id)
             }
-            ProfileStore.setFingerprint(document.fingerprint, for: profile.id)
+            if let fingerprint = document.fingerprint {
+                ProfileStore.setFingerprint(fingerprint, for: profile.id)
+            } else {
+                ProfileStore.disableFingerprint(for: profile.id)
+            }
             ProfileStore.setEnhancedPrivacyEnabled(document.enhancedPrivacyEnabled, for: profile.id)
             ProfileStore.setCurrentProfileID(profile.id)
             updateWebRTCProtectionMenuItem()
@@ -919,6 +996,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private let profileID: String?
     private var closeHandler: (() -> Void)?
     private var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
+    private var isDisposing = false
 
     init(
         initialURL: URL?,
@@ -968,7 +1046,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         webView.autoresizingMask = [.width, .height]
 
         if let initialURL {
-            webView.load(Self.privacyRequest(for: initialURL, sourceURL: nil))
+            webView.load(Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID))
         }
     }
 
@@ -981,8 +1059,36 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         webView.reload()
     }
 
+    var canGoBack: Bool {
+        webView.canGoBack
+    }
+
+    var canGoForward: Bool {
+        webView.canGoForward
+    }
+
+    @objc func goBack(_ sender: Any?) {
+        guard webView.canGoBack else {
+            return
+        }
+        webView.goBack()
+    }
+
+    @objc func goForward(_ sender: Any?) {
+        guard webView.canGoForward else {
+            return
+        }
+        webView.goForward()
+    }
+
+    @objc func goHome(_ sender: Any?) {
+        let target = ProfileStore.homepageURL(for: profileID ?? ProfileStore.currentProfileID())
+        webView.stopLoading()
+        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
+    }
+
     func navigate(to url: URL) {
-        webView.load(Self.privacyRequest(for: url, sourceURL: webView.url))
+        webView.load(Self.privacyRequest(for: url, sourceURL: webView.url, profileID: profileID))
     }
 
     func currentURL() -> URL? {
@@ -990,7 +1096,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func loadFingerprintTestPage() {
-        webView.loadHTMLString(Self.fingerprintTestHTML, baseURL: nil)
+        webView.stopLoading()
+        webView.loadHTMLString(Self.fingerprintTestShellHTML, baseURL: nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            self?.renderFingerprintReport()
+        }
     }
 
     func copyCookies(toProfileID targetProfileID: String, completion: @escaping (Int) -> Void) {
@@ -1087,19 +1197,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return "cookies-\(formatter.string(from: Date())).json"
     }
 
-    func confirmClearWebsiteData() {
+    func confirmBurnCurrentProfileData(completion: @escaping () -> Void) {
         let alert = NSAlert()
-        alert.messageText = "清空当前账号空间网站数据？"
-        alert.informativeText = "这会删除当前账号空间在本 App WebView 内**所有站点**的 cookie、登录态、缓存、localStorage、IndexedDB、Service Worker 等数据，并重新加载首页。不会影响其他账号空间，也不会删除 Chrome/Safari 数据或服务器上的账号资料。\n\n注意：本操作无法阻止站点通过 IP 地址、User-Agent、设备指纹或账号信息（手机号 / 支付方式 / 恢复邮箱）将不同账号关联到同一设备。要彻底切分账号，请配合不同出口 IP（VPN / 代理）使用，或改用「新建无痕窗口」做一次性登录。"
+        alert.messageText = "焚烧当前空间？"
+        alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并重新随机化当前空间指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
         alert.alertStyle = .warning
-        alert.addButton(withTitle: "清空并重新加载")
+        alert.addButton(withTitle: "焚烧并重建")
         alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn else {
                 return
             }
 
-            self?.clearWebsiteDataAndReload()
+            self?.burnWebsiteData(completion: completion)
         }
     }
 
@@ -1117,7 +1227,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
-        if isPopup || !persistent {
+        if isDisposing || isPopup || !persistent {
             return true
         }
 
@@ -1130,6 +1240,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
         closeHandler = nil
+        isDisposing = true
         window.close()
     }
 
@@ -1184,7 +1295,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             if navigationAction.targetFrame?.isMainFrame == true,
                Self.canRewriteForPrivacy(navigationAction.request),
                Self.needsPrivacyRewrite(request: navigationAction.request, cleanedURL: cleanedURL, sourceURL: webView.url) {
-                webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: webView.url))
+                webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: webView.url, profileID: profileID))
                 decisionHandler(.cancel)
                 return
             }
@@ -1250,6 +1361,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
         guard message.name == "downloadBlob",
+              message.frameInfo.isMainFrame,
+              Self.isTrustedDownloadBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any],
               let dataURL = payload["dataURL"] as? String
         else {
@@ -1278,6 +1391,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         } catch (_) {}
         """
         webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    private func renderFingerprintReport() {
+        webView.evaluateJavaScript(Self.fingerprintTestRenderScript) { [weak self] _, error in
+            if let error {
+                let message = Self.javascriptStringLiteral(error.localizedDescription)
+                let script = "document.body.innerHTML = '<main><h1>指纹检测页</h1><p>报告脚本执行失败：' + \(message) + '</p></main>';"
+                self?.webView.evaluateJavaScript(script, completionHandler: nil)
+            }
+        }
     }
 
     private func setWebZoom(_ zoom: CGFloat) {
@@ -1358,7 +1481,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         }
     }
 
-    private func clearWebsiteDataAndReload() {
+    private func burnWebsiteData(completion: @escaping () -> Void) {
         let dataStore = webView.configuration.websiteDataStore
         let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
         let group = DispatchGroup()
@@ -1400,10 +1523,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             self.currentZoom = 1.0
             UserDefaults.standard.removeObject(forKey: webZoomDefaultsKey)
             UserDefaults.standard.synchronize()
-            self.webView.pageZoom = self.currentZoom
-            let target = ProfileStore.homepageURL(for: self.profileID ?? defaultProfileID)
-            self.webView.load(Self.privacyRequest(for: target, sourceURL: nil, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData))
-            self.presentInfo("已清空当前账号空间在本 App 内的数据，页面已恢复为空白登录态。其他账号空间不受影响。")
+            completion()
         }
     }
 
@@ -1449,6 +1569,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     private func decodeDataURL(_ dataURL: String) throws -> Data {
+        guard dataURL.utf8.count <= maximumBridgeDownloadPayloadCharacters else {
+            throw NSError(domain: "ChatGPTSwiftWeb", code: 4, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+        }
         guard let commaIndex = dataURL.firstIndex(of: ",") else {
             throw NSError(domain: "ChatGPTSwiftWeb", code: 1, userInfo: [NSLocalizedDescriptionKey: "不是有效的 data URL"])
         }
@@ -1456,8 +1579,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         let header = dataURL[..<commaIndex]
         let body = String(dataURL[dataURL.index(after: commaIndex)...])
         if header.contains(";base64") {
+            let estimatedDecodedBytes = (body.utf8.count * 3) / 4
+            guard estimatedDecodedBytes <= maximumBridgeDownloadBytes else {
+                throw NSError(domain: "ChatGPTSwiftWeb", code: 5, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+            }
             guard let data = Data(base64Encoded: body, options: [.ignoreUnknownCharacters]) else {
                 throw NSError(domain: "ChatGPTSwiftWeb", code: 2, userInfo: [NSLocalizedDescriptionKey: "Base64 数据无法解码"])
+            }
+            guard data.count <= maximumBridgeDownloadBytes else {
+                throw NSError(domain: "ChatGPTSwiftWeb", code: 6, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
             }
             return data
         }
@@ -1466,6 +1596,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
               let data = decoded.data(using: .utf8)
         else {
             throw NSError(domain: "ChatGPTSwiftWeb", code: 3, userInfo: [NSLocalizedDescriptionKey: "文本数据无法解码"])
+        }
+        guard data.count <= maximumBridgeDownloadBytes else {
+            throw NSError(domain: "ChatGPTSwiftWeb", code: 7, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
         }
         return data
     }
@@ -1490,16 +1623,27 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private func sanitizeFilename(_ filename: String) -> String {
         let cleaned = filename
             .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: "\\", with: "-")
             .replacingOccurrences(of: ":", with: "-")
+            .trimmingCharacters(in: CharacterSet.controlCharacters)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return cleaned.isEmpty ? "chatgpt-download" : cleaned
+    }
+
+    private static func javascriptStringLiteral(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return string
     }
 
     private static func makeConfiguration(messageHandler: WKScriptMessageHandler, persistent: Bool, profileID: String?) -> WKWebViewConfiguration {
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
-        userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         if let fingerprint = ProfileStore.fingerprint(for: profileID) {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -1507,7 +1651,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             let script = FingerprintCatalog.enhancedPrivacyScript(profileID: profileID, fingerprint: ProfileStore.fingerprint(for: profileID))
             userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
-        if PrivacySettings.isWebRTCProtectionEnabled(profileID: profileID) {
+        if PrivacySettings.isWebRTCProtectionEnabled() {
             userContentController.addUserScript(WKUserScript(source: webRTCBlockerScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
 
@@ -1539,6 +1683,47 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return .default()
     }
 
+    private static func isChatGPTHost(_ host: String) -> Bool {
+        host == "chatgpt.com" || host.hasSuffix(".chatgpt.com") || host == "chat.openai.com" || host.hasSuffix(".chat.openai.com")
+    }
+
+    private static func isOpenAIAuthHost(_ host: String) -> Bool {
+        host == "auth.openai.com" || host.hasSuffix(".auth.openai.com")
+            || host == "auth0.openai.com" || host.hasSuffix(".auth0.openai.com")
+            || host == "login.openai.com" || host.hasSuffix(".login.openai.com")
+    }
+
+    private static func isOAuthContinuationHost(_ host: String, path: String) -> Bool {
+        let normalizedPath = path.lowercased()
+        let oauthLikeMarkers = [
+            "oauth",
+            "auth",
+            "authorize",
+            "signin",
+            "login",
+            "account",
+        ]
+        guard oauthLikeMarkers.contains(where: { normalizedPath.contains($0) }) else {
+            return false
+        }
+
+        let oauthHosts = [
+            "accounts.google.com",
+            "appleid.apple.com",
+            "login.microsoftonline.com",
+            "login.live.com",
+            "github.com",
+        ]
+        return oauthHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
+    private static func isTrustedDownloadBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
+        guard origin.protocol == "https" else {
+            return false
+        }
+        return isChatGPTHost(origin.host.lowercased())
+    }
+
     private static func shouldOpenInsideApp(_ url: URL) -> Bool {
         guard let scheme = url.scheme?.lowercased() else {
             return false
@@ -1548,27 +1733,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             return true
         }
 
-        guard ["http", "https"].contains(scheme),
+        guard scheme == "https",
               let host = url.host?.lowercased()
         else {
             return false
         }
 
-        let internalDomains = [
-            "chatgpt.com",
-            "chat.openai.com",
-            "openai.com",
-            "auth.openai.com",
-            "auth0.openai.com",
-            "platform.openai.com",
-            "login.openai.com",
-            "accounts.google.com",
-            "appleid.apple.com",
-            "login.microsoftonline.com",
-            "github.com",
-        ]
-
-        return internalDomains.contains { host == $0 || host.hasSuffix("." + $0) }
+        return isChatGPTHost(host)
+            || isOpenAIAuthHost(host)
+            || isOAuthContinuationHost(host, path: url.path)
     }
 
     private static func canRewriteForPrivacy(_ request: URLRequest) -> Bool {
@@ -1595,16 +1768,35 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private static func privacyRequest(
         for url: URL,
         sourceURL: URL?,
+        profileID: String?,
         cachePolicy: URLRequest.CachePolicy = .useProtocolCachePolicy
     ) -> URLRequest {
         let cleanedURL = cleanTrackingParameters(from: url)
         var request = URLRequest(url: cleanedURL, cachePolicy: cachePolicy)
         request.setValue("1", forHTTPHeaderField: "Sec-GPC")
+        if let acceptLanguage = acceptLanguageHeader(for: profileID) {
+            request.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
+        }
         if shouldTrimReferrer(from: sourceURL, to: cleanedURL),
            let origin = originReferrer(from: sourceURL) {
             request.setValue(origin, forHTTPHeaderField: "Referer")
         }
         return request
+    }
+
+    private static func acceptLanguageHeader(for profileID: String?) -> String? {
+        let languages = ProfileStore.fingerprint(for: profileID)?.acceptLanguages ?? FingerprintCatalog.defaultAcceptLanguages
+        guard !languages.isEmpty else {
+            return nil
+        }
+
+        return languages.enumerated().map { index, language in
+            if index == 0 {
+                return language
+            }
+            let quality = max(0.1, 1.0 - Double(index) * 0.1)
+            return "\(language);q=\(String(format: "%.1f", quality))"
+        }.joined(separator: ",")
     }
 
     private static func shouldTrimReferrer(from sourceURL: URL?, to destinationURL: URL) -> Bool {
@@ -1740,6 +1932,273 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return clamped.integral
     }
 
+    private static let fingerprintTestShellHTML = """
+    <!doctype html>
+    <html lang="zh-CN">
+    <head>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>指纹检测页</title>
+      <style>
+        :root { color-scheme: light dark; }
+        body {
+          margin: 0;
+          padding: 28px;
+          font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+          background: #f8fafc;
+          color: #111827;
+        }
+        main { max-width: 1040px; margin: 0 auto; }
+        section { margin-top: 22px; }
+        h1 { font-size: 24px; margin: 0 0 8px; }
+        h2 { font-size: 16px; margin: 0 0 10px; }
+        p { margin: 0 0 18px; color: #4b5563; line-height: 1.5; }
+        table { width: 100%; border-collapse: collapse; border: 1px solid #d1d5db; background: #ffffff; }
+        th, td { border-bottom: 1px solid #e5e7eb; padding: 9px 10px; text-align: left; vertical-align: top; font-size: 13px; }
+        tr:last-child th, tr:last-child td { border-bottom: 0; }
+        th { width: 260px; font-weight: 650; }
+        code { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+        .ok, .risk-low { color: #15803d; }
+        .warn, .risk-medium { color: #b45309; }
+        .risk-high { color: #b91c1c; }
+        .badge { display: inline-block; min-width: 54px; padding: 2px 7px; border-radius: 999px; text-align: center; font-size: 12px; font-weight: 650; background: #eef2ff; }
+        @media (prefers-color-scheme: dark) {
+          body { background: #0f172a; color: #e5e7eb; }
+          p { color: #94a3b8; }
+          table { border-color: #334155; background: #111827; }
+          th, td { border-bottom-color: #1f2937; }
+          .ok, .risk-low { color: #86efac; }
+          .warn, .risk-medium { color: #fbbf24; }
+          .risk-high { color: #fca5a5; }
+          .badge { background: #1e293b; }
+        }
+      </style>
+    </head>
+    <body>
+      <main>
+        <h1>指纹检测页</h1>
+        <p>正在读取当前账号空间的浏览器暴露值...</p>
+        <section>
+          <h2>一致性风险</h2>
+          <table><tbody id="risk"><tr><th>状态</th><td><code>pending</code></td></tr></tbody></table>
+        </section>
+        <section>
+          <h2>原始暴露值</h2>
+          <table><tbody id="report"><tr><th>状态</th><td><code>pending</code></td></tr></tbody></table>
+        </section>
+      </main>
+    </body>
+    </html>
+    """
+
+    private static let fingerprintTestRenderScript = """
+    (() => {
+      try {
+      const text = (value) => {
+        if (value === undefined) return 'undefined';
+        if (value === null) return 'null';
+        if (Array.isArray(value)) return JSON.stringify(value);
+        if (typeof value === 'object') {
+          try { return JSON.stringify(value); } catch (_) { return String(value); }
+        }
+        return String(value);
+      };
+      const hashString = (value) => {
+        let hash = 2166136261;
+        const raw = String(value);
+        for (let i = 0; i < raw.length; i += 1) {
+          hash ^= raw.charCodeAt(i);
+          hash = Math.imul(hash, 16777619);
+        }
+        return (hash >>> 0).toString(16).padStart(8, '0');
+      };
+      const canvasHash = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          canvas.width = 240;
+          canvas.height = 80;
+          const ctx = canvas.getContext('2d');
+          ctx.fillStyle = '#f5f5f5';
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = '#123456';
+          ctx.font = '18px -apple-system, Arial';
+          ctx.fillText('ChatGPT Swift 指纹检测 123', 12, 32);
+          ctx.strokeStyle = '#c2410c';
+          ctx.beginPath();
+          ctx.arc(180, 42, 22, 0, Math.PI * 2);
+          ctx.stroke();
+          return hashString(canvas.toDataURL());
+        } catch (error) {
+          return 'error: ' + error.message;
+        }
+      };
+      const webglInfo = () => {
+        try {
+          const canvas = document.createElement('canvas');
+          const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+          if (!gl) return { available: false };
+          const debug = gl.getExtension('WEBGL_debug_renderer_info');
+          return {
+            available: true,
+            vendor: debug ? gl.getParameter(debug.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+            renderer: debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+            version: gl.getParameter(gl.VERSION)
+          };
+        } catch (error) {
+          return { error: error.message };
+        }
+      };
+      const audioHash = async () => {
+        try {
+          const Offline = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+          if (!Offline) return 'unavailable';
+          const ctx = new Offline(1, 4410, 44100);
+          const oscillator = ctx.createOscillator();
+          const compressor = ctx.createDynamicsCompressor();
+          oscillator.type = 'triangle';
+          oscillator.frequency.value = 10000;
+          compressor.threshold.value = -50;
+          compressor.knee.value = 40;
+          compressor.ratio.value = 12;
+          compressor.attack.value = 0;
+          compressor.release.value = 0.25;
+          oscillator.connect(compressor);
+          compressor.connect(ctx.destination);
+          oscillator.start(0);
+          const buffer = await ctx.startRendering();
+          const data = buffer.getChannelData(0);
+          let sum = 0;
+          for (let i = 0; i < data.length; i += 37) sum += Math.abs(data[i]);
+          return hashString(sum.toFixed(12));
+        } catch (error) {
+          return 'error: ' + error.message;
+        }
+      };
+      const clear = (node) => {
+        while (node.firstChild) node.removeChild(node.firstChild);
+      };
+      const appendCell = (row, tag, value, className) => {
+        const cell = document.createElement(tag);
+        if (className) cell.className = className;
+        const code = document.createElement('code');
+        code.textContent = value;
+        cell.appendChild(code);
+        row.appendChild(cell);
+      };
+      const appendRaw = (tbody, key, value) => {
+        const row = document.createElement('tr');
+        const th = document.createElement('th');
+        th.textContent = key;
+        row.appendChild(th);
+        const rendered = text(value);
+        appendCell(row, 'td', rendered, rendered === 'undefined' || rendered === 'absent' ? 'warn' : 'ok');
+        tbody.appendChild(row);
+        return row;
+      };
+      const appendRisk = (tbody, level, key, value) => {
+        const row = document.createElement('tr');
+        const cls = level === '高' ? 'risk-high' : (level === '中' ? 'risk-medium' : 'risk-low');
+        const th = document.createElement('th');
+        const badge = document.createElement('span');
+        badge.className = 'badge ' + cls;
+        badge.textContent = level;
+        th.appendChild(badge);
+        th.appendChild(document.createTextNode(' ' + key));
+        row.appendChild(th);
+        appendCell(row, 'td', text(value), cls);
+        tbody.appendChild(row);
+      };
+
+      let risk = document.getElementById('risk');
+      let report = document.getElementById('report');
+      if (!risk || !report) {
+        document.head.innerHTML = '<style>body{margin:0;padding:28px;font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue",Arial,sans-serif;background:#f8fafc;color:#111827}main{max-width:1040px;margin:0 auto}section{margin-top:22px}h1{font-size:24px;margin:0 0 8px}h2{font-size:16px;margin:0 0 10px}p{margin:0 0 18px;color:#4b5563;line-height:1.5}table{width:100%;border-collapse:collapse;border:1px solid #d1d5db;background:#fff}th,td{border-bottom:1px solid #e5e7eb;padding:9px 10px;text-align:left;vertical-align:top;font-size:13px}th{width:260px;font-weight:650}code{word-break:break-all;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.ok,.risk-low{color:#15803d}.warn,.risk-medium{color:#b45309}.risk-high{color:#b91c1c}.badge{display:inline-block;min-width:54px;padding:2px 7px;border-radius:999px;text-align:center;font-size:12px;font-weight:650;background:#eef2ff}</style>';
+        document.body.innerHTML = '<main><h1>指纹检测页</h1><p>正在读取当前账号空间的浏览器暴露值...</p><section><h2>一致性风险</h2><table><tbody id="risk"></tbody></table></section><section><h2>原始暴露值</h2><table><tbody id="report"></tbody></table></section></main>';
+        risk = document.getElementById('risk');
+        report = document.getElementById('report');
+      }
+      if (!risk || !report) throw new Error('diagnostic containers missing');
+      clear(risk);
+      clear(report);
+      const ua = navigator.userAgent || '';
+      const platform = navigator.platform || '';
+      const safariFamily = /AppleWebKit/i.test(ua) && /Safari/i.test(ua) && !/(Chrome|CriOS|Firefox|FxiOS|Edg|OPR)/i.test(ua);
+      appendRisk(risk, safariFamily ? '低' : '高', 'Safari 家族一致性', safariFamily ? 'UA 属于 Safari/WebKit 家族' : 'UA 不是纯 Safari/WebKit 家族');
+
+      let device = 'mac';
+      if (/iPhone/i.test(ua)) device = 'iphone';
+      if (/iPad/i.test(ua)) device = 'ipad';
+      const touchPoints = Number(navigator.maxTouchPoints || 0);
+      const platformOk = (device === 'mac' && platform === 'MacIntel' && touchPoints === 0)
+        || (device === 'iphone' && platform === 'iPhone' && touchPoints > 0)
+        || (device === 'ipad' && (platform === 'iPad' || platform === 'MacIntel') && touchPoints > 0);
+      appendRisk(risk, platformOk ? '低' : '高', 'UA / platform / touch', device + ', platform=' + platform + ', maxTouchPoints=' + touchPoints);
+
+      const safariOnlySignals = [];
+      if (navigator.userAgentData !== undefined) safariOnlySignals.push('userAgentData present');
+      if (navigator.deviceMemory !== undefined) safariOnlySignals.push('deviceMemory present');
+      if (navigator.connection !== undefined) safariOnlySignals.push('connection present');
+      appendRisk(risk, safariOnlySignals.length ? '中' : '低', 'Safari-only API 暴露', safariOnlySignals.length ? safariOnlySignals.join(', ') : '未发现 Chromium-only API');
+
+      const rtcBlocked = typeof RTCPeerConnection === 'undefined' && typeof webkitRTCPeerConnection === 'undefined';
+      appendRisk(risk, rtcBlocked ? '低' : '中', 'WebRTC 暴露', rtcBlocked ? '构造器不可见' : '构造器仍可见，语音可用性和隐私需要权衡');
+      appendRisk(risk, navigator.globalPrivacyControl === true ? '低' : '中', 'GPC', navigator.globalPrivacyControl === true ? 'navigator.globalPrivacyControl=true' : '未检测到 GPC JS 信号');
+      const screenMismatch = innerWidth > screen.width + 48 || innerHeight > screen.height + 140;
+      appendRisk(risk, screenMismatch ? '高' : '低', '窗口 / screen 尺寸', 'inner=' + innerWidth + 'x' + innerHeight + ', screen=' + screen.width + 'x' + screen.height + ', dpr=' + devicePixelRatio);
+      appendRisk(risk, '中', '不可控残余', 'TLS/HTTP2 SETTINGS/IP/字体/Worker/行为模式仍由系统、网络和站点侧模型决定');
+
+      appendRaw(report, 'URL', location.href);
+      appendRaw(report, 'User-Agent', navigator.userAgent);
+      appendRaw(report, 'navigator.platform', navigator.platform);
+      appendRaw(report, 'navigator.language', navigator.language);
+      appendRaw(report, 'navigator.languages', Array.from(navigator.languages || []));
+      appendRaw(report, 'navigator.hardwareConcurrency', navigator.hardwareConcurrency);
+      appendRaw(report, 'navigator.deviceMemory', navigator.deviceMemory);
+      appendRaw(report, 'navigator.maxTouchPoints', navigator.maxTouchPoints);
+      appendRaw(report, 'navigator.userAgentData', navigator.userAgentData);
+      appendRaw(report, 'plugins.length', navigator.plugins ? navigator.plugins.length : 'undefined');
+      appendRaw(report, 'mimeTypes.length', navigator.mimeTypes ? navigator.mimeTypes.length : 'undefined');
+      appendRaw(report, 'TouchEvent', 'TouchEvent' in window ? 'present' : 'absent');
+      appendRaw(report, 'screen', {
+        width: screen.width,
+        height: screen.height,
+        availWidth: screen.availWidth,
+        availHeight: screen.availHeight,
+        colorDepth: screen.colorDepth,
+        pixelDepth: screen.pixelDepth,
+        orientation: screen.orientation ? { type: screen.orientation.type, angle: screen.orientation.angle } : undefined
+      });
+      appendRaw(report, 'window size', {
+        innerWidth,
+        innerHeight,
+        outerWidth,
+        outerHeight,
+        devicePixelRatio
+      });
+      appendRaw(report, 'timezone', Intl.DateTimeFormat().resolvedOptions().timeZone);
+      appendRaw(report, 'WebRTC constructors', {
+        RTCPeerConnection: typeof RTCPeerConnection,
+        webkitRTCPeerConnection: typeof webkitRTCPeerConnection,
+        RTCIceCandidate: typeof RTCIceCandidate
+      });
+      appendRaw(report, 'mediaDevices.enumerateDevices', navigator.mediaDevices && navigator.mediaDevices.enumerateDevices ? 'present' : 'absent');
+      appendRaw(report, 'Canvas hash', canvasHash());
+      appendRaw(report, 'WebGL', webglInfo());
+      const audioRow = appendRaw(report, 'Audio hash', 'pending');
+      audioHash().then((audio) => {
+        const td = audioRow.querySelector('td code');
+        if (td) td.textContent = text(audio);
+      });
+      const description = document.querySelector('main > p');
+      if (description) {
+        description.textContent = '这个页面在当前账号空间内运行，用来检查 UA、navigator、screen、WebRTC、Canvas、WebGL 和 AudioContext 暴露值，并提示 Safari-only 隐私指纹的一致性风险。';
+      }
+      } catch (error) {
+        document.body.innerHTML = '<main><h1>指纹检测页</h1><p>报告脚本执行失败：' + String(error && (error.stack || error.message || error)) + '</p></main>';
+      }
+    })();
+    """
+
     private static let fingerprintTestHTML = """
     <!doctype html>
     <html lang="zh-CN">
@@ -1753,33 +2212,70 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
           margin: 0;
           padding: 28px;
           font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
-          background: Canvas;
-          color: CanvasText;
+          background: #f8fafc;
+          color: #111827;
         }
         main { max-width: 1040px; margin: 0 auto; }
+        section { margin-top: 22px; }
         h1 { font-size: 24px; margin: 0 0 8px; }
-        p { margin: 0 0 18px; color: color-mix(in srgb, CanvasText 72%, transparent); line-height: 1.5; }
-        table { width: 100%; border-collapse: collapse; border: 1px solid color-mix(in srgb, CanvasText 18%, transparent); }
+        h2 { font-size: 16px; margin: 0 0 10px; }
+        p { margin: 0 0 18px; color: #4b5563; line-height: 1.5; }
+        table { width: 100%; border-collapse: collapse; border: 1px solid #d1d5db; background: #ffffff; }
         th, td {
-          border-bottom: 1px solid color-mix(in srgb, CanvasText 14%, transparent);
+          border-bottom: 1px solid #e5e7eb;
           padding: 9px 10px;
           text-align: left;
           vertical-align: top;
           font-size: 13px;
         }
+        tr:last-child th, tr:last-child td { border-bottom: 0; }
         th { width: 260px; font-weight: 650; }
         code { word-break: break-all; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
         .ok { color: #15803d; }
         .warn { color: #b45309; }
+        .risk-low { color: #15803d; }
+        .risk-medium { color: #b45309; }
+        .risk-high { color: #b91c1c; }
+        .badge {
+          display: inline-block;
+          min-width: 54px;
+          padding: 2px 7px;
+          border-radius: 999px;
+          text-align: center;
+          font-size: 12px;
+          font-weight: 650;
+          background: #eef2ff;
+        }
+        @media (prefers-color-scheme: dark) {
+          body { background: #0f172a; color: #e5e7eb; }
+          p { color: #94a3b8; }
+          table { border-color: #334155; background: #111827; }
+          th, td { border-bottom-color: #1f2937; }
+          .ok { color: #86efac; }
+          .warn { color: #fbbf24; }
+          .risk-low { color: #86efac; }
+          .risk-medium { color: #fbbf24; }
+          .risk-high { color: #fca5a5; }
+          .badge { background: #1e293b; }
+        }
       </style>
     </head>
     <body>
       <main>
         <h1>指纹检测页</h1>
-        <p>这个页面在当前账号空间内运行，用来检查 UA、navigator、screen、WebRTC、Canvas、WebGL 和 AudioContext 暴露值。切换指纹预设或增强隐私模式后重新打开即可对比。</p>
-        <table>
-          <tbody id="report"></tbody>
-        </table>
+        <p>这个页面在当前账号空间内运行，用来检查 UA、navigator、screen、WebRTC、Canvas、WebGL 和 AudioContext 暴露值，并提示 Safari-only 隐私指纹的一致性风险。</p>
+        <section>
+          <h2>一致性风险</h2>
+          <table>
+            <tbody id="risk"></tbody>
+          </table>
+        </section>
+        <section>
+          <h2>原始暴露值</h2>
+          <table>
+            <tbody id="report"></tbody>
+          </table>
+        </section>
       </main>
       <script>
         const text = (value) => {
@@ -1863,7 +2359,51 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
           }
         };
         const rows = [];
+        const riskRows = [];
         const add = (key, value) => rows.push([key, text(value)]);
+        const addRisk = (level, key, value) => riskRows.push([level, key, text(value)]);
+        const escapeHTML = (value) => value.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+        const render = () => {
+          document.getElementById('risk').innerHTML = riskRows.map(([level, key, value]) => {
+            const cls = level === '高' ? 'risk-high' : (level === '中' ? 'risk-medium' : 'risk-low');
+            return `<tr><th><span class="badge ${cls}">${escapeHTML(level)}</span> ${escapeHTML(key)}</th><td class="${cls}"><code>${escapeHTML(value)}</code></td></tr>`;
+          }).join('');
+          document.getElementById('report').innerHTML = rows.map(([key, value]) => {
+            const cls = value === 'undefined' || value === 'absent' ? 'warn' : 'ok';
+            return `<tr><th>${escapeHTML(key)}</th><td class="${cls}"><code>${escapeHTML(value)}</code></td></tr>`;
+          }).join('');
+        };
+        const buildRiskReport = () => {
+          const ua = navigator.userAgent || '';
+          const platform = navigator.platform || '';
+          const safariFamily = /AppleWebKit/i.test(ua) && /Safari/i.test(ua) && !/(Chrome|CriOS|Firefox|FxiOS|Edg|OPR)/i.test(ua);
+          addRisk(safariFamily ? '低' : '高', 'Safari 家族一致性', safariFamily ? 'UA 属于 Safari/WebKit 家族' : 'UA 不是纯 Safari/WebKit 家族');
+
+          let device = 'mac';
+          if (/iPhone/i.test(ua)) device = 'iphone';
+          if (/iPad/i.test(ua)) device = 'ipad';
+          const touchPoints = Number(navigator.maxTouchPoints || 0);
+          const platformOk = (device === 'mac' && platform === 'MacIntel' && touchPoints === 0)
+            || (device === 'iphone' && platform === 'iPhone' && touchPoints > 0)
+            || (device === 'ipad' && (platform === 'iPad' || platform === 'MacIntel') && touchPoints > 0);
+          addRisk(platformOk ? '低' : '高', 'UA / platform / touch', `${device}, platform=${platform}, maxTouchPoints=${touchPoints}`);
+
+          const safariOnlySignals = [];
+          if (navigator.userAgentData !== undefined) safariOnlySignals.push('userAgentData present');
+          if (navigator.deviceMemory !== undefined) safariOnlySignals.push('deviceMemory present');
+          if (navigator.connection !== undefined) safariOnlySignals.push('connection present');
+          addRisk(safariOnlySignals.length ? '中' : '低', 'Safari-only API 暴露', safariOnlySignals.length ? safariOnlySignals.join(', ') : '未发现 Chromium-only API');
+
+          const rtcBlocked = typeof RTCPeerConnection === 'undefined' && typeof webkitRTCPeerConnection === 'undefined';
+          addRisk(rtcBlocked ? '低' : '中', 'WebRTC 暴露', rtcBlocked ? '构造器不可见' : '构造器仍可见，语音可用性和隐私需要权衡');
+
+          addRisk(navigator.globalPrivacyControl === true ? '低' : '中', 'GPC', navigator.globalPrivacyControl === true ? 'navigator.globalPrivacyControl=true' : '未检测到 GPC JS 信号');
+
+          const screenMismatch = innerWidth > screen.width + 48 || innerHeight > screen.height + 140;
+          addRisk(screenMismatch ? '高' : '低', '窗口 / screen 尺寸', `inner=${innerWidth}x${innerHeight}, screen=${screen.width}x${screen.height}, dpr=${devicePixelRatio}`);
+
+          addRisk('中', '不可控残余', 'TLS/HTTP2 SETTINGS/IP/字体/Worker/行为模式仍由系统、网络和站点侧模型决定');
+        };
 
         add('URL', location.href);
         add('User-Agent', navigator.userAgent);
@@ -1902,13 +2442,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         add('mediaDevices.enumerateDevices', navigator.mediaDevices && navigator.mediaDevices.enumerateDevices ? 'present' : 'absent');
         add('Canvas hash', canvasHash());
         add('WebGL', webglInfo());
+        add('Audio hash', 'pending');
+        buildRiskReport();
+        render();
 
         audioHash().then((audio) => {
-          add('Audio hash', audio);
-          document.getElementById('report').innerHTML = rows.map(([key, value]) => {
-            const cls = value === 'undefined' || value === 'absent' ? 'warn' : 'ok';
-            return `<tr><th>${key}</th><td class="${cls}"><code>${value.replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))}</code></td></tr>`;
-          }).join('');
+          const target = rows.find((row) => row[0] === 'Audio hash');
+          if (target) target[1] = text(audio);
+          render();
         });
       </script>
     </body>
@@ -1917,8 +2458,23 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
     private static let downloadBridgeScript = """
     (() => {
-      if (window.__chatgptSwiftDownloadBridge) return;
-      window.__chatgptSwiftDownloadBridge = true;
+      const marker = '__wkDownloadBridge';
+      if (window[marker]) return;
+      try {
+        Object.defineProperty(window, marker, { value: true, configurable: false, writable: false });
+      } catch (_) {
+        window[marker] = true;
+      }
+
+      const maxBlobDownloadBytes = \(maximumBridgeDownloadBytes);
+      const isTrustedPage = () => {
+        try {
+          const host = location.hostname.toLowerCase();
+          return location.protocol === 'https:' && (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com' || host.endsWith('.chat.openai.com'));
+        } catch (_) {
+          return false;
+        }
+      };
 
       const blobURLs = new Map();
       const originalCreateObjectURL = URL.createObjectURL.bind(URL);
@@ -1931,6 +2487,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
       };
 
       function readBlob(blob) {
+        if (!blob || typeof blob.size !== 'number' || blob.size > maxBlobDownloadBytes) {
+          throw new Error('Blob download is too large for this bridge');
+        }
         return new Promise((resolve, reject) => {
           const reader = new FileReader();
           reader.onload = () => resolve(reader.result);
@@ -1940,7 +2499,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
       }
 
       async function resolveDataURL(href) {
-        if (href.startsWith('data:')) return href;
+        if (href.startsWith('data:')) {
+          if (href.length > maxBlobDownloadBytes * 2 + 4096) throw new Error('Data URL download is too large for this bridge');
+          return href;
+        }
         const cached = blobURLs.get(href);
         if (cached) return await readBlob(cached);
         const response = await fetch(href);
@@ -1950,6 +2512,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
       document.addEventListener('click', async (event) => {
         const target = event.target && event.target.closest ? event.target.closest('a[href]') : null;
         if (!target) return;
+        if (!isTrustedPage()) return;
 
         const href = target.href || '';
         if (!href.startsWith('blob:') && !href.startsWith('data:')) return;
@@ -1964,7 +2527,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             dataURL
           });
         } catch (error) {
-          console.error('[ChatGPT Swift] blob download bridge failed', error);
+          console.error('[WebView] blob download bridge failed', error);
         }
       }, true);
     })();
@@ -2096,6 +2659,7 @@ private struct ProfileExportDocument: Codable {
     let name: String
     let homepage: String?
     let fingerprint: FingerprintProfile?
+    let fingerprintDisabled: Bool?
     let enhancedPrivacyEnabled: Bool
 }
 
@@ -2117,18 +2681,18 @@ private struct FingerprintProfile: Codable {
 
 private enum FingerprintCatalog {
     static let offPresetID = "off"
+    static let defaultAcceptLanguages = ["zh-CN", "en-US"]
 
     private static let macSafari17UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
     private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
     private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-    private static let defaultLanguages = ["zh-CN", "en-US"]
 
     static let presets: [FingerprintProfile] = [
         FingerprintProfile(
             presetID: "mba13",
             displayName: "MacBook Air 13\" M2",
             userAgent: macSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 8,
             deviceMemory: 8,
@@ -2143,7 +2707,7 @@ private enum FingerprintCatalog {
             presetID: "mbp14",
             displayName: "MacBook Pro 14\" M3",
             userAgent: macSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 10,
             deviceMemory: 16,
@@ -2158,7 +2722,7 @@ private enum FingerprintCatalog {
             presetID: "imac5k",
             displayName: "iMac 27\" 5K",
             userAgent: macSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 10,
             deviceMemory: 32,
@@ -2173,7 +2737,7 @@ private enum FingerprintCatalog {
             presetID: "ipad13",
             displayName: "iPad Pro 12.9\"",
             userAgent: iPadSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "iPad",
             hardwareConcurrency: 8,
             deviceMemory: 8,
@@ -2188,7 +2752,7 @@ private enum FingerprintCatalog {
             presetID: "iphone15pro",
             displayName: "iPhone 15 Pro",
             userAgent: iPhoneSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "iPhone",
             hardwareConcurrency: 6,
             deviceMemory: 6,
@@ -2206,14 +2770,62 @@ private enum FingerprintCatalog {
     }
 
     static func randomProfile() -> FingerprintProfile {
-        let weightedClass = Int.random(in: 0..<10)
-        if weightedClass < 7 {
-            return randomMacProfile()
+        randomMacProfile()
+    }
+
+    static func privacyAssessment(
+        fingerprint: FingerprintProfile?,
+        enhancedPrivacyEnabled: Bool,
+        webRTCProtectionEnabled: Bool
+    ) -> String {
+        var lines: [String] = []
+        if let fingerprint {
+            lines.append("推荐基线：开启，当前空间固定为 \(fingerprint.displayName)")
+            let issues = consistencyIssues(for: fingerprint)
+            if issues.isEmpty {
+                lines.append("Safari 一致性：通过基础检查")
+            } else {
+                lines.append("Safari 一致性：需注意 " + issues.joined(separator: "；"))
+            }
+        } else {
+            lines.append("推荐基线：关闭，当前空间使用真实默认 Safari/WebKit 指纹")
         }
-        if weightedClass < 9 {
-            return randomIpadProfile()
+        lines.append("增强隐私：\(enhancedPrivacyEnabled ? "开启，Canvas/WebGL/Audio 等使用稳定扰动" : "关闭，JS 层高熵指纹暴露更多")")
+        lines.append("WebRTC：\(webRTCProtectionEnabled ? "已屏蔽构造器和设备枚举" : "关闭，可能暴露本机网络和设备枚举")")
+        lines.append("不可控残余：TLS/HTTP2/Worker/字体/GPU/IP/行为模式仍不能保证伪装成另一台真实设备")
+        return lines.joined(separator: "\n")
+    }
+
+    private static func consistencyIssues(for fingerprint: FingerprintProfile) -> [String] {
+        var issues: [String] = []
+        let ua = fingerprint.userAgent
+        let isSafariFamily = ua.contains("AppleWebKit")
+            && ua.contains("Safari")
+            && !ua.contains("Chrome")
+            && !ua.contains("Firefox")
+            && !ua.contains("Edg")
+        if !isSafariFamily {
+            issues.append("UA 不是 Safari/WebKit 家族")
         }
-        return randomIphoneProfile()
+        if ua.contains("Macintosh") && fingerprint.platform != "MacIntel" {
+            issues.append("Mac UA 与 platform 不一致")
+        }
+        if ua.contains("iPhone") && (fingerprint.platform != "iPhone" || fingerprint.maxTouchPoints == 0) {
+            issues.append("iPhone UA 与触控/platform 不一致")
+        }
+        if ua.contains("iPad") && fingerprint.maxTouchPoints == 0 {
+            issues.append("iPad UA 缺少触控能力")
+        }
+        if fingerprint.maxTouchPoints == 0 && (fingerprint.platform == "iPhone" || fingerprint.platform == "iPad") {
+            issues.append("移动 platform 缺少触控能力")
+        }
+        if fingerprint.devicePixelRatio < 1.0 || fingerprint.devicePixelRatio > 3.0 {
+            issues.append("DPR 超出常见 Safari 设备范围")
+        }
+        if fingerprint.screenWidth < 320 || fingerprint.screenHeight < 480 {
+            issues.append("屏幕尺寸过小")
+        }
+        return issues
     }
 
     static func script(for fingerprint: FingerprintProfile) -> String {
@@ -2222,15 +2834,54 @@ private enum FingerprintCatalog {
         let timezoneBlock: String
         if let timezone = fingerprint.timezone {
             timezoneBlock = """
-              const OrigDTF = Intl.DateTimeFormat;
-              const TZ = \(jsonLiteral(timezone));
-              const Override = function(loc, opts) {
-                const o = Object.assign({}, opts || {});
-                if (!o.timeZone) o.timeZone = TZ;
-                return new OrigDTF(loc, o);
-              };
-              Override.prototype = OrigDTF.prototype;
-              Intl.DateTimeFormat = Override;
+              try {
+                const OrigDTF = Intl.DateTimeFormat;
+                const TZ = \(jsonLiteral(timezone));
+                function DateTimeFormat(locales, options) {
+                  const o = Object.assign({}, options || {});
+                  if (!o.timeZone) o.timeZone = TZ;
+                  return new OrigDTF(locales, o);
+                }
+                DateTimeFormat.prototype = OrigDTF.prototype;
+                for (const k of ['supportedLocalesOf']) {
+                  if (typeof OrigDTF[k] === 'function') {
+                    DateTimeFormat[k] = OrigDTF[k].bind(OrigDTF);
+                    markFake(DateTimeFormat[k], k);
+                  }
+                }
+                markFake(DateTimeFormat, 'DateTimeFormat');
+                Intl.DateTimeFormat = DateTimeFormat;
+                const origResolved = Object.getOwnPropertyDescriptor(OrigDTF.prototype, 'resolvedOptions');
+                if (origResolved && typeof origResolved.value === 'function') {
+                  const origFn = origResolved.value;
+                  function resolvedOptions() {
+                    const r = origFn.call(this);
+                    r.timeZone = TZ;
+                    return r;
+                  }
+                  markFake(resolvedOptions, 'resolvedOptions');
+                  Object.defineProperty(OrigDTF.prototype, 'resolvedOptions', { value: resolvedOptions, writable: true, configurable: true });
+                }
+                const origGetTZO = Date.prototype.getTimezoneOffset;
+                function getTimezoneOffset() {
+                  try {
+                    const parts = new OrigDTF('en-US', { timeZone: TZ, timeZoneName: 'shortOffset' }).formatToParts(this);
+                    const tzPart = parts.find(p => p.type === 'timeZoneName');
+                    if (tzPart && tzPart.value) {
+                      const m = tzPart.value.match(/GMT([+-])(\\d+)(?::(\\d+))?/);
+                      if (m) {
+                        const sign = m[1] === '+' ? -1 : 1;
+                        const h = parseInt(m[2], 10) || 0;
+                        const mi = parseInt(m[3] || '0', 10) || 0;
+                        return sign * (h * 60 + mi);
+                      }
+                    }
+                  } catch (_) {}
+                  return origGetTZO.call(this);
+                }
+                markFake(getTimezoneOffset, 'getTimezoneOffset');
+                Date.prototype.getTimezoneOffset = getTimezoneOffset;
+              } catch (_) {}
             """
         } else {
             timezoneBlock = ""
@@ -2238,30 +2889,53 @@ private enum FingerprintCatalog {
 
         return """
         (() => {
-          if (window.__chatgptSwiftFingerprint) return;
-          window.__chatgptSwiftFingerprint = true;
+          if (window.__wkFingerprint) return;
+          try {
+            Object.defineProperty(window, '__wkFingerprint', { value: true, configurable: false, writable: false });
+          } catch (_) {}
 
-          const def = (obj, key, val) => {
-            try { Object.defineProperty(obj, key, { get: () => val, configurable: true }); } catch (_) {}
+          const markFake = window.__wkMarkNative || ((fn) => fn);
+
+          const defGetter = (obj, key, val, getterName) => {
+            try {
+              const fn = { [getterName]: function () { return val; } }[getterName];
+              markFake(fn, getterName);
+              Object.defineProperty(obj, key, { get: fn, configurable: true });
+            } catch (_) {}
           };
 
           const langs = Object.freeze(\(languagesJSON).slice ? \(languagesJSON).slice() : \(languagesJSON));
 
-          def(navigator, 'platform', \(jsonLiteral(fingerprint.platform)));
-          def(navigator, 'language', \(jsonLiteral(primaryLanguage)));
-          def(navigator, 'languages', langs);
-          def(navigator, 'hardwareConcurrency', \(fingerprint.hardwareConcurrency));
-          def(navigator, 'deviceMemory', \(fingerprint.deviceMemory));
-          def(navigator, 'maxTouchPoints', \(fingerprint.maxTouchPoints));
+          defGetter(Navigator.prototype, 'userAgent', \(jsonLiteral(fingerprint.userAgent)), 'get userAgent');
+          defGetter(Navigator.prototype, 'vendor', 'Apple Computer, Inc.', 'get vendor');
+          defGetter(Navigator.prototype, 'platform', \(jsonLiteral(fingerprint.platform)), 'get platform');
+          defGetter(Navigator.prototype, 'language', \(jsonLiteral(primaryLanguage)), 'get language');
+          defGetter(Navigator.prototype, 'languages', langs, 'get languages');
+          defGetter(Navigator.prototype, 'hardwareConcurrency', \(fingerprint.hardwareConcurrency), 'get hardwareConcurrency');
+          defGetter(Navigator.prototype, 'maxTouchPoints', \(fingerprint.maxTouchPoints), 'get maxTouchPoints');
+          try {
+            if ('webdriver' in navigator || 'webdriver' in Navigator.prototype) {
+              defGetter(Navigator.prototype, 'webdriver', undefined, 'get webdriver');
+            }
+          } catch (_) {}
+          try {
+            if ('deviceMemory' in navigator || 'deviceMemory' in Navigator.prototype) {
+              defGetter(Navigator.prototype, 'deviceMemory', undefined, 'get deviceMemory');
+            }
+          } catch (_) {}
 
-          def(screen, 'width', \(fingerprint.screenWidth));
-          def(screen, 'height', \(fingerprint.screenHeight));
-          def(screen, 'availWidth', \(fingerprint.screenWidth));
-          def(screen, 'availHeight', \(fingerprint.screenHeight));
-          def(screen, 'colorDepth', \(fingerprint.colorDepth));
-          def(screen, 'pixelDepth', \(fingerprint.colorDepth));
+          defGetter(Screen.prototype, 'width', \(fingerprint.screenWidth), 'get width');
+          defGetter(Screen.prototype, 'height', \(fingerprint.screenHeight), 'get height');
+          defGetter(Screen.prototype, 'availWidth', \(fingerprint.screenWidth), 'get availWidth');
+          defGetter(Screen.prototype, 'availHeight', \(fingerprint.screenHeight), 'get availHeight');
+          defGetter(Screen.prototype, 'colorDepth', \(fingerprint.colorDepth), 'get colorDepth');
+          defGetter(Screen.prototype, 'pixelDepth', \(fingerprint.colorDepth), 'get pixelDepth');
 
-          def(window, 'devicePixelRatio', \(fingerprint.devicePixelRatio));
+          try {
+            const dprFn = { 'get devicePixelRatio': function () { return \(fingerprint.devicePixelRatio); } }['get devicePixelRatio'];
+            markFake(dprFn, 'get devicePixelRatio');
+            Object.defineProperty(window, 'devicePixelRatio', { get: dprFn, configurable: true });
+          } catch (_) {}
 
         \(timezoneBlock)
         })();
@@ -2282,18 +2956,35 @@ private enum FingerprintCatalog {
 
         return """
         (() => {
-          if (window.__chatgptSwiftEnhancedPrivacy) return;
+          if (window.__wkEnhancedPrivacy) return;
           try {
-            Object.defineProperty(window, '__chatgptSwiftEnhancedPrivacy', { value: true, configurable: false, writable: false });
+            Object.defineProperty(window, '__wkEnhancedPrivacy', { value: true, configurable: false, writable: false });
           } catch (_) {}
 
           const seed = \(seed);
           const maxTouchPoints = \(maxTouchPoints);
-          const def = (obj, key, val) => {
-            try { Object.defineProperty(obj, key, { get: () => val, configurable: true }); } catch (_) {}
+          const markFake = window.__wkMarkNative || ((fn) => fn);
+
+          const defGetter = (obj, key, val, getterName) => {
+            try {
+              const fn = { [getterName]: function () { return val; } }[getterName];
+              markFake(fn, getterName);
+              Object.defineProperty(obj, key, { get: fn, configurable: true });
+            } catch (_) {}
           };
           const defValue = (obj, key, val) => {
             try { Object.defineProperty(obj, key, { value: val, configurable: true, writable: false }); } catch (_) {}
+          };
+          const wrap = (target, key, factory, fakeName) => {
+            try {
+              const original = target[key];
+              if (typeof original !== 'function') return null;
+              const replacement = factory(original);
+              if (typeof replacement !== 'function') return null;
+              markFake(replacement, fakeName || key);
+              target[key] = replacement;
+              return original;
+            } catch (_) { return null; }
           };
           const noise = (i) => {
             let x = (seed + Math.imul(i + 1, 374761393)) | 0;
@@ -2301,16 +2992,60 @@ private enum FingerprintCatalog {
             return ((x ^ (x >>> 16)) & 1) ? 1 : -1;
           };
 
-          def(navigator, 'userAgentData', undefined);
-
-          const emptyArray = Object.freeze([]);
-          def(navigator, 'plugins', emptyArray);
-          def(navigator, 'mimeTypes', emptyArray);
+          try {
+            if ('userAgentData' in navigator || 'userAgentData' in Navigator.prototype) {
+              defGetter(Navigator.prototype, 'userAgentData', undefined, 'get userAgentData');
+            }
+          } catch (_) {}
+          try {
+            if ('connection' in navigator || 'connection' in Navigator.prototype) {
+              defGetter(Navigator.prototype, 'connection', undefined, 'get connection');
+            }
+          } catch (_) {}
 
           if (maxTouchPoints > 0) {
             try {
-              if (!('ontouchstart' in window)) def(window, 'ontouchstart', null);
+              if (!('ontouchstart' in window)) defGetter(window, 'ontouchstart', null, 'get ontouchstart');
               if (!window.TouchEvent && window.UIEvent) defValue(window, 'TouchEvent', window.UIEvent);
+            } catch (_) {}
+            try {
+              const origMatchMedia = window.matchMedia;
+              if (typeof origMatchMedia === 'function') {
+                const touchOverrides = [
+                  { re: /\\(\\s*hover\\s*:\\s*hover\\s*\\)/i, value: false },
+                  { re: /\\(\\s*hover\\s*:\\s*none\\s*\\)/i, value: true },
+                  { re: /\\(\\s*any-hover\\s*:\\s*hover\\s*\\)/i, value: false },
+                  { re: /\\(\\s*any-hover\\s*:\\s*none\\s*\\)/i, value: true },
+                  { re: /\\(\\s*pointer\\s*:\\s*fine\\s*\\)/i, value: false },
+                  { re: /\\(\\s*pointer\\s*:\\s*coarse\\s*\\)/i, value: true },
+                  { re: /\\(\\s*pointer\\s*:\\s*none\\s*\\)/i, value: false },
+                  { re: /\\(\\s*any-pointer\\s*:\\s*fine\\s*\\)/i, value: false },
+                  { re: /\\(\\s*any-pointer\\s*:\\s*coarse\\s*\\)/i, value: true }
+                ];
+                function matchMedia(query) {
+                  const result = origMatchMedia.call(this, query);
+                  try {
+                    const q = String(query || '');
+                    for (const rule of touchOverrides) {
+                      if (rule.re.test(q)) {
+                        return Object.assign({}, result, {
+                          matches: rule.value,
+                          media: q,
+                          onchange: null,
+                          addEventListener: result.addEventListener ? result.addEventListener.bind(result) : function () {},
+                          removeEventListener: result.removeEventListener ? result.removeEventListener.bind(result) : function () {},
+                          addListener: result.addListener ? result.addListener.bind(result) : function () {},
+                          removeListener: result.removeListener ? result.removeListener.bind(result) : function () {},
+                          dispatchEvent: result.dispatchEvent ? result.dispatchEvent.bind(result) : function () { return true; }
+                        });
+                      }
+                    }
+                  } catch (_) {}
+                  return result;
+                }
+                markFake(matchMedia, 'matchMedia');
+                window.matchMedia = matchMedia;
+              }
             } catch (_) {}
           }
 
@@ -2318,33 +3053,42 @@ private enum FingerprintCatalog {
             type: \(jsonLiteral(orientationType)),
             angle: \(orientationAngle),
             onchange: null,
-            addEventListener: () => {},
-            removeEventListener: () => {},
-            dispatchEvent: () => true
+            addEventListener: function () {},
+            removeEventListener: function () {},
+            dispatchEvent: function () { return true; }
           });
-          def(screen, 'orientation', orientation);
+          markFake(orientation.addEventListener, 'addEventListener');
+          markFake(orientation.removeEventListener, 'removeEventListener');
+          markFake(orientation.dispatchEvent, 'dispatchEvent');
+          defGetter(Screen.prototype, 'orientation', orientation, 'get orientation');
 
           try {
             if (navigator.permissions && navigator.permissions.query) {
               const originalQuery = navigator.permissions.query.bind(navigator.permissions);
-              navigator.permissions.query = (descriptor) => {
+              function query(descriptor) {
                 try {
-                  return originalQuery(descriptor).catch(() => Promise.resolve({ state: 'prompt', onchange: null }));
+                  return originalQuery(descriptor).catch(function () { return Promise.resolve({ state: 'prompt', onchange: null }); });
                 } catch (_) {
                   return Promise.resolve({ state: 'prompt', onchange: null });
                 }
-              };
+              }
+              markFake(query, 'query');
+              navigator.permissions.query = query;
             }
           } catch (_) {}
 
           try {
             if (!navigator.mediaDevices) {
-              def(navigator, 'mediaDevices', {
-                enumerateDevices: () => Promise.resolve([])
-              });
+              const emptyEnumerate = function enumerateDevices() { return Promise.resolve([]); };
+              markFake(emptyEnumerate, 'enumerateDevices');
+              defGetter(Navigator.prototype, 'mediaDevices', { enumerateDevices: emptyEnumerate }, 'get mediaDevices');
             } else if (navigator.mediaDevices.enumerateDevices) {
               const originalEnumerateDevices = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-              navigator.mediaDevices.enumerateDevices = () => originalEnumerateDevices().catch(() => []);
+              const wrappedEnumerate = function enumerateDevices() {
+                return originalEnumerateDevices().catch(function () { return []; });
+              };
+              markFake(wrappedEnumerate, 'enumerateDevices');
+              navigator.mediaDevices.enumerateDevices = wrappedEnumerate;
             }
           } catch (_) {}
 
@@ -2372,81 +3116,82 @@ private enum FingerprintCatalog {
           };
           try {
             const canvas2D = window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype;
-            if (canvas2D && canvas2D.getImageData) {
-              const originalGetImageData = canvas2D.getImageData;
-              canvas2D.getImageData = function(...args) {
-                return applyCanvasNoise(originalGetImageData.apply(this, args), 7);
-              };
+            if (canvas2D) {
+              wrap(canvas2D, 'getImageData', function (original) {
+                return function getImageData() {
+                  return applyCanvasNoise(original.apply(this, arguments), 7);
+                };
+              }, 'getImageData');
             }
             if (window.HTMLCanvasElement) {
-              const originalToDataURL = HTMLCanvasElement.prototype.toDataURL;
-              if (originalToDataURL) {
-                HTMLCanvasElement.prototype.toDataURL = function(...args) {
+              wrap(HTMLCanvasElement.prototype, 'toDataURL', function (original) {
+                return function toDataURL() {
                   perturbCanvas(this);
-                  return originalToDataURL.apply(this, args);
+                  return original.apply(this, arguments);
                 };
-              }
-              const originalToBlob = HTMLCanvasElement.prototype.toBlob;
-              if (originalToBlob) {
-                HTMLCanvasElement.prototype.toBlob = function(...args) {
+              }, 'toDataURL');
+              wrap(HTMLCanvasElement.prototype, 'toBlob', function (original) {
+                return function toBlob() {
                   perturbCanvas(this);
-                  return originalToBlob.apply(this, args);
+                  return original.apply(this, arguments);
                 };
-              }
+              }, 'toBlob');
             }
           } catch (_) {}
 
           const patchWebGL = (proto) => {
             if (!proto) return;
-            try {
-              const originalGetParameter = proto.getParameter;
-              proto.getParameter = function(parameter) {
+            wrap(proto, 'getParameter', function (original) {
+              return function getParameter(parameter) {
                 if (parameter === 37445) return 'Apple Inc.';
                 if (parameter === 37446) return \(jsonLiteral(webGLRenderer));
-                return originalGetParameter.apply(this, arguments);
+                return original.apply(this, arguments);
               };
-            } catch (_) {}
-            try {
-              const originalReadPixels = proto.readPixels;
-              proto.readPixels = function(...args) {
-                const result = originalReadPixels.apply(this, args);
-                const pixels = args[6];
-                if (pixels && typeof pixels.length === 'number') {
-                  for (let i = 0; i < pixels.length; i += 101) {
-                    pixels[i] = Math.max(0, Math.min(255, pixels[i] + noise(i + 11)));
+            }, 'getParameter');
+            wrap(proto, 'readPixels', function (original) {
+              return function readPixels() {
+                const result = original.apply(this, arguments);
+                try {
+                  const pixels = arguments[6];
+                  if (pixels && typeof pixels.length === 'number') {
+                    for (let i = 0; i < pixels.length; i += 101) {
+                      pixels[i] = Math.max(0, Math.min(255, pixels[i] + noise(i + 11)));
+                    }
                   }
-                }
+                } catch (_) {}
                 return result;
               };
-            } catch (_) {}
+            }, 'readPixels');
           };
           patchWebGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
           patchWebGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
 
           try {
             if (window.AudioBuffer && AudioBuffer.prototype.getChannelData) {
-              const originalGetChannelData = AudioBuffer.prototype.getChannelData;
-              AudioBuffer.prototype.getChannelData = function(...args) {
-                const data = originalGetChannelData.apply(this, args);
-                try {
-                  for (let i = 0; i < data.length; i += 113) {
-                    data[i] += noise(i + 23) * 0.0000001;
-                  }
-                } catch (_) {}
-                return data;
-              };
+              wrap(AudioBuffer.prototype, 'getChannelData', function (original) {
+                return function getChannelData() {
+                  const data = original.apply(this, arguments);
+                  try {
+                    for (let i = 0; i < data.length; i += 113) {
+                      data[i] += noise(i + 23) * 0.0000001;
+                    }
+                  } catch (_) {}
+                  return data;
+                };
+              }, 'getChannelData');
             }
             if (window.AnalyserNode && AnalyserNode.prototype.getFloatFrequencyData) {
-              const originalGetFloatFrequencyData = AnalyserNode.prototype.getFloatFrequencyData;
-              AnalyserNode.prototype.getFloatFrequencyData = function(array) {
-                const result = originalGetFloatFrequencyData.apply(this, arguments);
-                try {
-                  for (let i = 0; i < array.length; i += 127) {
-                    array[i] += noise(i + 31) * 0.0001;
-                  }
-                } catch (_) {}
-                return result;
-              };
+              wrap(AnalyserNode.prototype, 'getFloatFrequencyData', function (original) {
+                return function getFloatFrequencyData(array) {
+                  const result = original.apply(this, arguments);
+                  try {
+                    for (let i = 0; i < array.length; i += 127) {
+                      array[i] += noise(i + 31) * 0.0001;
+                    }
+                  } catch (_) {}
+                  return result;
+                };
+              }, 'getFloatFrequencyData');
             }
           } catch (_) {}
         })();
@@ -2457,7 +3202,6 @@ private enum FingerprintCatalog {
         let cores = [4, 6, 8, 10, 12].randomElement() ?? 8
         let memory = [8, 16, 32].randomElement() ?? 16
         let screen = [
-            (1280, 800),
             (1470, 956),
             (1512, 982),
             (1920, 1080),
@@ -2467,9 +3211,9 @@ private enum FingerprintCatalog {
 
         return FingerprintProfile(
             presetID: "random-\(UUID().uuidString)",
-            displayName: "随机：MacBook Air-ish",
+            displayName: "随机：Mac Safari 稳定指纹",
             userAgent: macSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: cores,
             deviceMemory: memory,
@@ -2495,7 +3239,7 @@ private enum FingerprintCatalog {
             presetID: "random-\(UUID().uuidString)",
             displayName: "随机：iPad-ish",
             userAgent: iPadSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "iPad",
             hardwareConcurrency: cores,
             deviceMemory: memory,
@@ -2521,7 +3265,7 @@ private enum FingerprintCatalog {
             presetID: "random-\(UUID().uuidString)",
             displayName: "随机：iPhone-ish",
             userAgent: iPhoneSafari17UserAgent,
-            acceptLanguages: defaultLanguages,
+            acceptLanguages: defaultAcceptLanguages,
             platform: "iPhone",
             hardwareConcurrency: cores,
             deviceMemory: memory,
@@ -2553,6 +3297,28 @@ private enum FingerprintCatalog {
 }
 
 private enum ProfileStore {
+    static func ensurePrivacyBaseline() {
+        let profiles = loadProfiles()
+        for profile in profiles {
+            ensureFingerprintBaseline(for: profile.id)
+            let enhancedKey = profileEnhancedPrivacyDefaultsPrefix + profile.id
+            if UserDefaults.standard.object(forKey: enhancedKey) == nil {
+                UserDefaults.standard.set(true, forKey: enhancedKey)
+            }
+        }
+        UserDefaults.standard.synchronize()
+    }
+
+    private static func ensureFingerprintBaseline(for profileID: String) {
+        let fingerprintKey = profileFingerprintDefaultsPrefix + profileID
+        let disabledKey = profileFingerprintDisabledDefaultsPrefix + profileID
+        guard UserDefaults.standard.data(forKey: fingerprintKey) == nil,
+              UserDefaults.standard.object(forKey: disabledKey) == nil else {
+            return
+        }
+        setFingerprint(FingerprintCatalog.randomProfile(), for: profileID)
+    }
+
     static func loadProfiles() -> [WebProfile] {
         var profiles: [WebProfile] = []
         if let data = UserDefaults.standard.data(forKey: profilesDefaultsKey),
@@ -2627,11 +3393,7 @@ private enum ProfileStore {
 
     static func setEnhancedPrivacyEnabled(_ enabled: Bool, for profileID: String) {
         let key = profileEnhancedPrivacyDefaultsPrefix + profileID
-        if enabled {
-            UserDefaults.standard.set(true, forKey: key)
-        } else {
-            UserDefaults.standard.removeObject(forKey: key)
-        }
+        UserDefaults.standard.set(enabled, forKey: key)
         UserDefaults.standard.synchronize()
     }
 
@@ -2647,10 +3409,16 @@ private enum ProfileStore {
         return fingerprint
     }
 
+    static func isFingerprintDisabled(for profileID: String) -> Bool {
+        UserDefaults.standard.bool(forKey: profileFingerprintDisabledDefaultsPrefix + profileID)
+    }
+
     static func setFingerprint(_ fingerprint: FingerprintProfile?, for profileID: String) {
         let key = profileFingerprintDefaultsPrefix + profileID
+        let disabledKey = profileFingerprintDisabledDefaultsPrefix + profileID
         guard let fingerprint else {
             UserDefaults.standard.removeObject(forKey: key)
+            UserDefaults.standard.removeObject(forKey: disabledKey)
             UserDefaults.standard.synchronize()
             return
         }
@@ -2658,6 +3426,13 @@ private enum ProfileStore {
             return
         }
         UserDefaults.standard.set(data, forKey: key)
+        UserDefaults.standard.removeObject(forKey: disabledKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func disableFingerprint(for profileID: String) {
+        UserDefaults.standard.removeObject(forKey: profileFingerprintDefaultsPrefix + profileID)
+        UserDefaults.standard.set(true, forKey: profileFingerprintDisabledDefaultsPrefix + profileID)
         UserDefaults.standard.synchronize()
     }
 }
@@ -2670,8 +3445,8 @@ private enum PrivacySettings {
         return UserDefaults.standard.bool(forKey: webRTCProtectionDefaultsKey)
     }
 
-    static func isWebRTCProtectionEnabled(profileID: String? = ProfileStore.currentProfileID()) -> Bool {
-        isWebRTCProtectionRequested() || ProfileStore.fingerprint(for: profileID) != nil
+    static func isWebRTCProtectionEnabled() -> Bool {
+        isWebRTCProtectionRequested()
     }
 
     static func setWebRTCProtectionEnabled(_ enabled: Bool) {
@@ -2682,40 +3457,97 @@ private enum PrivacySettings {
 
 private let webRTCBlockerScript = """
 (() => {
-  if (window.__chatgptSwiftWebRTCBlocked) return;
-  try {
-    Object.defineProperty(window, '__chatgptSwiftWebRTCBlocked', { value: true, configurable: false, writable: false });
-  } catch (_) {}
-  try {
-    const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceCandidate', 'RTCSessionDescription', 'RTCDataChannel'];
-    for (const name of names) {
-      try {
-        Object.defineProperty(window, name, { value: undefined, configurable: false, writable: false });
-      } catch (_) {}
-    }
-    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-      const original = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-      navigator.mediaDevices.enumerateDevices = () => original().then(() => []);
-    }
-  } catch (_) {}
-})();
+  if (window.__wkRTCGuard) return;
+	  try {
+	    Object.defineProperty(window, '__wkRTCGuard', { value: true, configurable: false, writable: false });
+	  } catch (_) {}
+	  try {
+	    const markFake = window.__wkMarkNative || ((fn) => fn);
+	    const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceCandidate', 'RTCSessionDescription', 'RTCDataChannel'];
+	    for (const name of names) {
+	      try {
+	        Object.defineProperty(window, name, { value: undefined, configurable: false, writable: false });
+	      } catch (_) {}
+	    }
+	    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+	      const original = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+	      const enumerateDevices = function enumerateDevices() { return original().then(() => []); };
+	      markFake(enumerateDevices, 'enumerateDevices');
+	      navigator.mediaDevices.enumerateDevices = enumerateDevices;
+	    }
+	  } catch (_) {}
+	})();
 """
 
 private let privacySignalsScript = """
 (() => {
-  if (window.__chatgptSwiftPrivacySignals) return;
+  if (window.__wkPrivacySignals) return;
   try {
-    Object.defineProperty(window, '__chatgptSwiftPrivacySignals', { value: true, configurable: false, writable: false });
+    Object.defineProperty(window, '__wkPrivacySignals', { value: true, configurable: false, writable: false });
   } catch (_) {}
 
+  const markFake = window.__wkMarkNative || ((fn) => fn);
   const defineBooleanGetter = (target, key, value) => {
     try {
-      Object.defineProperty(target, key, { get: () => value, configurable: true });
+      const getterName = 'get ' + key;
+      const fn = { [getterName]: function () { return value; } }[getterName];
+      markFake(fn, getterName);
+      Object.defineProperty(target, key, { get: fn, configurable: true });
     } catch (_) {}
   };
 
   defineBooleanGetter(Navigator.prototype, 'globalPrivacyControl', true);
   defineBooleanGetter(navigator, 'globalPrivacyControl', true);
+})();
+"""
+
+private let nativeShimScript = """
+(() => {
+  if (window.__wkNativeShim) return;
+  try {
+    Object.defineProperty(window, '__wkNativeShim', { value: true, configurable: false, writable: false });
+  } catch (_) {}
+
+  const origToString = Function.prototype.toString;
+  const fakeMap = new WeakMap();
+
+  const patchedToString = function toString() {
+    try {
+      if (fakeMap.has(this)) return fakeMap.get(this);
+    } catch (_) {}
+    return origToString.call(this);
+  };
+
+  try {
+    fakeMap.set(patchedToString, 'function toString() { [native code] }');
+    fakeMap.set(origToString, 'function toString() { [native code] }');
+  } catch (_) {}
+
+  try {
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: patchedToString,
+      writable: true,
+      configurable: true
+    });
+  } catch (_) {}
+
+  const markFake = (fn, name) => {
+    try {
+      if (typeof fn === 'function' && typeof name === 'string') {
+        fakeMap.set(fn, 'function ' + name + '() { [native code] }');
+      }
+    } catch (_) {}
+    return fn;
+  };
+  markFake(markFake, 'markFake');
+
+  try {
+    Object.defineProperty(window, '__wkMarkNative', {
+      value: markFake,
+      writable: false,
+      configurable: false
+    });
+  } catch (_) {}
 })();
 """
 

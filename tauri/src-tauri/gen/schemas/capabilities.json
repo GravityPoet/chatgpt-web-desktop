@@ -1,1 +1,1 @@
-{"main-capability":{"identifier":"main-capability","description":"Minimal capability for the ChatGPT Rust window.","local":true,"windows":["main"],"permissions":["core:default"]}}
+{"main-capability":{"identifier":"main-capability","description":"Minimal capability for the ChatGPT Rust window. Custom commands enforce their own trusted-origin checks.","local":true,"windows":["main"],"permissions":[]}}
