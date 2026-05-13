@@ -1363,21 +1363,123 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         guard message.name == "downloadBlob",
               message.frameInfo.isMainFrame,
               Self.isTrustedDownloadBridgeOrigin(message.frameInfo.securityOrigin),
-              let payload = message.body as? [String: Any],
-              let dataURL = payload["dataURL"] as? String
+              let payload = message.body as? [String: Any]
         else {
             return
         }
 
-        let suggestedName = (payload["filename"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-        do {
-            let outputURL = uniqueDownloadURL(suggestedFilename: suggestedName?.isEmpty == false ? suggestedName! : "chatgpt-download")
-            let data = try decodeDataURL(dataURL)
-            try data.write(to: outputURL, options: .atomic)
-            NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-        } catch {
-            presentError("保存下载失败：\(error.localizedDescription)")
+        if (payload["action"] as? String) == "showImageMenu" {
+            showImageDownloadMenu(payload: payload)
+            return
         }
+
+        saveImageDownloadPayload(payload)
+    }
+
+    private func saveImageDownloadPayload(_ payload: [String: Any]) {
+        let suggestedName = (payload["filename"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let dataURL = payload["dataURL"] as? String {
+            do {
+                let filename = Self.imageFilename(
+                    suggestedFilename: suggestedName,
+                    fallback: "chatgpt-image",
+                    mimeType: Self.dataURLMimeType(dataURL)
+                )
+                let outputURL = uniqueDownloadURL(suggestedFilename: filename)
+                let data = try decodeDataURL(dataURL)
+                try data.write(to: outputURL, options: .atomic)
+                NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+            } catch {
+                presentError("保存下载失败：\(error.localizedDescription)")
+            }
+            return
+        }
+
+        if let rawURL = payload["url"] as? String,
+           let url = URL(string: rawURL),
+           url.scheme?.lowercased() == "https" {
+            downloadRemoteImage(from: url, suggestedFilename: suggestedName)
+            return
+        }
+
+        presentError("保存下载失败：下载桥没有收到有效图像数据。")
+    }
+
+    private func showImageDownloadMenu(payload: [String: Any]) {
+        let menu = NSMenu(title: "图像")
+        let downloadItem = NSMenuItem(title: "下载图像", action: #selector(downloadImageFromContextMenu(_:)), keyEquivalent: "")
+        downloadItem.target = self
+        downloadItem.representedObject = payload as NSDictionary
+        menu.addItem(downloadItem)
+
+        let copyItem = NSMenuItem(title: "拷贝图像", action: #selector(copyImageFromContextMenu(_:)), keyEquivalent: "")
+        copyItem.target = self
+        copyItem.representedObject = payload as NSDictionary
+        menu.addItem(copyItem)
+
+        let x = CGFloat((payload["x"] as? Double) ?? Double(webView.bounds.midX))
+        let y = CGFloat((payload["y"] as? Double) ?? Double(webView.bounds.midY))
+        let point = NSPoint(
+            x: min(max(x, 0), webView.bounds.width),
+            y: min(max(webView.bounds.height - y, 0), webView.bounds.height)
+        )
+        menu.popUp(positioning: downloadItem, at: point, in: webView)
+    }
+
+    @objc private func downloadImageFromContextMenu(_ sender: NSMenuItem) {
+        guard let payload = Self.dictionary(from: sender.representedObject) else {
+            return
+        }
+        saveImageDownloadPayload(payload)
+    }
+
+    @objc private func copyImageFromContextMenu(_ sender: NSMenuItem) {
+        guard let payload = Self.dictionary(from: sender.representedObject) else {
+            return
+        }
+        copyImagePayload(payload)
+    }
+
+    private static func dictionary(from object: Any?) -> [String: Any]? {
+        guard let dictionary = object as? NSDictionary else {
+            return nil
+        }
+        return dictionary.reduce(into: [String: Any]()) { result, entry in
+            guard let key = entry.key as? String else {
+                return
+            }
+            result[key] = entry.value
+        }
+    }
+
+    private func copyImagePayload(_ payload: [String: Any]) {
+        if let dataURL = payload["dataURL"] as? String {
+            do {
+                let data = try decodeDataURL(dataURL)
+                try copyImageDataToPasteboard(data)
+            } catch {
+                presentError("拷贝图像失败：\(error.localizedDescription)")
+            }
+            return
+        }
+
+        if let rawURL = payload["url"] as? String,
+           let url = URL(string: rawURL),
+           url.scheme?.lowercased() == "https" {
+            copyRemoteImage(from: url)
+            return
+        }
+
+        presentError("拷贝图像失败：下载桥没有收到有效图像数据。")
+    }
+
+    private func copyImageDataToPasteboard(_ data: Data) throws {
+        guard let image = NSImage(data: data) else {
+            throw NSError(domain: "ChatGPTSwiftWeb", code: 8, userInfo: [NSLocalizedDescriptionKey: "图像数据无法解码"])
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects([image])
     }
 
     private func clearInjectedZoomState() {
@@ -1478,6 +1580,142 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             }
         } catch {
             presentError("Cookie 导入失败：\(Self.safeCookieImportMessage(error))")
+        }
+    }
+
+    private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.httpShouldHandleCookies = false
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            guard let self else {
+                return
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    self.presentError("保存下载失败：\(error.localizedDescription)")
+                }
+                return
+            }
+
+            guard let data, !data.isEmpty else {
+                DispatchQueue.main.async {
+                    self.presentError("保存下载失败：图像数据为空。")
+                }
+                return
+            }
+
+            guard data.count <= maximumBridgeDownloadBytes else {
+                DispatchQueue.main.async {
+                    self.presentError("保存下载失败：图像超过 \(maximumBridgeDownloadBytes / 1024 / 1024) MB。")
+                }
+                return
+            }
+
+            let filename = Self.remoteImageFilename(
+                suggestedFilename: suggestedFilename,
+                sourceURL: url,
+                mimeType: response?.mimeType
+            )
+            let outputURL = self.uniqueDownloadURL(suggestedFilename: filename)
+
+            do {
+                try data.write(to: outputURL, options: .atomic)
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.activateFileViewerSelecting([outputURL])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.presentError("保存下载失败：\(error.localizedDescription)")
+                }
+            }
+        }.resume()
+    }
+
+    private func copyRemoteImage(from url: URL) {
+        var request = URLRequest(url: url)
+        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        request.httpShouldHandleCookies = false
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+            guard let self else {
+                return
+            }
+
+            if let error {
+                DispatchQueue.main.async {
+                    self.presentError("拷贝图像失败：\(error.localizedDescription)")
+                }
+                return
+            }
+
+            guard let data, !data.isEmpty else {
+                DispatchQueue.main.async {
+                    self.presentError("拷贝图像失败：图像数据为空。")
+                }
+                return
+            }
+
+            guard data.count <= maximumBridgeDownloadBytes else {
+                DispatchQueue.main.async {
+                    self.presentError("拷贝图像失败：图像超过 \(maximumBridgeDownloadBytes / 1024 / 1024) MB。")
+                }
+                return
+            }
+
+            do {
+                try self.copyImageDataToPasteboard(data)
+            } catch {
+                DispatchQueue.main.async {
+                    self.presentError("拷贝图像失败：\(error.localizedDescription)")
+                }
+            }
+        }.resume()
+    }
+
+    private static func remoteImageFilename(suggestedFilename: String?, sourceURL: URL, mimeType: String?) -> String {
+        imageFilename(
+            suggestedFilename: suggestedFilename,
+            fallback: sourceURL.lastPathComponent.isEmpty ? "chatgpt-image" : sourceURL.lastPathComponent,
+            mimeType: mimeType
+        )
+    }
+
+    private static func imageFilename(suggestedFilename: String?, fallback: String, mimeType: String?) -> String {
+        let rawName = suggestedFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
+        var filename = rawName?.isEmpty == false ? rawName! : fallback
+        if filename.isEmpty || filename == "/" {
+            filename = "chatgpt-image"
+        }
+
+        if URL(fileURLWithPath: filename).pathExtension.isEmpty,
+           let ext = fileExtension(forMIMEType: mimeType) {
+            filename += ".\(ext)"
+        }
+
+        return filename
+    }
+
+    private static func fileExtension(forMIMEType mimeType: String?) -> String? {
+        switch mimeType?.lowercased() {
+        case "image/png":
+            return "png"
+        case "image/jpeg", "image/jpg":
+            return "jpg"
+        case "image/webp":
+            return "webp"
+        case "image/gif":
+            return "gif"
+        case "image/svg+xml":
+            return "svg"
+        case "image/avif":
+            return "avif"
+        case "image/heic":
+            return "heic"
+        default:
+            return nil
         }
     }
 
@@ -1601,6 +1839,21 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             throw NSError(domain: "ChatGPTSwiftWeb", code: 7, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
         }
         return data
+    }
+
+    private static func dataURLMimeType(_ dataURL: String) -> String? {
+        guard let commaIndex = dataURL.firstIndex(of: ",") else {
+            return nil
+        }
+        let header = String(dataURL[..<commaIndex])
+        guard header.hasPrefix("data:") else {
+            return nil
+        }
+        let rawMimeType = header
+            .dropFirst("data:".count)
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: true)
+            .first
+        return rawMimeType.map(String.init)
     }
 
     private func uniqueDownloadURL(suggestedFilename: String) -> URL {
@@ -2508,6 +2761,71 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         const response = await fetch(href);
         return await readBlob(await response.blob());
       }
+
+      function filenameFromURL(raw, fallback) {
+        try {
+          const url = new URL(raw, location.href);
+          const last = decodeURIComponent(url.pathname.split('/').filter(Boolean).pop() || '');
+          if (last) return last;
+        } catch (_) {}
+        return fallback || 'chatgpt-image.png';
+      }
+
+      function imageTargetFromEvent(event) {
+        const path = event.composedPath ? event.composedPath() : [];
+        for (const node of path) {
+          if (!node || node === window || node === document) continue;
+          if (node instanceof HTMLImageElement || node instanceof HTMLCanvasElement) return node;
+        }
+        const target = event.target;
+        if (target && target.closest) {
+          return target.closest('img, canvas');
+        }
+        return null;
+      }
+
+      async function imagePayload(target) {
+        if (target instanceof HTMLCanvasElement) {
+          const dataURL = target.toDataURL('image/png');
+          if (dataURL.length > maxBlobDownloadBytes * 2 + 4096) throw new Error('Canvas image is too large for this bridge');
+          return { filename: 'chatgpt-canvas.png', dataURL };
+        }
+
+        const src = target.currentSrc || target.src || '';
+        if (!src) throw new Error('Image has no source URL');
+
+        const filename = target.getAttribute('download') || target.alt || filenameFromURL(src, 'chatgpt-image.png');
+        if (src.startsWith('data:') || src.startsWith('blob:')) {
+          return { filename, dataURL: await resolveDataURL(src) };
+        }
+
+        const url = new URL(src, location.href);
+        if (url.protocol !== 'https:') throw new Error('Only HTTPS images can be downloaded by URL');
+        try {
+          const response = await fetch(url.href, { credentials: 'include', cache: 'no-store' });
+          if (response.ok) {
+            return { filename, dataURL: await readBlob(await response.blob()) };
+          }
+        } catch (_) {}
+        return { filename, url: url.href };
+      }
+
+      document.addEventListener('contextmenu', (event) => {
+        if (!isTrustedPage()) return;
+        const target = imageTargetFromEvent(event);
+        if (!target) return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        imagePayload(target).then((payload) => {
+          window.webkit.messageHandlers.downloadBlob.postMessage(Object.assign({
+            action: 'showImageMenu',
+            x: event.clientX,
+            y: event.clientY
+          }, payload));
+        }).catch((error) => {
+          console.error('[WebView] image context menu failed', error);
+        });
+      }, true);
 
       document.addEventListener('click', async (event) => {
         const target = event.target && event.target.closest ? event.target.closest('a[href]') : null;
