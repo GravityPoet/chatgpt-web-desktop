@@ -10,6 +10,7 @@
 - 原生 Dock / App 图标 / 菜单
 - `WKWebView` 加载 `https://chatgpt.com/`
 - 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
+- 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
 - 显式单实例锁：重复打开会激活已有窗口，不会堆多个进程
 - `Info.plist` 已声明麦克风、摄像头、下载目录权限说明
