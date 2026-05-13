@@ -375,7 +375,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let alert = NSAlert()
         alert.messageText = "克隆当前空间"
-        alert.informativeText = "会复制空间名称、首页、指纹预设和增强隐私设置。可选择同时复制 cookies。"
+        alert.informativeText = "会复制首页和增强隐私设置，并自动为新空间生成稳定随机指纹。默认不复制 cookies，可按需勾选。"
         alert.alertStyle = .informational
         alert.addButton(withTitle: "克隆")
         alert.addButton(withTitle: "取消")
@@ -716,7 +716,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
            let url = URL(string: homepage) {
             ProfileStore.setHomepage(url, for: newProfile.id)
         }
-        ProfileStore.setFingerprint(ProfileStore.fingerprint(for: sourceID), for: newProfile.id)
+        ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: newProfile.id)
         ProfileStore.setEnhancedPrivacyEnabled(ProfileStore.isEnhancedPrivacyEnabled(for: sourceID), for: newProfile.id)
 
         let switchToNewProfile = { [weak self] in
@@ -990,7 +990,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func loadFingerprintTestPage() {
-        webView.loadHTMLString(Self.fingerprintTestHTML, baseURL: URL(string: "https://fingerprint.local/"))
+        webView.loadHTMLString(Self.fingerprintTestHTML, baseURL: nil)
     }
 
     func copyCookies(toProfileID targetProfileID: String, completion: @escaping (Int) -> Void) {
