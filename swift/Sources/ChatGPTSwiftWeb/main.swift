@@ -57,47 +57,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let appItem = NSMenuItem()
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About ChatGPT Swift", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(withTitle: "关于 ChatGPT Swift", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(withTitle: "Quit ChatGPT Swift", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenu.addItem(withTitle: "退出 ChatGPT Swift", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
 
         let fileItem = NSMenuItem()
-        let fileMenu = NSMenu(title: "File")
-        let importCookiesItem = fileMenu.addItem(withTitle: "Import ChatGPT Cookies...", action: #selector(importChatGPTCookies(_:)), keyEquivalent: "")
+        let fileMenu = NSMenu(title: "文件")
+        let importCookiesItem = fileMenu.addItem(withTitle: "导入 ChatGPT Cookies...", action: #selector(importChatGPTCookies(_:)), keyEquivalent: "")
         importCookiesItem.target = self
+        let clearWebsiteDataItem = fileMenu.addItem(withTitle: "清空 ChatGPT 网站数据...", action: #selector(clearChatGPTWebsiteData(_:)), keyEquivalent: "")
+        clearWebsiteDataItem.target = self
         fileMenu.addItem(NSMenuItem.separator())
-        fileMenu.addItem(withTitle: "Close Window", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        fileMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
         fileItem.submenu = fileMenu
         mainMenu.addItem(fileItem)
 
         let editItem = NSMenuItem()
-        let editMenu = NSMenu(title: "Edit")
-        editMenu.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
-        editMenu.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
         editMenu.addItem(NSMenuItem.separator())
-        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
-        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
         let viewItem = NSMenuItem()
-        let viewMenu = NSMenu(title: "View")
-        viewMenu.addItem(withTitle: "Reload", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
+        let viewMenu = NSMenu(title: "视图")
+        viewMenu.addItem(withTitle: "重新加载", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
         viewMenu.addItem(NSMenuItem.separator())
-        viewMenu.addItem(withTitle: "Zoom In", action: #selector(BrowserWindowController.zoomIn(_:)), keyEquivalent: "=")
-        viewMenu.addItem(withTitle: "Zoom Out", action: #selector(BrowserWindowController.zoomOut(_:)), keyEquivalent: "-")
-        viewMenu.addItem(withTitle: "Actual Size", action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
+        viewMenu.addItem(withTitle: "放大", action: #selector(BrowserWindowController.zoomIn(_:)), keyEquivalent: "=")
+        viewMenu.addItem(withTitle: "缩小", action: #selector(BrowserWindowController.zoomOut(_:)), keyEquivalent: "-")
+        viewMenu.addItem(withTitle: "实际大小", action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 
         let windowItem = NSMenuItem()
-        let windowMenu = NSMenu(title: "Window")
-        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
-        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.zoom(_:)), keyEquivalent: "")
+        let windowMenu = NSMenu(title: "窗口")
+        windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.zoom(_:)), keyEquivalent: "")
         windowItem.submenu = windowMenu
         mainMenu.addItem(windowItem)
         NSApp.windowsMenu = windowMenu
@@ -140,6 +142,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func importChatGPTCookies(_ sender: Any?) {
         mainController?.importChatGPTCookiesFromPanel()
+    }
+
+    @objc private func clearChatGPTWebsiteData(_ sender: Any?) {
+        mainController?.confirmClearWebsiteData()
     }
 }
 
@@ -217,6 +223,22 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             }
 
             self?.importChatGPTCookies(from: url)
+        }
+    }
+
+    func confirmClearWebsiteData() {
+        let alert = NSAlert()
+        alert.messageText = "清空 ChatGPT 网站数据？"
+        alert.informativeText = "这会删除本 App WebView 保存的 cookie、登录态、缓存、localStorage、IndexedDB、Service Worker 和其他网站数据，并重新加载 ChatGPT。不会删除 Chrome/Safari 数据，也不会删除你的 ChatGPT 账号数据。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "清空并重新加载")
+        alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard response == .alertFirstButtonReturn else {
+                return
+            }
+
+            self?.clearWebsiteDataAndReload()
         }
     }
 
@@ -424,6 +446,54 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             }
         } catch {
             presentError("Cookie 导入失败：\(Self.safeCookieImportMessage(error))")
+        }
+    }
+
+    private func clearWebsiteDataAndReload() {
+        let dataStore = webView.configuration.websiteDataStore
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        let group = DispatchGroup()
+
+        group.enter()
+        dataStore.removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
+            group.leave()
+        }
+
+        group.enter()
+        dataStore.httpCookieStore.getAllCookies { cookies in
+            guard !cookies.isEmpty else {
+                group.leave()
+                return
+            }
+
+            let cookieGroup = DispatchGroup()
+            for cookie in cookies {
+                cookieGroup.enter()
+                dataStore.httpCookieStore.delete(cookie) {
+                    cookieGroup.leave()
+                }
+            }
+
+            cookieGroup.notify(queue: .main) {
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            URLCache.shared.removeAllCachedResponses()
+            let children = self.childControllers
+            self.childControllers.removeAll()
+            children.forEach { $0.window.close() }
+            self.currentZoom = 1.0
+            UserDefaults.standard.removeObject(forKey: webZoomDefaultsKey)
+            UserDefaults.standard.synchronize()
+            self.webView.pageZoom = self.currentZoom
+            self.webView.load(URLRequest(url: chatGPTURL, cachePolicy: .reloadIgnoringLocalAndRemoteCacheData))
+            self.presentInfo("已清空本 App 的 ChatGPT 网站数据，页面已恢复为空白登录态。")
         }
     }
 

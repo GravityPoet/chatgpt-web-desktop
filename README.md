@@ -1,5 +1,7 @@
 # ChatGPT Web Desktop
 
+Languages: English | [简体中文](README.zh-CN.md)
+
 Use ChatGPT Web as a desktop app, so you can choose advanced/high thinking controls when the native app does not expose them.
 
 This project exists for one specific pain point: in the native ChatGPT desktop app, you may not be able to choose the higher thinking-strength mode available on ChatGPT Web. That means you can get stuck with a lighter reasoning mode when you actually want the model to spend more compute on a harder problem and produce a more accurate, more carefully reasoned answer.
@@ -58,6 +60,8 @@ The Swift version is a native macOS implementation. The Tauri version is the cro
 The repository does not include personal cookies, session data, tokens, or local browser profiles.
 
 Runtime login state is stored by the operating system WebView at runtime. The Swift app includes an optional cookie import flow for a user-selected local JSON file, but exported cookie files should never be committed or shared.
+
+The Swift app also includes a clear website data action for resetting this app's WebView cookies, login state, cache, localStorage, IndexedDB, service workers, and other local website data before reloading ChatGPT.
 
 ## Build
 
