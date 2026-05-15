@@ -1281,8 +1281,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
         let cleanedURL = Self.cleanTrackingParameters(from: url)
 
+        let sourceURL = webView.url
+
         if navigationAction.targetFrame == nil {
-            if Self.shouldOpenInsideApp(cleanedURL) {
+            if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
                 openPopup(url: cleanedURL)
             } else {
                 NSWorkspace.shared.open(cleanedURL)
@@ -1291,7 +1293,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             return
         }
 
-        if Self.shouldOpenInsideApp(cleanedURL) {
+        if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
             if navigationAction.targetFrame?.isMainFrame == true,
                Self.canRewriteForPrivacy(navigationAction.request),
                Self.needsPrivacyRewrite(request: navigationAction.request, cleanedURL: cleanedURL, sourceURL: webView.url) {
@@ -1897,6 +1899,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint = ProfileStore.fingerprint(for: profileID) {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
@@ -1946,9 +1949,35 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             || host == "login.openai.com" || host.hasSuffix(".login.openai.com")
     }
 
-    private static func isOAuthContinuationHost(_ host: String, path: String) -> Bool {
-        let normalizedPath = path.lowercased()
-        let oauthLikeMarkers = [
+    private static func isOpenAIFamilyHost(_ host: String) -> Bool {
+        host == "openai.com" || host.hasSuffix(".openai.com")
+    }
+
+    private static func isTrustedAuthSourceHost(_ host: String) -> Bool {
+        isChatGPTHost(host)
+            || isOpenAIAuthHost(host)
+            || isOpenAIFamilyHost(host)
+            || isOAuthProviderHost(host)
+    }
+
+    private static func isOAuthProviderHost(_ host: String) -> Bool {
+        host == "accounts.google.com"
+            || host.hasPrefix("accounts.google.")
+            || host == "appleid.apple.com"
+            || host == "login.microsoftonline.com"
+            || host == "login.live.com"
+            || host == "github.com"
+            || host == "facebook.com"
+            || host.hasSuffix(".facebook.com")
+            || host == "twitter.com"
+            || host == "x.com"
+    }
+
+    private static func isAuthLikeURL(_ url: URL, expanded: Bool = false) -> Bool {
+        let path = url.path.lowercased()
+        let query = url.query?.lowercased() ?? ""
+        let combined = path + "?" + query
+        var markers = [
             "oauth",
             "auth",
             "authorize",
@@ -1956,18 +1985,42 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             "login",
             "account",
         ]
-        guard oauthLikeMarkers.contains(where: { normalizedPath.contains($0) }) else {
+        if expanded {
+            markers.append(contentsOf: [
+                "callback",
+                "continue",
+                "credential",
+                "passkey",
+                "webauthn",
+                "challenge",
+                "verify",
+                "mfa",
+                "sso",
+            ])
+        }
+        return markers.contains { combined.contains($0) }
+    }
+
+    private static func isOAuthContinuationHost(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else {
+            return false
+        }
+        guard isOAuthProviderHost(host) else {
+            return false
+        }
+        return isAuthLikeURL(url)
+    }
+
+    private static func isAuthContinuationFromTrustedSource(_ url: URL, sourceURL: URL?) -> Bool {
+        guard let host = url.host?.lowercased(),
+              let sourceHost = sourceURL?.host?.lowercased(),
+              isTrustedAuthSourceHost(sourceHost),
+              isAuthLikeURL(url, expanded: true)
+        else {
             return false
         }
 
-        let oauthHosts = [
-            "accounts.google.com",
-            "appleid.apple.com",
-            "login.microsoftonline.com",
-            "login.live.com",
-            "github.com",
-        ]
-        return oauthHosts.contains { host == $0 || host.hasSuffix("." + $0) }
+        return isOpenAIFamilyHost(host) || isOAuthProviderHost(host)
     }
 
     private static func isTrustedDownloadBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
@@ -1977,7 +2030,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return isChatGPTHost(origin.host.lowercased())
     }
 
-    private static func shouldOpenInsideApp(_ url: URL) -> Bool {
+    private static func shouldOpenInsideApp(_ url: URL, sourceURL: URL? = nil) -> Bool {
         guard let scheme = url.scheme?.lowercased() else {
             return false
         }
@@ -1994,7 +2047,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
         return isChatGPTHost(host)
             || isOpenAIAuthHost(host)
-            || isOAuthContinuationHost(host, path: url.path)
+            || isOAuthContinuationHost(url)
+            || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
     }
 
     private static func canRewriteForPrivacy(_ request: URLRequest) -> Bool {
@@ -3816,6 +3870,121 @@ private let privacySignalsScript = """
 
   defineBooleanGetter(Navigator.prototype, 'globalPrivacyControl', true);
   defineBooleanGetter(navigator, 'globalPrivacyControl', true);
+})();
+"""
+
+private let passkeyLimitationNoticeScript = """
+(() => {
+  if (window.__wkPasskeyLimitationNoticeInstalled) return;
+  try {
+    Object.defineProperty(window, '__wkPasskeyLimitationNoticeInstalled', { value: true, configurable: false, writable: false });
+  } catch (_) {}
+
+  const trustedHost = (host) => {
+    const normalized = String(host || '').toLowerCase();
+    return normalized === 'chatgpt.com'
+      || normalized.endsWith('.chatgpt.com')
+      || normalized === 'chat.openai.com'
+      || normalized.endsWith('.chat.openai.com')
+      || normalized === 'openai.com'
+      || normalized.endsWith('.openai.com');
+  };
+
+  const pageLooksLikePasskey = () => {
+    const href = String(location.href || '').toLowerCase();
+    const text = String(document.body ? document.body.innerText || '' : '').toLowerCase();
+    const urlSignal = href.includes('passkey')
+      || href.includes('webauthn')
+      || href.includes('security_key')
+      || href.includes('publickeycredential')
+      || href.includes('credential');
+    const textSignal = text.includes('使用密钥继续')
+      || text.includes('通行密钥')
+      || text.includes('帐户的密钥')
+      || text.includes('账户的密钥')
+      || text.includes('passkey to continue')
+      || text.includes('continue with passkey')
+      || text.includes('use your passkey')
+      || text.includes('we found a passkey')
+      || text.includes('security key to continue')
+      || text.includes('use your security key');
+    return urlSignal || textSignal;
+  };
+
+  const showNotice = () => {
+    if (!trustedHost(location.hostname) || !pageLooksLikePasskey()) return;
+    if (document.getElementById('chatgpt-swift-passkey-notice')) return;
+    if (!document.body || window.__wkPasskeyLimitationNoticeDismissed) return;
+
+    const notice = document.createElement('aside');
+    notice.id = 'chatgpt-swift-passkey-notice';
+    notice.setAttribute('role', 'status');
+    notice.style.cssText = [
+      'position:fixed',
+      'top:18px',
+      'left:50%',
+      'transform:translateX(-50%)',
+      'z-index:2147483647',
+      'box-sizing:border-box',
+      'width:min(760px,calc(100vw - 32px))',
+      'padding:14px 44px 14px 16px',
+      'border:1px solid rgba(255,255,255,.16)',
+      'border-radius:10px',
+      'background:rgba(17,17,17,.96)',
+      'color:#fff',
+      'box-shadow:0 14px 40px rgba(0,0,0,.22)',
+      'font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+      'text-align:left'
+    ].join(';');
+
+    const title = document.createElement('div');
+    title.textContent = '这个本地 WKWebView wrapper 不能使用 chatgpt.com / openai.com 的 Apple 通行密钥。';
+    title.style.cssText = 'font-weight:650;margin:0 0 4px';
+    notice.appendChild(title);
+
+    const detail = document.createElement('div');
+    detail.textContent = '请点“尝试其他方法”，或用 Safari、Chrome、官方 ChatGPT App 完成 passkey 登录。';
+    detail.style.cssText = 'color:rgba(255,255,255,.78);margin:0';
+    notice.appendChild(detail);
+
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.setAttribute('aria-label', '关闭提示');
+    close.textContent = '×';
+    close.style.cssText = [
+      'position:absolute',
+      'top:8px',
+      'right:10px',
+      'width:28px',
+      'height:28px',
+      'border:0',
+      'border-radius:999px',
+      'background:rgba(255,255,255,.12)',
+      'color:#fff',
+      'font:20px/26px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif',
+      'cursor:pointer'
+    ].join(';');
+    close.addEventListener('click', () => {
+      window.__wkPasskeyLimitationNoticeDismissed = true;
+      notice.remove();
+    });
+    notice.appendChild(close);
+
+    document.body.appendChild(notice);
+  };
+
+  const schedule = () => window.requestAnimationFrame(showNotice);
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', schedule, { once: true });
+  } else {
+    schedule();
+  }
+
+  try {
+    const observer = new MutationObserver(schedule);
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    window.setTimeout(() => observer.disconnect(), 15000);
+  } catch (_) {}
 })();
 """
 
