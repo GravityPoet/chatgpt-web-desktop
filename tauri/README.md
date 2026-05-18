@@ -44,8 +44,8 @@ npm run build:signed-dmg
 
 ```text
 src-tauri/target/release/bundle/macos/ChatGPT Rust.app
-src-tauri/target/release/bundle/dmg/ChatGPT Rust_0.1.0_aarch64.dmg
-dist/ChatGPT-Rust-0.1.0-arm64.dmg
+src-tauri/target/release/bundle/dmg/ChatGPT Rust_0.2.0_aarch64.dmg
+dist/ChatGPT-Rust-0.2.0-arm64.dmg
 ```
 
 ## 实测清单

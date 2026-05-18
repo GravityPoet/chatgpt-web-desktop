@@ -9,11 +9,13 @@
 *.pem
 *.p12
 *.mobileprovision
-*cookie*
-*cookies*
-*session*
-*token*
-*secret*
+
+# Cookie/session export files (not source code)
+*cookie*.json
+*cookies*.json
+*session*.json
+*token*.json
+*secret*.json
 
 # Build outputs and generated desktop bundles
 dist/
@@ -31,3 +33,6 @@ tauri/node_modules/
 tauri/dist/
 tauri/backups/
 tauri/src-tauri/target/
+
+# OpenCode memory (not part of the project)
+.opencode/
