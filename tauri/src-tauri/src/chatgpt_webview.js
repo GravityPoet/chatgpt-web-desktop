@@ -70,12 +70,32 @@
       return false;
     }
 
-    const bytes = Array.from(new Uint8Array(buffer));
-    await invoke("save_blob_download", {
+    const sessionId = await invoke("start_blob_download", {
       filename: cleanFilename(filename),
-      bytes,
+      expectedSize: buffer.byteLength,
     });
-    return true;
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 1024 * 1024;
+
+    try {
+      for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+        const chunk = bytes.subarray(offset, Math.min(offset + chunkSize, bytes.length));
+        await invoke("append_blob_download", {
+          sessionId,
+          bytes: Array.from(chunk),
+        });
+      }
+
+      await invoke("finish_blob_download", { sessionId });
+      return true;
+    } catch (error) {
+      try {
+        await invoke("cancel_blob_download", { sessionId });
+      } catch (_) {
+        // Best-effort cleanup; the original write error is more useful.
+      }
+      throw error;
+    }
   }
 
   async function specialUrlToBuffer(url) {

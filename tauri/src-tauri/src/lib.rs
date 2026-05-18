@@ -1,11 +1,12 @@
 use std::{
-    fs,
-    io,
+    collections::HashMap,
+    fs::{self, OpenOptions},
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 
@@ -21,33 +22,134 @@ const CHATGPT_WEBVIEW_SCRIPT: &str = include_str!("chatgpt_webview.js");
 const MAX_BLOB_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
 const MIN_WEBVIEW_ZOOM: f64 = 0.85;
 const MAX_WEBVIEW_ZOOM: f64 = 1.40;
+static BLOB_DOWNLOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Default)]
+struct BlobDownloadSessions(Mutex<HashMap<String, BlobDownloadSession>>);
+
+struct BlobDownloadSession {
+    path: PathBuf,
+    expected_size: usize,
+    bytes_written: usize,
+}
 
 #[tauri::command]
-fn save_blob_download(
+fn start_blob_download(
     app: AppHandle<Wry>,
     window: WebviewWindow<Wry>,
+    sessions: tauri::State<'_, BlobDownloadSessions>,
     filename: String,
-    bytes: Vec<u8>,
+    expected_size: usize,
 ) -> Result<String, String> {
     ensure_trusted_command_window(&window)?;
-
-    if bytes.is_empty() {
-        return Err("download payload is empty".to_string());
-    }
-
-    if bytes.len() > MAX_BLOB_DOWNLOAD_BYTES {
-        return Err("download payload is too large".to_string());
-    }
+    validate_blob_download_size(expected_size)?;
 
     let downloads_dir = download_dir(&app)?;
     fs::create_dir_all(&downloads_dir)
         .map_err(|error| format!("failed to create Downloads directory: {error}"))?;
 
     let output_path = unique_download_path(&downloads_dir, &sanitize_filename(&filename));
-    fs::write(&output_path, bytes)
-        .map_err(|error| format!("failed to write download file: {error}"))?;
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&output_path)
+        .map_err(|error| format!("failed to create download file: {error}"))?;
 
-    Ok(output_path.to_string_lossy().into_owned())
+    let session_id = format!(
+        "{}-{}",
+        std::process::id(),
+        BLOB_DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
+    );
+    let mut sessions = sessions
+        .0
+        .lock()
+        .map_err(|_| "download session lock is poisoned".to_string())?;
+    sessions.insert(
+        session_id.clone(),
+        BlobDownloadSession {
+            path: output_path,
+            expected_size,
+            bytes_written: 0,
+        },
+    );
+
+    Ok(session_id)
+}
+
+#[tauri::command]
+fn append_blob_download(
+    window: WebviewWindow<Wry>,
+    sessions: tauri::State<'_, BlobDownloadSessions>,
+    session_id: String,
+    bytes: Vec<u8>,
+) -> Result<usize, String> {
+    ensure_trusted_command_window(&window)?;
+    if bytes.is_empty() {
+        return Err("download chunk is empty".to_string());
+    }
+
+    let mut sessions = sessions
+        .0
+        .lock()
+        .map_err(|_| "download session lock is poisoned".to_string())?;
+    let session = sessions
+        .get_mut(&session_id)
+        .ok_or_else(|| "download session does not exist".to_string())?;
+    let next_size = session
+        .bytes_written
+        .checked_add(bytes.len())
+        .ok_or_else(|| "download payload is too large".to_string())?;
+    if next_size > session.expected_size || next_size > MAX_BLOB_DOWNLOAD_BYTES {
+        return Err("download payload is too large".to_string());
+    }
+
+    OpenOptions::new()
+        .append(true)
+        .open(&session.path)
+        .and_then(|mut file| file.write_all(&bytes))
+        .map_err(|error| format!("failed to write download chunk: {error}"))?;
+    session.bytes_written = next_size;
+
+    Ok(session.bytes_written)
+}
+
+#[tauri::command]
+fn finish_blob_download(
+    window: WebviewWindow<Wry>,
+    sessions: tauri::State<'_, BlobDownloadSessions>,
+    session_id: String,
+) -> Result<String, String> {
+    ensure_trusted_command_window(&window)?;
+    let mut sessions = sessions
+        .0
+        .lock()
+        .map_err(|_| "download session lock is poisoned".to_string())?;
+    let session = sessions
+        .remove(&session_id)
+        .ok_or_else(|| "download session does not exist".to_string())?;
+    if session.bytes_written != session.expected_size {
+        let _ = fs::remove_file(&session.path);
+        return Err("download ended before all bytes were written".to_string());
+    }
+
+    Ok(session.path.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+fn cancel_blob_download(
+    window: WebviewWindow<Wry>,
+    sessions: tauri::State<'_, BlobDownloadSessions>,
+    session_id: String,
+) -> Result<(), String> {
+    ensure_trusted_command_window(&window)?;
+    let mut sessions = sessions
+        .0
+        .lock()
+        .map_err(|_| "download session lock is poisoned".to_string())?;
+    if let Some(session) = sessions.remove(&session_id) {
+        let _ = fs::remove_file(session.path);
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -77,8 +179,12 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main_window(app);
         }))
+        .manage(BlobDownloadSessions::default())
         .invoke_handler(tauri::generate_handler![
-            save_blob_download,
+            start_blob_download,
+            append_blob_download,
+            finish_blob_download,
+            cancel_blob_download,
             set_native_webview_zoom
         ])
         .setup(move |app| {
@@ -227,34 +333,40 @@ fn is_openai_auth_host(host: &str) -> bool {
 }
 
 fn is_oauth_host(host: &str, path: &str) -> bool {
-    let known_provider = host == "accounts.google.com"
-        || host.starts_with("accounts.google.")
-        || host == "login.microsoftonline.com"
-        || host == "login.live.com"
-        || host == "appleid.apple.com"
-        || host == "github.com"
-        || host == "facebook.com"
-        || host.ends_with(".facebook.com")
-        || host == "twitter.com"
-        || host == "x.com";
-
-    if !known_provider {
-        return false;
-    }
-
     let path = path.to_ascii_lowercase();
-    let oauth_like_markers = [
-        "oauth",
-        "auth",
-        "authorize",
-        "login",
-        "signin",
-        "account",
-    ];
+    let path = path.trim_end_matches('/');
 
-    oauth_like_markers
-        .iter()
-        .any(|marker| path.contains(marker))
+    match host {
+        "accounts.google.com" => path.starts_with("/o/oauth2/")
+            || path == "/signin/oauth"
+            || path.starts_with("/signin/oauth/"),
+        host if host.starts_with("accounts.google.") => {
+            path.starts_with("/o/oauth2/") || path.starts_with("/signin/oauth")
+        }
+        "login.microsoftonline.com" => path.contains("/oauth2/")
+            || path.ends_with("/oauth2")
+            || path.starts_with("/common/login")
+            || path.starts_with("/organizations/login")
+            || path.starts_with("/consumers/login"),
+        "login.live.com" => path.starts_with("/oauth20_"),
+        "appleid.apple.com" => path.starts_with("/auth/"),
+        "github.com" => path == "/login/oauth/authorize",
+        "facebook.com" | "www.facebook.com" => {
+            path == "/dialog/oauth" || path == "/v2.0/dialog/oauth"
+        }
+        "twitter.com" | "x.com" => path.starts_with("/i/oauth2/"),
+        _ => false,
+    }
+}
+
+fn validate_blob_download_size(size: usize) -> Result<(), String> {
+    if size == 0 {
+        return Err("download payload is empty".to_string());
+    }
+    if size > MAX_BLOB_DOWNLOAD_BYTES {
+        return Err("download payload is too large".to_string());
+    }
+    Ok(())
 }
 
 fn ensure_trusted_command_window(window: &WebviewWindow<Wry>) -> Result<(), String> {
@@ -458,6 +570,9 @@ mod tests {
             "http://chatgpt.com/",
             "https://github.com/",
             "https://github.com/tw93/Pake",
+            "https://accounts.google.com/accountchooser",
+            "https://accounts.google.com/signin/v2/challenge/pwd",
+            "https://x.com/account/settings",
         ];
 
         for url in urls {
@@ -482,5 +597,13 @@ mod tests {
         assert!(is_trusted_command_url(&trusted));
         assert!(!is_trusted_command_url(&auth_page));
         assert!(!is_trusted_command_url(&external));
+    }
+
+    #[test]
+    fn validates_blob_download_size_limits() {
+        assert!(validate_blob_download_size(1).is_ok());
+        assert!(validate_blob_download_size(MAX_BLOB_DOWNLOAD_BYTES).is_ok());
+        assert!(validate_blob_download_size(0).is_err());
+        assert!(validate_blob_download_size(MAX_BLOB_DOWNLOAD_BYTES + 1).is_err());
     }
 }

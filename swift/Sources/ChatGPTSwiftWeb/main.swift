@@ -1859,7 +1859,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     private func uniqueDownloadURL(suggestedFilename: String) -> URL {
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first!
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
         let sanitized = sanitizeFilename(suggestedFilename)
         let ext = URL(fileURLWithPath: sanitized).pathExtension
         let stem = URL(fileURLWithPath: sanitized).deletingPathExtension().lastPathComponent
@@ -4071,7 +4072,8 @@ enum SingleInstance {
     }
 
     private static func lockFileURL() -> URL {
-        let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let supportDirectory = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
         let appDirectory = supportDirectory.appendingPathComponent(appBundleIdentifier, isDirectory: true)
         try? FileManager.default.createDirectory(at: appDirectory, withIntermediateDirectories: true)
         return appDirectory.appendingPathComponent("single-instance.lock")
