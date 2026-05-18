@@ -5,8 +5,10 @@
 /backups/
 .env
 .env.*
-*cookie*
-*cookies*
-*session*
-*token*
-*secret*
+
+# Cookie/session export files (not source code)
+*cookie*.json
+*cookies*.json
+*session*.json
+*token*.json
+*secret*.json

@@ -1,0 +1,315 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tauri::{
+    webview::{NewWindowFeatures, NewWindowResponse},
+    AppHandle, Manager, Url, WebviewUrl, WebviewWindow, WebviewWindowBuilder, Wry,
+};
+
+use crate::{
+    fingerprint, menu, privacy,
+    profile::{ProfileStore, DEFAULT_PROFILE_ID},
+    CHATGPT_WEBVIEW_SCRIPT,
+};
+
+pub const MAIN_WINDOW_LABEL: &str = "main";
+
+/// State held in Tauri's managed state for browser operations.
+pub struct BrowserState {
+    pub popup_counter: AtomicUsize,
+}
+
+impl BrowserState {
+    pub fn new() -> Self {
+        Self {
+            popup_counter: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// Convert a profile ID (UUID string) to `[u8; 16]` for `data_store_identifier`.
+/// Returns `None` for non-UUID IDs (e.g. "default").
+pub fn profile_id_to_uuid_bytes(profile_id: &str) -> Option<[u8; 16]> {
+    uuid::Uuid::parse_str(profile_id)
+        .ok()
+        .map(|u| *u.as_bytes())
+}
+
+/// Apply macOS profile isolation using `data_store_identifier`.
+/// On macOS, WKWebView uses `WKWebsiteDataStore(forIdentifier:)` for isolation.
+/// On other platforms, this is a no-op (they use `data_directory` instead).
+#[cfg(target_os = "macos")]
+fn apply_macos_isolation<'a, M: Manager<Wry>>(
+    builder: WebviewWindowBuilder<'a, Wry, M>,
+    profile_id: &str,
+) -> WebviewWindowBuilder<'a, Wry, M> {
+    if profile_id == DEFAULT_PROFILE_ID {
+        return builder;
+    }
+    if let Some(uuid_bytes) = profile_id_to_uuid_bytes(profile_id) {
+        builder.data_store_identifier(uuid_bytes)
+    } else {
+        builder
+    }
+}
+
+/// Apply Windows/Linux profile isolation using `data_directory`.
+#[cfg(not(target_os = "macos"))]
+fn apply_platform_isolation<'a, M: Manager<Wry>>(
+    builder: WebviewWindowBuilder<'a, Wry, M>,
+    profile_store: &ProfileStore,
+    profile_id: &str,
+) -> WebviewWindowBuilder<'a, Wry, M> {
+    if profile_id == DEFAULT_PROFILE_ID {
+        return builder;
+    }
+    let data_dir = profile_store.webview_data_dir(profile_id);
+    builder.data_directory(data_dir)
+}
+
+/// Build the initial main window for the current profile.
+pub fn build_main_window(
+    app: &AppHandle<Wry>,
+    profile_store: &ProfileStore,
+) -> Result<WebviewWindow<Wry>, String> {
+    let profile = profile_store.current_profile();
+    let homepage = profile_store.homepage_url(&profile.id);
+
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == MAIN_WINDOW_LABEL)
+        .cloned()
+        .ok_or_else(|| "missing main window configuration".to_string())?;
+
+    let title = main_window_title(&profile.name, &profile.id);
+    let init_scripts = build_init_scripts(profile_store, &profile.id);
+
+    let app_for_nav = app.clone();
+    let app_for_popup = app.clone();
+    let app_for_download = app.clone();
+
+    let builder = WebviewWindowBuilder::from_config(app, &window_config)
+        .map_err(|e| format!("failed to create window from config: {e}"))?
+        .title(&title)
+        .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
+        .on_new_window(move |url, features| {
+            handle_new_window(&app_for_popup, url, features)
+        })
+        .on_download(move |_webview, event| {
+            crate::handle_download_event(&app_for_download, event)
+        });
+
+    // Apply platform-specific profile isolation
+    #[cfg(target_os = "macos")]
+    let builder = apply_macos_isolation(builder, &profile.id);
+    #[cfg(not(target_os = "macos"))]
+    let builder = apply_platform_isolation(builder, profile_store, &profile.id);
+
+    // Add initialization scripts
+    let mut builder = builder;
+    for script in &init_scripts {
+        builder = builder.initialization_script(script);
+    }
+
+    let webview = builder
+        .build()
+        .map_err(|e| format!("failed to build main webview: {e}"))?;
+
+    // Load the homepage
+    if let Ok(url) = Url::parse(&homepage) {
+        webview
+            .navigate(url)
+            .map_err(|e| format!("failed to navigate to homepage: {e}"))?;
+    }
+
+    Ok(webview)
+}
+
+/// Rebuild the main window for a new profile.
+pub fn rebuild_main_window(
+    app: &AppHandle<Wry>,
+    profile_store: &ProfileStore,
+    initial_url: Option<String>,
+) -> Result<(), String> {
+    // Close existing auth popups
+    close_auth_popups(app);
+
+    // Destroy existing main window (bypasses close handler that would just hide it)
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        window
+            .destroy()
+            .map_err(|e| format!("failed to destroy main window: {e}"))?;
+    }
+
+    let profile = profile_store.current_profile();
+    let homepage = initial_url.unwrap_or_else(|| profile_store.homepage_url(&profile.id));
+
+    let window_config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|w| w.label == MAIN_WINDOW_LABEL)
+        .cloned()
+        .ok_or_else(|| "missing main window configuration".to_string())?;
+
+    let title = main_window_title(&profile.name, &profile.id);
+    let init_scripts = build_init_scripts(profile_store, &profile.id);
+
+    let app_for_nav = app.clone();
+    let app_for_popup = app.clone();
+    let app_for_download = app.clone();
+
+    let builder = WebviewWindowBuilder::from_config(app, &window_config)
+        .map_err(|e| format!("failed to create window from config: {e}"))?
+        .title(&title)
+        .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
+        .on_new_window(move |url, features| {
+            handle_new_window(&app_for_popup, url, features)
+        })
+        .on_download(move |_webview, event| {
+            crate::handle_download_event(&app_for_download, event)
+        });
+
+    // Apply platform-specific profile isolation
+    #[cfg(target_os = "macos")]
+    let builder = apply_macos_isolation(builder, &profile.id);
+    #[cfg(not(target_os = "macos"))]
+    let builder = apply_platform_isolation(builder, profile_store, &profile.id);
+
+    let mut builder = builder;
+    for script in &init_scripts {
+        builder = builder.initialization_script(script);
+    }
+
+    let webview = builder
+        .build()
+        .map_err(|e| format!("failed to rebuild main webview: {e}"))?;
+
+    if let Ok(url) = Url::parse(&homepage) {
+        let _ = webview.navigate(url);
+    }
+
+    // Rebuild menu
+    let new_menu = menu::build_app_menu(app, profile_store);
+    app.set_menu(new_menu)
+        .map_err(|e| format!("failed to set menu: {e}"))?;
+
+    Ok(())
+}
+
+/// Close all auth popup windows (using destroy to bypass close handler).
+pub fn close_auth_popups(app: &AppHandle<Wry>) {
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("auth-") {
+            let _ = window.destroy();
+        }
+    }
+}
+
+/// Build initialization scripts for a profile.
+pub fn build_init_scripts(profile_store: &ProfileStore, profile_id: &str) -> Vec<String> {
+    let mut scripts: Vec<String> = vec![
+        privacy::NATIVE_SHIM_SCRIPT.to_string(),
+        privacy::PRIVACY_SIGNALS_SCRIPT.to_string(),
+        CHATGPT_WEBVIEW_SCRIPT.to_string(),
+        privacy::PASSKEY_NOTICE_SCRIPT.to_string(),
+    ];
+
+    let meta = profile_store.get_meta(profile_id);
+
+    // Fingerprint override
+    if let Some(ref fp) = meta.fingerprint {
+        if !meta.fingerprint_disabled {
+            scripts.push(fingerprint::fingerprint_script(fp));
+        }
+    }
+
+    // Enhanced privacy (Canvas/WebGL/Audio noise, GPC, etc.)
+    if meta.enhanced_privacy {
+        scripts.push(fingerprint::enhanced_privacy_script(
+            profile_id,
+            meta.fingerprint.as_ref(),
+        ));
+    }
+
+    // WebRTC blocker — only inject if the profile has it enabled
+    if meta.webrtc_enabled {
+        scripts.push(privacy::WEBRTC_BLOCKER_SCRIPT.to_string());
+    }
+
+    scripts
+}
+
+/// Handle new window requests (auth popups).
+/// Auth popups share the current profile's data store.
+fn handle_new_window(
+    app: &AppHandle<Wry>,
+    target_url: Url,
+    features: NewWindowFeatures,
+) -> NewWindowResponse<Wry> {
+    if !crate::should_stay_inside_app(&target_url) {
+        crate::open_external_url(&target_url);
+        return NewWindowResponse::Deny;
+    }
+
+    let browser_state = app.state::<BrowserState>();
+    let label = format!(
+        "auth-{}",
+        browser_state
+            .popup_counter
+            .fetch_add(1, Ordering::Relaxed)
+            + 1
+    );
+    let title = target_url
+        .host_str()
+        .map_or_else(|| "ChatGPT Login".to_string(), ToString::to_string);
+
+    let profile_store = app.state::<ProfileStore>();
+    let current_id = profile_store.current_profile_id();
+
+    let app_for_nav = app.clone();
+    let app_for_download = app.clone();
+
+    let builder = WebviewWindowBuilder::new(
+        app,
+        label,
+        WebviewUrl::External("about:blank".parse().expect("about:blank is valid")),
+    )
+    .title(title)
+    .inner_size(1200.0, 800.0)
+    .min_inner_size(720.0, 480.0)
+    .resizable(true)
+    .center()
+    .focused(true)
+    .window_features(features)
+    .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
+    .on_download(move |_webview, event| {
+        crate::handle_download_event(&app_for_download, event)
+    });
+
+    // Apply the same profile isolation to auth popups
+    #[cfg(target_os = "macos")]
+    let builder = apply_macos_isolation(builder, &current_id);
+    #[cfg(not(target_os = "macos"))]
+    let builder = apply_platform_isolation(builder, &profile_store, &current_id);
+
+    match builder.build() {
+        Ok(window) => NewWindowResponse::Create { window },
+        Err(error) => {
+            eprintln!("failed to create managed auth window: {error}");
+            NewWindowResponse::Deny
+        }
+    }
+}
+
+/// Get the main window title based on profile name.
+pub fn main_window_title(profile_name: &str, profile_id: &str) -> String {
+    if profile_id == DEFAULT_PROFILE_ID {
+        "ChatGPT Rust".to_string()
+    } else {
+        format!("ChatGPT Rust · {profile_name}")
+    }
+}

@@ -1,7 +1,31 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Minimal capability for the ChatGPT Rust window. Custom commands enforce their own trusted-origin checks.",
-  "windows": ["main"],
-  "permissions": []
+  "description": "Capability for remote ChatGPT/OpenAI pages. Download and zoom are directly callable; sensitive commands also require a one-time native-menu token.",
+  "windows": ["main", "auth-*", "incognito-*"],
+  "remote": {
+    "urls": [
+      "https://chatgpt.com/*",
+      "https://*.chatgpt.com/*",
+      "https://chat.openai.com/*",
+      "https://*.chat.openai.com/*"
+    ]
+  },
+  "permissions": [
+    "core:default",
+    "allow-set-native-webview-zoom",
+    "allow-start-blob-download",
+    "allow-append-blob-download",
+    "allow-finish-blob-download",
+    "allow-cancel-blob-download",
+    "allow-cmd-create-profile",
+    "allow-cmd-clone-profile",
+    "allow-cmd-rename-profile",
+    "allow-cmd-delete-profile",
+    "allow-cmd-set-homepage",
+    "allow-cmd-import-profile",
+    "allow-cmd-import-cookies",
+    "allow-cmd-export-cookies",
+    "allow-cmd-burn-current-profile"
+  ]
 }
