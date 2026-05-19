@@ -1,11 +1,13 @@
 import AppKit
 import Darwin
 import Foundation
+import OSLog
 import UniformTypeIdentifiers
 import WebKit
 
 private let chatGPTURL = URL(string: "https://chatgpt.com/")!
 private let appBundleIdentifier = "local.chatgpt-web.swift"
+private let browserLogger = Logger(subsystem: appBundleIdentifier, category: "Browser")
 private let mainFrameDefaultsKey = "ChatGPTSwiftWeb.MainWindowFrame"
 private let webZoomDefaultsKey = "ChatGPTSwiftWeb.WebViewZoom"
 private let minimumWebZoom: CGFloat = 0.85
@@ -1287,6 +1289,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
                 openPopup(url: cleanedURL)
             } else {
+                browserLogger.info("Opening target-frame-less external URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
                 NSWorkspace.shared.open(cleanedURL)
             }
             decisionHandler(.cancel)
@@ -1303,6 +1306,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             }
             decisionHandler(.allow)
         } else {
+            browserLogger.info("Opening external URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
             NSWorkspace.shared.open(cleanedURL)
             decisionHandler(.cancel)
         }
@@ -1950,6 +1954,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             || host == "login.openai.com" || host.hasSuffix(".login.openai.com")
     }
 
+    private static func isOpenAISentinelHost(_ host: String) -> Bool {
+        host == "sentinel.openai.com"
+    }
+
     private static func isOpenAIFamilyHost(_ host: String) -> Bool {
         host == "openai.com" || host.hasSuffix(".openai.com")
     }
@@ -2048,8 +2056,20 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
         return isChatGPTHost(host)
             || isOpenAIAuthHost(host)
+            || isOpenAISentinelHost(host)
             || isOAuthContinuationHost(url)
             || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
+    }
+
+    private static func loggableURL(_ url: URL) -> String {
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
+            return "<unparseable-url>"
+        }
+        if components.query != nil {
+            components.percentEncodedQuery = nil
+            return (components.url?.absoluteString ?? "\(url.scheme ?? "unknown")://\(url.host ?? "unknown")") + "?<redacted>"
+        }
+        return components.url?.absoluteString ?? url.absoluteString
     }
 
     private static func canRewriteForPrivacy(_ request: URLRequest) -> Bool {
