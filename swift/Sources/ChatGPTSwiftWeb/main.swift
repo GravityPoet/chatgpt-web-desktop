@@ -1340,6 +1340,24 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         }
     }
 
+    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+        let panel = NSOpenPanel()
+        panel.title = "选择要上传的文件"
+        panel.prompt = "上传"
+        panel.canChooseFiles = !parameters.allowsDirectories
+        panel.canChooseDirectories = parameters.allowsDirectories
+        panel.allowsMultipleSelection = parameters.allowsMultipleSelection
+
+        panel.beginSheetModal(for: window) { response in
+            guard response == .OK else {
+                completionHandler(nil)
+                return
+            }
+
+            completionHandler(panel.urls.isEmpty ? nil : panel.urls)
+        }
+    }
+
     @available(macOS 11.3, *)
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
         download.delegate = self
