@@ -3,7 +3,10 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="ChatGPT Rust"
-VERSION="0.1.0"
+VERSION="$(
+  cd "$ROOT"
+  node -e 'const fs = require("fs"); const conf = JSON.parse(fs.readFileSync("src-tauri/tauri.conf.json", "utf8")); if (!conf.version) throw new Error("missing tauri version"); process.stdout.write(conf.version);'
+)"
 ARCH="$(uname -m)"
 TAURI_APP="$ROOT/src-tauri/target/release/bundle/macos/$APP_NAME.app"
 DIST_DIR="$ROOT/dist"
