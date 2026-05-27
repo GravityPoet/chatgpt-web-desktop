@@ -17,6 +17,7 @@ private let maximumCookieImportBytes = 2 * 1024 * 1024
 private let maximumBridgeDownloadBytes = 200 * 1024 * 1024
 private let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
 private let cookieImportErrorDomain = "ChatGPTSwiftWeb.CookieImport"
+private let defaultHeaderCookieImportDomain = ".chatgpt.com"
 private let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"
 private let currentProfileDefaultsKey = "ChatGPTSwiftWeb.CurrentProfileID"
 private let defaultProfileID = "default"
@@ -1134,9 +1135,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     func importCookiesFromPanel() {
         let panel = NSOpenPanel()
         panel.title = "Import Cookies"
-        panel.message = "选择从浏览器导出的 cookie JSON 文件。将导入到当前账号空间。"
+        panel.message = "选择 cookie 文件。支持 JSON、Netscape cookies.txt、Cookie/Header String 文本。将导入到当前账号空间。"
         panel.prompt = "Import"
-        panel.allowedContentTypes = [.json]
+        panel.allowedContentTypes = [.json, .plainText, .data]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
@@ -1792,16 +1793,320 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private static func loadCookieExport(from url: URL) throws -> [HTTPCookie] {
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
         if let fileSize = values.fileSize, fileSize > maximumCookieImportBytes {
-            throw cookieImportError("JSON 文件过大")
+            throw cookieImportError("Cookie 文件过大")
         }
 
         let data = try Data(contentsOf: url)
-        let exportedCookies = try JSONDecoder().decode([ExportedBrowserCookie].self, from: data)
+        return try parseCookieImport(data: data)
+    }
+
+    private static func parseCookieImport(data: Data) throws -> [HTTPCookie] {
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw cookieImportError("Cookie 文件必须是 UTF-8 文本")
+        }
+
+        let normalizedText = text.removingUTF8ByteOrderMark()
+        let trimmedText = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedText.isEmpty else {
+            throw cookieImportError("没有可导入的 cookie")
+        }
+
+        let exportedCookies: [ExportedBrowserCookie]
+        if trimmedText.hasPrefix("[") || trimmedText.hasPrefix("{") {
+            exportedCookies = try JSONDecoder().decode(CookieImportDocument.self, from: Data(trimmedText.utf8)).cookies
+        } else if looksLikeNetscapeCookieText(trimmedText) {
+            exportedCookies = try parseNetscapeCookieText(trimmedText)
+        } else {
+            exportedCookies = try parseHeaderCookieText(trimmedText)
+        }
+
         let cookies = try exportedCookies.map { try $0.makeCookie() }
         guard !cookies.isEmpty else {
             throw cookieImportError("没有可导入的 cookie")
         }
         return cookies
+    }
+
+    private static func looksLikeNetscapeCookieText(_ text: String) -> Bool {
+        if text.localizedCaseInsensitiveContains("Netscape HTTP Cookie File") {
+            return true
+        }
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+            if line.hasPrefix("#") && !line.hasPrefix("#HttpOnly_") {
+                continue
+            }
+            let fields = splitCookieFields(line, maxSplits: 6)
+            return fields.count >= 7 && isNetscapeBoolean(fields[1]) && isNetscapeBoolean(fields[3]) && Int(fields[4]) != nil
+        }
+
+        return false
+    }
+
+    private static func parseNetscapeCookieText(_ text: String) throws -> [ExportedBrowserCookie] {
+        var cookies: [ExportedBrowserCookie] = []
+
+        for (lineIndex, rawLine) in text.components(separatedBy: .newlines).enumerated() {
+            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+
+            var httpOnly = false
+            if line.hasPrefix("#HttpOnly_") {
+                httpOnly = true
+                line.removeFirst("#HttpOnly_".count)
+            } else if line.hasPrefix("#") {
+                continue
+            }
+
+            let fields = splitCookieFields(line, maxSplits: 6)
+            guard fields.count >= 7 else {
+                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行字段不足")
+            }
+            guard let includeSubdomains = parseNetscapeBoolean(fields[1]) else {
+                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 includeSubdomains 无效")
+            }
+            guard let secure = parseNetscapeBoolean(fields[3]) else {
+                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 secure 无效")
+            }
+            guard let expires = Double(fields[4]) else {
+                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 expires 无效")
+            }
+
+            let isSession = expires <= 0
+            cookies.append(
+                ExportedBrowserCookie(
+                    domain: fields[0],
+                    expirationDate: isSession ? nil : expires,
+                    hostOnly: !includeSubdomains,
+                    httpOnly: httpOnly,
+                    name: fields[5],
+                    path: fields[2].isEmpty ? "/" : fields[2],
+                    sameSite: nil,
+                    secure: secure,
+                    session: isSession,
+                    value: fields[6]
+                )
+            )
+        }
+
+        guard !cookies.isEmpty else {
+            throw cookieImportError("没有可导入的 cookie")
+        }
+        return cookies
+    }
+
+    private static func parseHeaderCookieText(_ text: String) throws -> [ExportedBrowserCookie] {
+        var cookies: [ExportedBrowserCookie] = []
+
+        for rawLine in text.components(separatedBy: .newlines) {
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty {
+                continue
+            }
+
+            if let value = stripHeaderPrefix(line, prefix: "Set-Cookie:") {
+                cookies.append(try parseSetCookieLine(value))
+            } else if let value = stripHeaderPrefix(line, prefix: "Cookie:") {
+                cookies.append(contentsOf: try parseCookieHeaderPairs(value))
+            } else if looksLikeSetCookieLine(line) {
+                cookies.append(try parseSetCookieLine(line))
+            } else {
+                cookies.append(contentsOf: try parseCookieHeaderPairs(line))
+            }
+        }
+
+        guard !cookies.isEmpty else {
+            throw cookieImportError("没有可导入的 cookie")
+        }
+        return cookies
+    }
+
+    private static func parseCookieHeaderPairs(_ header: String) throws -> [ExportedBrowserCookie] {
+        var cookies: [ExportedBrowserCookie] = []
+
+        for segment in header.split(separator: ";", omittingEmptySubsequences: true) {
+            let pair = segment.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let separator = pair.firstIndex(of: "=") else {
+                continue
+            }
+
+            let name = String(pair[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = String(pair[pair.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !name.isEmpty, !isSetCookieAttribute(name) else {
+                continue
+            }
+
+            cookies.append(headerCookie(name: name, value: value))
+        }
+
+        guard !cookies.isEmpty else {
+            throw cookieImportError("Header String 没有可导入的 cookie")
+        }
+        return cookies
+    }
+
+    private static func parseSetCookieLine(_ line: String) throws -> ExportedBrowserCookie {
+        let segments = line.split(separator: ";", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let first = segments.first, let separator = first.firstIndex(of: "=") else {
+            throw cookieImportError("Set-Cookie Header 无效")
+        }
+
+        let name = String(first[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = String(first[first.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            throw cookieImportError("Set-Cookie Header cookie 名称为空")
+        }
+
+        var domain = defaultHeaderCookieImportDomain
+        var path = "/"
+        var secure = false
+        var httpOnly = false
+        var sameSite: String?
+        var session = true
+        var expirationDate: Double?
+
+        for attribute in segments.dropFirst() {
+            let lower = attribute.lowercased()
+            if lower == "secure" {
+                secure = true
+            } else if lower == "httponly" {
+                httpOnly = true
+            } else if let separator = attribute.firstIndex(of: "=") {
+                let key = String(attribute[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                let value = String(attribute[attribute.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                switch key {
+                case "domain":
+                    domain = value
+                case "path":
+                    path = value.isEmpty ? "/" : value
+                case "expires":
+                    if let date = parseCookieExpiresDate(value) {
+                        expirationDate = date.timeIntervalSince1970
+                        session = false
+                    }
+                case "max-age":
+                    if let maxAge = Double(value), maxAge > 0 {
+                        expirationDate = Date().addingTimeInterval(maxAge).timeIntervalSince1970
+                        session = false
+                    }
+                case "samesite":
+                    sameSite = value
+                default:
+                    break
+                }
+            }
+        }
+
+        return ExportedBrowserCookie(
+            domain: domain,
+            expirationDate: expirationDate,
+            hostOnly: !domain.hasPrefix("."),
+            httpOnly: httpOnly,
+            name: name,
+            path: path,
+            sameSite: sameSite,
+            secure: secure,
+            session: session,
+            value: value
+        )
+    }
+
+    private static func headerCookie(name: String, value: String) -> ExportedBrowserCookie {
+        ExportedBrowserCookie(
+            domain: defaultHeaderCookieImportDomain,
+            expirationDate: nil,
+            hostOnly: false,
+            httpOnly: false,
+            name: name,
+            path: "/",
+            sameSite: nil,
+            secure: true,
+            session: true,
+            value: value
+        )
+    }
+
+    private static func splitCookieFields(_ line: String, maxSplits: Int) -> [String] {
+        line.split(
+            maxSplits: maxSplits,
+            omittingEmptySubsequences: true,
+            whereSeparator: { $0 == " " || $0 == "\t" }
+        ).map(String.init)
+    }
+
+    private static func stripHeaderPrefix(_ line: String, prefix: String) -> String? {
+        guard line.range(of: prefix, options: [.caseInsensitive, .anchored]) != nil else {
+            return nil
+        }
+        return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func looksLikeSetCookieLine(_ line: String) -> Bool {
+        let lowerSegments = line.split(separator: ";").map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        }
+        guard lowerSegments.count > 1, lowerSegments.first?.contains("=") == true else {
+            return false
+        }
+        return lowerSegments.dropFirst().contains { segment in
+            segment == "secure"
+                || segment == "httponly"
+                || segment.hasPrefix("domain=")
+                || segment.hasPrefix("path=")
+                || segment.hasPrefix("expires=")
+                || segment.hasPrefix("max-age=")
+                || segment.hasPrefix("samesite=")
+        }
+    }
+
+    private static func isSetCookieAttribute(_ name: String) -> Bool {
+        switch name.lowercased() {
+        case "domain", "path", "expires", "max-age", "samesite", "secure", "httponly":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private static func isNetscapeBoolean(_ value: String) -> Bool {
+        parseNetscapeBoolean(value) != nil
+    }
+
+    private static func parseNetscapeBoolean(_ value: String) -> Bool? {
+        switch value.uppercased() {
+        case "TRUE":
+            return true
+        case "FALSE":
+            return false
+        default:
+            return nil
+        }
+    }
+
+    private static func parseCookieExpiresDate(_ value: String) -> Date? {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        for format in [
+            "EEE, dd MMM yyyy HH:mm:ss zzz",
+            "EEE, dd-MMM-yyyy HH:mm:ss zzz",
+            "EEE MMM dd HH:mm:ss yyyy",
+        ] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) {
+                return date
+            }
+        }
+
+        return nil
     }
 
     private static func safeCookieImportMessage(_ error: Error) -> String {
@@ -2945,6 +3250,29 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     """
 }
 
+private struct CookieImportDocument: Decodable {
+    let cookies: [ExportedBrowserCookie]
+
+    enum CodingKeys: String, CodingKey {
+        case cookies
+    }
+
+    init(from decoder: Decoder) throws {
+        let singleValue = try decoder.singleValueContainer()
+        if let cookies = try? singleValue.decode([ExportedBrowserCookie].self) {
+            self.cookies = cookies
+            return
+        }
+        if let cookie = try? singleValue.decode(ExportedBrowserCookie.self) {
+            self.cookies = [cookie]
+            return
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.cookies = try container.decode([ExportedBrowserCookie].self, forKey: .cookies)
+    }
+}
+
 private struct ExportedBrowserCookie: Codable {
     let domain: String
     let expirationDate: Double?
@@ -2956,6 +3284,30 @@ private struct ExportedBrowserCookie: Codable {
     let secure: Bool?
     let session: Bool?
     let value: String
+
+    init(
+        domain: String,
+        expirationDate: Double?,
+        hostOnly: Bool?,
+        httpOnly: Bool?,
+        name: String,
+        path: String,
+        sameSite: String?,
+        secure: Bool?,
+        session: Bool?,
+        value: String
+    ) {
+        self.domain = domain
+        self.expirationDate = expirationDate
+        self.hostOnly = hostOnly
+        self.httpOnly = httpOnly
+        self.name = name
+        self.path = path
+        self.sameSite = sameSite
+        self.secure = secure
+        self.session = session
+        self.value = value
+    }
 
     init(cookie: HTTPCookie) {
         self.domain = cookie.domain
@@ -3054,6 +3406,15 @@ private struct ExportedBrowserCookie: Codable {
         default:
             return nil
         }
+    }
+}
+
+private extension String {
+    func removingUTF8ByteOrderMark() -> String {
+        if hasPrefix("\u{feff}") {
+            return String(dropFirst())
+        }
+        return self
     }
 }
 

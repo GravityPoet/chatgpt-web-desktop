@@ -594,7 +594,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
                         r#"
                     (() => {
                       const token = __MENU_TOKEN__;
-                      const json = prompt('导入 Cookies\n粘贴 cookie JSON：');
+                      const json = prompt('导入 Cookies\n支持 JSON、Netscape cookies.txt、Cookie/Header String。请粘贴内容：');
                       if (!json) return;
                       if (window.__TAURI__ && window.__TAURI__.core) {
                         window.__TAURI__.core.invoke('cmd_import_cookies', { token, json });
@@ -945,7 +945,7 @@ fn cmd_import_cookies(
 ) -> Result<String, String> {
     ensure_trusted_command_window(&window)?;
     consume_menu_token(&app, MENU_IMPORT_COOKIES, &token)?;
-    let cookies = cookies::parse_cookie_json(&json)?;
+    let cookies = cookies::parse_cookie_import(&json)?;
     let count = cookies.len();
 
     for c in &cookies {
