@@ -33,7 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var incognitoControllers: [BrowserWindowController] = []
     private var keyMonitor: Any?
     private var profilesMenu: NSMenu?
+    private var privacyMenu: NSMenu?
     private var webRTCProtectionItem: NSMenuItem?
+    private var enhancedPrivacyItem: NSMenuItem?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -119,6 +121,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let fileMenu = NSMenu(title: "文件")
         let importCookiesItem = fileMenu.addItem(withTitle: "导入 Cookies...", action: #selector(importCookiesMenu(_:)), keyEquivalent: "")
         importCookiesItem.target = self
+        let pasteCookiesItem = fileMenu.addItem(withTitle: "粘贴 Cookies...", action: #selector(pasteCookiesMenu(_:)), keyEquivalent: "")
+        pasteCookiesItem.target = self
         let exportCookiesItem = fileMenu.addItem(withTitle: "导出 Cookies...", action: #selector(exportCookiesMenu(_:)), keyEquivalent: "")
         exportCookiesItem.target = self
         let clearWebsiteDataItem = fileMenu.addItem(withTitle: "焚烧当前空间...", action: #selector(burnCurrentProfileData(_:)), keyEquivalent: "")
@@ -153,18 +157,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
-        let viewItem = NSMenuItem()
-        let viewMenu = NSMenu(title: "视图")
-        let backItem = viewMenu.addItem(withTitle: "后退", action: #selector(goBackAction(_:)), keyEquivalent: "[")
+        let navigationItem = NSMenuItem()
+        let navigationMenu = NSMenu(title: "导航")
+        let backItem = navigationMenu.addItem(withTitle: "后退", action: #selector(goBackAction(_:)), keyEquivalent: "[")
         backItem.target = self
-        let forwardItem = viewMenu.addItem(withTitle: "前进", action: #selector(goForwardAction(_:)), keyEquivalent: "]")
+        let forwardItem = navigationMenu.addItem(withTitle: "前进", action: #selector(goForwardAction(_:)), keyEquivalent: "]")
         forwardItem.target = self
-        let homeItem = viewMenu.addItem(withTitle: "回到首页", action: #selector(goHomeAction(_:)), keyEquivalent: "h")
+        let homeItem = navigationMenu.addItem(withTitle: "回到主页", action: #selector(goHomeAction(_:)), keyEquivalent: "h")
         homeItem.keyEquivalentModifierMask = [.command, .shift]
         homeItem.target = self
-        viewMenu.addItem(NSMenuItem.separator())
-        viewMenu.addItem(withTitle: "重新加载", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
-        viewMenu.addItem(NSMenuItem.separator())
+        navigationMenu.addItem(NSMenuItem.separator())
+        navigationMenu.addItem(withTitle: "重新加载", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
+        navigationItem.submenu = navigationMenu
+        mainMenu.addItem(navigationItem)
+
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "视图")
         viewMenu.addItem(withTitle: "放大", action: #selector(BrowserWindowController.zoomIn(_:)), keyEquivalent: "=")
         viewMenu.addItem(withTitle: "缩小", action: #selector(BrowserWindowController.zoomOut(_:)), keyEquivalent: "-")
         viewMenu.addItem(withTitle: "实际大小", action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
@@ -173,16 +181,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         let privacyItem = NSMenuItem()
         let privacyMenu = NSMenu(title: "隐私")
-        let webRTCItem = privacyMenu.addItem(withTitle: "启用 WebRTC 防护", action: #selector(toggleWebRTCProtection(_:)), keyEquivalent: "")
-        webRTCItem.target = self
-        webRTCProtectionItem = webRTCItem
-        updateWebRTCProtectionMenuItem()
-        privacyMenu.addItem(NSMenuItem.separator())
-        let privacyStatusItem = privacyMenu.addItem(withTitle: "隐私状态...", action: #selector(showPrivacyStatus(_:)), keyEquivalent: "")
-        privacyStatusItem.target = self
-        let fingerprintTestItem = privacyMenu.addItem(withTitle: "打开指纹检测页", action: #selector(openFingerprintTestPage(_:)), keyEquivalent: "")
-        fingerprintTestItem.target = self
+        privacyMenu.delegate = self
+        privacyMenu.autoenablesItems = false
+        rebuildPrivacyMenu(privacyMenu)
         privacyItem.submenu = privacyMenu
+        self.privacyMenu = privacyMenu
         mainMenu.addItem(privacyItem)
 
         let windowItem = NSMenuItem()
@@ -251,6 +254,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     @objc private func importCookiesMenu(_ sender: Any?) {
         mainController?.importCookiesFromPanel()
+    }
+
+    @objc private func pasteCookiesMenu(_ sender: Any?) {
+        mainController?.pasteCookiesFromDialog()
     }
 
     @objc private func exportCookiesMenu(_ sender: Any?) {
@@ -397,6 +404,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
         ProfileStore.setCurrentProfileID(id)
         updateWebRTCProtectionMenuItem()
+        updateEnhancedPrivacyMenuItem()
         rebuildMainController()
     }
 
@@ -425,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let profileID = ProfileStore.currentProfileID()
         let enabled = !ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         ProfileStore.setEnhancedPrivacyEnabled(enabled, for: profileID)
+        updateEnhancedPrivacyMenuItem()
         rebuildMainController(initialURL: mainController?.currentURL())
     }
 
@@ -630,10 +639,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        guard menu === profilesMenu else {
-            return
+        if menu === profilesMenu {
+            rebuildProfilesMenu(menu)
+        } else if menu === privacyMenu {
+            rebuildPrivacyMenu(menu)
         }
-        rebuildProfilesMenu(menu)
     }
 
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
@@ -657,23 +667,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
 
         let currentID = ProfileStore.currentProfileID()
-        for profile in ProfileStore.loadProfiles() {
+        let profiles = ProfileStore.loadProfiles()
+        for profile in profiles {
             let item = menu.addItem(withTitle: profile.name, action: #selector(switchToProfile(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = profile.id
             item.state = profile.id == currentID ? .on : .off
             item.isEnabled = isolationAvailable || profile.id == defaultProfileID
         }
-        menu.addItem(NSMenuItem.separator())
-        let fingerprintItem = menu.addItem(withTitle: "指纹预设", action: nil, keyEquivalent: "")
-        let fingerprintMenu = NSMenu(title: "指纹预设")
-        rebuildFingerprintMenu(fingerprintMenu, profileID: currentID)
-        fingerprintItem.submenu = fingerprintMenu
-        let enhancedItem = menu.addItem(withTitle: "增强隐私模式（当前空间）", action: #selector(toggleEnhancedPrivacy(_:)), keyEquivalent: "")
-        enhancedItem.target = self
-        enhancedItem.state = ProfileStore.isEnhancedPrivacyEnabled(for: currentID) ? .on : .off
-        let testItem = menu.addItem(withTitle: "打开指纹检测页", action: #selector(openFingerprintTestPage(_:)), keyEquivalent: "")
-        testItem.target = self
         menu.addItem(NSMenuItem.separator())
         let setHomeItem = menu.addItem(withTitle: "设置当前空间首页…", action: #selector(setProfileHomepageAction(_:)), keyEquivalent: "")
         setHomeItem.target = self
@@ -705,6 +706,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             let hint = menu.addItem(withTitle: "账号空间隔离需要 macOS 14 或更新版本", action: nil, keyEquivalent: "")
             hint.isEnabled = false
         }
+    }
+
+    private func rebuildPrivacyMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let currentID = ProfileStore.currentProfileID()
+
+        let webRTCItem = menu.addItem(withTitle: "启用 WebRTC 防护", action: #selector(toggleWebRTCProtection(_:)), keyEquivalent: "")
+        webRTCItem.target = self
+        webRTCProtectionItem = webRTCItem
+        updateWebRTCProtectionMenuItem()
+
+        menu.addItem(NSMenuItem.separator())
+        let fingerprintItem = menu.addItem(withTitle: "指纹预设", action: nil, keyEquivalent: "")
+        let fingerprintMenu = NSMenu(title: "指纹预设")
+        rebuildFingerprintMenu(fingerprintMenu, profileID: currentID)
+        fingerprintItem.submenu = fingerprintMenu
+
+        let enhancedItem = menu.addItem(withTitle: "增强隐私模式（当前空间）", action: #selector(toggleEnhancedPrivacy(_:)), keyEquivalent: "")
+        enhancedItem.target = self
+        enhancedPrivacyItem = enhancedItem
+        updateEnhancedPrivacyMenuItem()
+
+        menu.addItem(NSMenuItem.separator())
+        let privacyStatusItem = menu.addItem(withTitle: "隐私状态...", action: #selector(showPrivacyStatus(_:)), keyEquivalent: "")
+        privacyStatusItem.target = self
+        let fingerprintTestItem = menu.addItem(withTitle: "打开指纹检测页", action: #selector(openFingerprintTestPage(_:)), keyEquivalent: "")
+        fingerprintTestItem.target = self
     }
 
     private func rebuildFingerprintMenu(_ menu: NSMenu, profileID: String) {
@@ -756,6 +784,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         mainController = controller
         controller.show()
         updateWebRTCProtectionMenuItem()
+        updateEnhancedPrivacyMenuItem()
     }
 
     private func mainWindowTitle(for profile: WebProfile) -> String {
@@ -778,6 +807,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func updateWebRTCProtectionMenuItem() {
         webRTCProtectionItem?.title = "启用 WebRTC 防护"
         webRTCProtectionItem?.state = PrivacySettings.isWebRTCProtectionEnabled() ? .on : .off
+    }
+
+    private func updateEnhancedPrivacyMenuItem() {
+        let currentID = ProfileStore.currentProfileID()
+        enhancedPrivacyItem?.title = "增强隐私模式（当前空间）"
+        enhancedPrivacyItem?.state = ProfileStore.isEnhancedPrivacyEnabled(for: currentID) ? .on : .off
     }
 
     private func createProfileFromCurrent(named name: String, copyCookies: Bool) {
@@ -1148,6 +1183,47 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             }
 
             self?.importCookies(from: url)
+        }
+    }
+
+    func pasteCookiesFromDialog() {
+        let alert = NSAlert()
+        alert.messageText = "粘贴 Cookies"
+        alert.informativeText = "支持 JSON、Netscape cookies.txt、Cookie/Header String。内容会导入到当前账号空间。"
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "导入")
+        alert.addButton(withTitle: "取消")
+
+        let scrollView = NSScrollView(frame: NSRect(x: 0, y: 0, width: 560, height: 240))
+        scrollView.borderType = .bezelBorder
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+
+        let textView = NSTextView(frame: scrollView.bounds)
+        textView.autoresizingMask = [.width, .height]
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.isRichText = false
+        textView.isAutomaticQuoteSubstitutionEnabled = false
+        textView.isAutomaticDashSubstitutionEnabled = false
+        textView.isAutomaticTextReplacementEnabled = false
+        textView.allowsUndo = true
+        textView.string = NSPasteboard.general.string(forType: .string) ?? ""
+
+        scrollView.documentView = textView
+        alert.accessoryView = scrollView
+
+        alert.beginSheetModal(for: window) { [weak self, textView] response in
+            guard response == .alertFirstButtonReturn else {
+                return
+            }
+            self?.importCookies(fromText: textView.string)
+        }
+
+        DispatchQueue.main.async { [weak self, weak textView] in
+            guard let textView else {
+                return
+            }
+            self?.window.makeFirstResponder(textView)
         }
     }
 
@@ -1589,23 +1665,82 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private func importCookies(from url: URL) {
         do {
             let cookies = try Self.loadCookieExport(from: url)
-            let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
-            let group = DispatchGroup()
-
-            for cookie in cookies {
-                group.enter()
-                cookieStore.setCookie(cookie) {
-                    group.leave()
-                }
-            }
-
-            group.notify(queue: .main) { [weak self] in
-                self?.presentInfo("已导入 \(cookies.count) 个 cookie，正在刷新页面。")
-                self?.webView.reload()
-            }
+            importCookies(cookies)
         } catch {
             presentError("Cookie 导入失败：\(Self.safeCookieImportMessage(error))")
         }
+    }
+
+    private func importCookies(fromText text: String) {
+        do {
+            let cookies = try Self.parseCookieImport(data: Data(text.utf8))
+            importCookies(cookies)
+        } catch {
+            presentError("Cookie 导入失败：\(Self.safeCookieImportMessage(error))")
+        }
+    }
+
+    private func importCookies(_ cookies: [HTTPCookie]) {
+        let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        let group = DispatchGroup()
+        let importedIdentities = Set(cookies.map(CookieIdentity.init))
+
+        for cookie in cookies {
+            group.enter()
+            cookieStore.setCookie(cookie) {
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            guard let self else {
+                return
+            }
+
+            cookieStore.getAllCookies { [weak self] storedCookies in
+                guard let self else {
+                    return
+                }
+
+                let storedIdentities = Set(storedCookies.map(CookieIdentity.init))
+                let missingCookies = cookies.filter { !storedIdentities.contains(CookieIdentity($0)) }
+                let storedCount = importedIdentities.intersection(storedIdentities).count
+                let importedLoginNames = Set(cookies.map(\.name).filter(Self.isChatGPTLoginCookieName))
+                let storedLoginNames = Set(storedCookies.map(\.name).filter { importedLoginNames.contains($0) })
+                let missingLoginNames = importedLoginNames.subtracting(storedLoginNames).sorted()
+                let profileName = self.profileDisplayName() ?? "默认"
+
+                var lines = [
+                    "当前空间：\(profileName)",
+                    "已解析 \(cookies.count) 个 cookie；WebKit 当前可读到 \(storedCount)/\(importedIdentities.count) 个目标 cookie。"
+                ]
+
+                if importedLoginNames.isEmpty {
+                    lines.append("提示：本次内容没有 ChatGPT session-token，通常不能直接免登录。")
+                } else if missingLoginNames.isEmpty {
+                    lines.append("关键登录 cookie 已写入：\(importedLoginNames.sorted().joined(separator: ", "))")
+                } else {
+                    lines.append("缺失关键登录 cookie：\(missingLoginNames.joined(separator: ", "))")
+                }
+
+                if !missingCookies.isEmpty {
+                    let names = missingCookies.prefix(8).map(\.name).joined(separator: ", ")
+                    let suffix = missingCookies.count > 8 ? " 等 \(missingCookies.count) 个" : ""
+                    lines.append("未写入：\(names)\(suffix)")
+                }
+
+                lines.append("正在刷新页面。")
+                self.presentAlert(lines.joined(separator: "\n"), style: missingCookies.isEmpty && missingLoginNames.isEmpty ? .informational : .warning)
+                self.webView.reload()
+            }
+        }
+    }
+
+    private static func isChatGPTLoginCookieName(_ name: String) -> Bool {
+        name.hasPrefix("__Secure-next-auth.session-token")
+            || name == "cf_clearance"
+            || name == "__Secure-oai-is"
+            || name == "oai-sc"
     }
 
     private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
@@ -3270,6 +3405,18 @@ private struct CookieImportDocument: Decodable {
 
         let container = try decoder.container(keyedBy: CodingKeys.self)
         self.cookies = try container.decode([ExportedBrowserCookie].self, forKey: .cookies)
+    }
+}
+
+private struct CookieIdentity: Hashable {
+    let name: String
+    let domain: String
+    let path: String
+
+    init(_ cookie: HTTPCookie) {
+        name = cookie.name
+        domain = cookie.domain.lowercased()
+        path = cookie.path
     }
 }
 
