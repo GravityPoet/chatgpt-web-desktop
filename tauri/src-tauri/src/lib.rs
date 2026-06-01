@@ -11,10 +11,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        Mutex,
-    },
+    sync::{atomic::Ordering, Mutex},
 };
 
 use tauri::{
@@ -23,26 +20,14 @@ use tauri::{
     WindowEvent, Wry,
 };
 use tauri_plugin_window_state::{Builder as WindowStateBuilder, StateFlags};
-use uuid::Uuid;
-
 use browser::{BrowserState, MAIN_WINDOW_LABEL};
 use profile::{ProfileExportDocument, ProfileStore};
 
 const CHATGPT_WEBVIEW_SCRIPT: &str = include_str!("chatgpt_webview.js");
 const MAX_BLOB_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
+const MAX_CHATGPT_COOKIE_HEADER_BYTES: usize = 6 * 1024;
 const MIN_WEBVIEW_ZOOM: f64 = 0.85;
 const MAX_WEBVIEW_ZOOM: f64 = 1.40;
-static BLOB_DOWNLOAD_COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-const MENU_CREATE_PROFILE: &str = "create_profile";
-const MENU_CLONE_PROFILE: &str = "clone_profile";
-const MENU_RENAME_PROFILE: &str = "rename_profile";
-const MENU_DELETE_PROFILE: &str = "delete_profile";
-const MENU_SET_HOMEPAGE: &str = "set_homepage";
-const MENU_IMPORT_PROFILE: &str = "import_profile";
-const MENU_IMPORT_COOKIES: &str = "import_cookies";
-const MENU_EXPORT_COOKIES: &str = "export_cookies";
-const MENU_BURN_CURRENT_PROFILE: &str = "burn_current_profile";
 
 // --- Download session management ---
 
@@ -55,11 +40,13 @@ struct BlobDownloadSession {
     bytes_written: usize,
 }
 
-/// One-time tokens minted by native menu handlers for sensitive commands.
-/// Remote ChatGPT pages may invoke these commands, but only immediately after
-/// a user menu gesture has minted the matching action token.
+/// In-memory storage for cookies pending injection during profile clone.
+/// Avoids writing session cookies to disk.
 #[derive(Default)]
-struct MenuCommandTokens(Mutex<HashMap<String, &'static str>>);
+struct PendingCookies(Mutex<Option<Vec<serde_json::Value>>>);
+
+#[derive(Default)]
+struct NativeZoomState(Mutex<f64>);
 
 #[tauri::command]
 fn start_blob_download(
@@ -83,11 +70,7 @@ fn start_blob_download(
         .open(&output_path)
         .map_err(|error| format!("failed to create download file: {error}"))?;
 
-    let session_id = format!(
-        "{}-{}",
-        std::process::id(),
-        BLOB_DOWNLOAD_COUNTER.fetch_add(1, Ordering::Relaxed) + 1
-    );
+    let session_id = uuid::Uuid::new_v4().to_string();
     let mut sessions = sessions
         .0
         .lock()
@@ -191,10 +174,527 @@ fn set_native_webview_zoom(window: WebviewWindow<Wry>, scale: f64) -> Result<f64
     Ok(clamped)
 }
 
+fn applescript_string_literal(value: &str) -> String {
+    let escaped: String = value
+        .chars()
+        .filter(|char| !matches!(char, '\0' | '\r'))
+        .flat_map(|char| match char {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            _ => vec![char],
+        })
+        .collect();
+    format!("\"{}\"", escaped)
+}
+
+fn applescript_text_expr(value: &str) -> String {
+    let parts: Vec<String> = value.split('\n').map(applescript_string_literal).collect();
+    if parts.is_empty() {
+        "\"\"".to_string()
+    } else {
+        parts.join(" & return & ")
+    }
+}
+
+fn run_osascript(script: &str) -> Result<String, String> {
+    let output = Command::new("osascript")
+        .arg("-e")
+        .arg(script)
+        .output()
+        .map_err(|error| format!("failed to run osascript: {error}"))?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .trim_end_matches(['\r', '\n'])
+            .to_string())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
+fn native_alert(title: &str, message: &str) {
+    let script = format!(
+        "display dialog {} with title {} buttons {{\"知道了\"}} default button \"知道了\"",
+        applescript_text_expr(message),
+        applescript_text_expr(title)
+    );
+    let _ = run_osascript(&script);
+}
+
+fn native_confirm(title: &str, message: &str) -> bool {
+    let script = format!(
+        "button returned of (display dialog {} with title {} buttons {{\"取消\", \"确定\"}} default button \"确定\" cancel button \"取消\")",
+        applescript_text_expr(message),
+        applescript_text_expr(title)
+    );
+    run_osascript(&script)
+        .map(|button| button.trim() == "确定")
+        .unwrap_or(false)
+}
+
+fn native_prompt(title: &str, message: &str, default_answer: &str) -> Option<String> {
+    let script = format!(
+        "set dialogResult to display dialog {} default answer {} with title {} buttons {{\"取消\", \"确定\"}} default button \"确定\" cancel button \"取消\"\ntext returned of dialogResult",
+        applescript_text_expr(message),
+        applescript_text_expr(default_answer),
+        applescript_text_expr(title)
+    );
+    run_osascript(&script).ok()
+}
+
+fn native_choose_file(prompt: &str) -> Option<PathBuf> {
+    let script = format!(
+        "POSIX path of (choose file with prompt {} without invisibles)",
+        applescript_text_expr(prompt)
+    );
+    run_osascript(&script).ok().map(PathBuf::from)
+}
+
+fn show_menu_error(message: impl AsRef<str>) {
+    native_alert("ChatGPT Rust", message.as_ref());
+}
+
+fn current_main_window(app: &AppHandle<Wry>) -> Option<WebviewWindow<Wry>> {
+    app.get_webview_window(MAIN_WINDOW_LABEL)
+}
+
+fn stop_main_window_loading(app: &AppHandle<Wry>) {
+    if let Some(window) = current_main_window(app) {
+        let _ = window.eval("try { window.stop(); } catch (_) {}");
+    }
+}
+
+fn current_homepage(profile_store: &ProfileStore) -> String {
+    let profile = profile_store.current_profile();
+    profile_store.homepage_url(&profile.id)
+}
+
+fn current_reload_target(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> String {
+    current_main_window(app)
+        .and_then(|window| window.url().ok())
+        .map(|url| url.to_string())
+        .filter(|url| !url.is_empty() && url != "about:blank")
+        .unwrap_or_else(|| current_homepage(profile_store))
+}
+
+fn rebuild_main_window_to(app: &AppHandle<Wry>, target_url: String, failure_label: &str) {
+    stop_main_window_loading(app);
+    let profile_store = app.state::<ProfileStore>();
+    if let Err(error) = browser::rebuild_main_window(app, &profile_store, Some(target_url)) {
+        show_menu_error(format!("{failure_label}：{error}"));
+    }
+}
+
+fn parse_https_url(raw: &str) -> Result<Url, String> {
+    let trimmed = raw.trim();
+    if !trimmed.starts_with("https://") {
+        return Err("仅支持 https:// 网址。".to_string());
+    }
+    let url = Url::parse(trimmed).map_err(|_| "网址无效。".to_string())?;
+    if url.host_str().is_none_or(|host| host.is_empty()) {
+        return Err("网址缺少有效域名。".to_string());
+    }
+    Ok(url)
+}
+
+fn percent_encode_data_url(input: &str) -> String {
+    let mut encoded = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn rebuild_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) {
+    let menu = menu::build_app_menu(app, profile_store);
+    if let Err(error) = app.set_menu(menu) {
+        eprintln!("failed to rebuild menu: {error}");
+    }
+}
+
+fn set_menu_zoom(app: &AppHandle<Wry>, next: f64) {
+    let clamped = next.clamp(MIN_WEBVIEW_ZOOM, MAX_WEBVIEW_ZOOM);
+    if let Some(window) = current_main_window(app) {
+        if let Err(error) = window.set_zoom(clamped) {
+            show_menu_error(format!("缩放失败：{error}"));
+            return;
+        }
+    }
+    if let Ok(mut zoom) = app.state::<NativeZoomState>().0.lock() {
+        *zoom = clamped;
+    }
+}
+
+fn adjust_menu_zoom(app: &AppHandle<Wry>, delta: f64) {
+    let current = app
+        .state::<NativeZoomState>()
+        .0
+        .lock()
+        .map(|zoom| *zoom)
+        .unwrap_or(1.0);
+    set_menu_zoom(app, current + delta);
+}
+
+#[cfg(target_os = "macos")]
+fn remove_profile_data_store(app: &AppHandle<Wry>, profile_id: &str) {
+    let Some(uuid_bytes) = browser::profile_id_to_uuid_bytes(profile_id) else {
+        return;
+    };
+    let app = app.clone();
+    let profile_id = profile_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = app.remove_data_store(uuid_bytes).await {
+            eprintln!("failed to remove data store for profile '{profile_id}': {error}");
+        }
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn remove_profile_data_store(_app: &AppHandle<Wry>, _profile_id: &str) {}
+
+#[derive(Debug, Eq, Hash, PartialEq)]
+struct CookieIdentity {
+    domain: String,
+    name: String,
+    path: String,
+}
+
+impl CookieIdentity {
+    fn imported(cookie: &cookies::ExportedCookie) -> Self {
+        Self {
+            domain: normalize_cookie_domain(&cookie.domain),
+            name: cookie.name.trim().to_string(),
+            path: if cookie.path.is_empty() {
+                "/".to_string()
+            } else {
+                cookie.path.clone()
+            },
+        }
+    }
+
+    fn stored(cookie: &tauri::webview::cookie::Cookie<'_>) -> Self {
+        Self {
+            domain: normalize_cookie_domain(cookie.domain().unwrap_or("")),
+            name: cookie.name().to_string(),
+            path: cookie.path().unwrap_or("/").to_string(),
+        }
+    }
+}
+
+fn normalize_cookie_domain(domain: &str) -> String {
+    domain.trim().trim_start_matches('.').to_ascii_lowercase()
+}
+
+fn cookie_same_site(value: Option<&str>) -> Option<tauri::webview::cookie::SameSite> {
+    match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+        Some("lax") => Some(tauri::webview::cookie::SameSite::Lax),
+        Some("strict") => Some(tauri::webview::cookie::SameSite::Strict),
+        Some("none") | Some("no_restriction") => Some(tauri::webview::cookie::SameSite::None),
+        _ => None,
+    }
+}
+
+fn set_imported_cookie(
+    window: &WebviewWindow<Wry>,
+    cookie: &cookies::ExportedCookie,
+) -> Result<(), String> {
+    let domain = cookie.domain.trim();
+    let name = cookie.name.trim();
+    let path = if cookie.path.is_empty() {
+        "/"
+    } else {
+        &cookie.path
+    };
+    let mut builder = build_webview_cookie(
+        name,
+        cookie.value.as_str(),
+        domain,
+        path,
+        cookie.secure.unwrap_or(false),
+        cookie.http_only.unwrap_or(false),
+        cookie.host_only.unwrap_or(false),
+    );
+    if let Some(same_site) = cookie_same_site(cookie.same_site.as_deref()) {
+        builder = builder.same_site(same_site);
+    }
+    if cookie.session != Some(true) {
+        if let Some(exp) = cookie.expiration_date {
+            use tauri::webview::cookie::time;
+            if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(exp as i64) {
+                builder = builder.expires(dt);
+            }
+        }
+    }
+    window
+        .set_cookie(builder.build())
+        .map_err(|error| format!("设置 cookie「{}」失败：{error}", cookie.name))
+}
+
+fn cookie_domain_is_chatgpt_related(domain: &str) -> bool {
+    let domain = normalize_cookie_domain(domain);
+    domain == "chatgpt.com"
+        || domain.ends_with(".chatgpt.com")
+        || domain == "chat.openai.com"
+        || domain.ends_with(".chat.openai.com")
+        || domain == "openai.com"
+        || domain.ends_with(".openai.com")
+        || domain == "auth.openai.com"
+        || domain.ends_with(".auth.openai.com")
+        || domain == "auth0.openai.com"
+        || domain.ends_with(".auth0.openai.com")
+        || domain == "login.openai.com"
+        || domain.ends_with(".login.openai.com")
+}
+
+fn stored_cookie_is_chatgpt_related(cookie: &tauri::webview::cookie::Cookie<'_>) -> bool {
+    cookie
+        .domain()
+        .map(cookie_domain_is_chatgpt_related)
+        .unwrap_or(false)
+}
+
+fn approximate_chatgpt_cookie_header_bytes(
+    cookies: &[tauri::webview::cookie::Cookie<'static>],
+) -> usize {
+    cookies
+        .iter()
+        .filter(|cookie| stored_cookie_is_chatgpt_related(cookie))
+        .map(|cookie| cookie.name().len() + cookie.value().len() + 2)
+        .sum()
+}
+
+fn delete_stored_cookie(
+    window: &WebviewWindow<Wry>,
+    cookie: &tauri::webview::cookie::Cookie<'_>,
+) -> Result<(), String> {
+    let mut builder = tauri::webview::cookie::Cookie::build((cookie.name().to_string(), ""));
+    if let Some(path) = cookie.path() {
+        builder = builder.path(path.to_string());
+    }
+    if let Some(domain) = cookie.domain() {
+        builder = builder.domain(domain.to_string());
+    }
+    window
+        .delete_cookie(builder.build())
+        .map_err(|error| format!("删除 cookie「{}」失败：{error}", cookie.name()))
+}
+
+pub(crate) fn prune_oversized_chatgpt_cookies(window: &WebviewWindow<Wry>) -> Result<usize, String> {
+    let stored = window
+        .cookies()
+        .map_err(|error| format!("读取 cookies 失败：{error}"))?;
+    let header_bytes = approximate_chatgpt_cookie_header_bytes(&stored);
+    if header_bytes <= MAX_CHATGPT_COOKIE_HEADER_BYTES {
+        return Ok(0);
+    }
+
+    let mut deleted = 0;
+    for cookie in stored
+        .iter()
+        .filter(|cookie| stored_cookie_is_chatgpt_related(cookie))
+        .filter(|cookie| !cookies::is_chatgpt_essential_cookie_name(cookie.name()))
+    {
+        if delete_stored_cookie(window, cookie).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
+}
+
+fn filter_essential_chatgpt_import_cookies(
+    cookies: Vec<cookies::ExportedCookie>,
+) -> (Vec<cookies::ExportedCookie>, usize) {
+    let original_count = cookies.len();
+    let filtered: Vec<cookies::ExportedCookie> = cookies
+        .into_iter()
+        .filter(|cookie| cookies::is_chatgpt_essential_cookie_name(cookie.name.trim()))
+        .collect();
+    let skipped_count = original_count.saturating_sub(filtered.len());
+    (filtered, skipped_count)
+}
+
+fn import_cookies_into_current_window(
+    app: &AppHandle<Wry>,
+    raw: &str,
+    source_label: &str,
+) -> Result<(), String> {
+    let parsed_all = cookies::parse_cookie_import(raw)?;
+    let parsed_all_count = parsed_all.len();
+    let (parsed, skipped_count) = filter_essential_chatgpt_import_cookies(parsed_all);
+    if parsed.is_empty() {
+        return Err(
+            "未发现关键 ChatGPT 登录 cookie。为避免请求头过大导致白屏，已拒绝导入低价值 cookie。"
+                .to_string(),
+        );
+    }
+    let window = current_main_window(app).ok_or_else(|| "未找到主窗口。".to_string())?;
+
+    for cookie in &parsed {
+        set_imported_cookie(&window, cookie)?;
+    }
+    let _ = prune_oversized_chatgpt_cookies(&window);
+
+    let stored = window
+        .cookies()
+        .map_err(|error| format!("导入后读取 cookies 失败：{error}"))?;
+    let imported_identities: std::collections::HashSet<CookieIdentity> =
+        parsed.iter().map(CookieIdentity::imported).collect();
+    let stored_identities: std::collections::HashSet<CookieIdentity> =
+        stored.iter().map(CookieIdentity::stored).collect();
+    let stored_count = imported_identities
+        .intersection(&stored_identities)
+        .count();
+    let imported_login_names: std::collections::HashSet<String> = parsed
+        .iter()
+        .map(|cookie| cookie.name.trim().to_string())
+        .filter(|name| cookies::is_chatgpt_essential_cookie_name(name))
+        .collect();
+    let stored_login_names: std::collections::HashSet<String> = stored
+        .iter()
+        .map(|cookie| cookie.name().to_string())
+        .filter(|name| imported_login_names.contains(name))
+        .collect();
+    let missing_login_names: Vec<String> = imported_login_names
+        .difference(&stored_login_names)
+        .cloned()
+        .collect();
+
+    let profile_store = app.state::<ProfileStore>();
+    let profile_name = profile_store.current_profile().name;
+    let mut lines = vec![
+        format!("来源：{source_label}"),
+        format!("当前空间：{profile_name}"),
+        format!(
+            "已解析 {} 个 cookie，导入 {} 个关键 cookie，跳过 {skipped_count} 个低价值 cookie；WebKit 当前可读到 {stored_count}/{} 个目标 cookie。",
+            parsed_all_count,
+            parsed.len(),
+            imported_identities.len()
+        ),
+    ];
+
+    let has_session_cookie = imported_login_names
+        .iter()
+        .any(|name| cookies::is_chatgpt_session_cookie_name(name));
+
+    if !has_session_cookie {
+        lines.push("提示：本次内容没有 ChatGPT session-token，通常不能直接免登录。".to_string());
+    } else if missing_login_names.is_empty() {
+        let mut names: Vec<String> = imported_login_names.into_iter().collect();
+        names.sort();
+        lines.push(format!("关键登录 cookie 已写入：{}", names.join(", ")));
+    } else {
+        let mut names = missing_login_names;
+        names.sort();
+        lines.push(format!("缺失关键登录 cookie：{}", names.join(", ")));
+    }
+
+    if stored_count < imported_identities.len() {
+        let missing_names: Vec<String> = imported_identities
+            .difference(&stored_identities)
+            .take(8)
+            .map(|identity| identity.name.clone())
+            .collect();
+        if !missing_names.is_empty() {
+            lines.push(format!("未写入或不可读：{}", missing_names.join(", ")));
+        }
+    }
+
+    lines.push("正在刷新页面。".to_string());
+    let _ = window.reload();
+    native_alert("Cookie 导入结果", &lines.join("\n"));
+    Ok(())
+}
+
+fn set_default_profile_by_id(app: &AppHandle<Wry>, profile_id: &str) {
+    let profile_store = app.state::<ProfileStore>();
+    let previous_current_id = profile_store.current_profile_id();
+    let profile = match profile_store.set_default_profile(profile_id) {
+        Ok(profile) => profile,
+        Err(error) => {
+            show_menu_error(format!("设置默认空间失败：{error}"));
+            return;
+        }
+    };
+
+    rebuild_menu(app, &profile_store);
+    if previous_current_id != profile.id {
+        if let Err(error) = browser::rebuild_main_window(app, &profile_store, None) {
+            show_menu_error(format!("重建窗口失败：{error}"));
+            return;
+        }
+    }
+    native_alert("ChatGPT Rust", &format!("已将「{}」设为默认空间。", profile.name));
+}
+
+fn delete_profile_by_id(app: &AppHandle<Wry>, profile_id: &str) {
+    if profile_id == profile::DEFAULT_PROFILE_ID {
+        show_menu_error("默认内置空间不能删除。");
+        return;
+    }
+
+    let profile_store = app.state::<ProfileStore>();
+    let Some(target) = profile_store
+        .list_profiles()
+        .into_iter()
+        .find(|profile| profile.id == profile_id)
+    else {
+        show_menu_error("要删除的空间不存在。");
+        return;
+    };
+
+    if !native_confirm(
+        "删除账号空间",
+        &format!(
+            "删除账号空间「{}」？\n\n本空间的所有 cookie、登录态、缓存与本地存储将被永久删除。其他空间不受影响。",
+            target.name
+        ),
+    ) {
+        return;
+    }
+
+    let deleting_current = profile_store.current_profile_id() == target.id;
+    if let Err(error) = profile_store.delete_profile(&target.id) {
+        show_menu_error(format!("删除空间失败：{error}"));
+        return;
+    }
+
+    rebuild_menu(app, &profile_store);
+
+    let mut can_remove_data_store = true;
+    if deleting_current {
+        browser::close_auth_popups(app);
+        if let Err(error) = browser::rebuild_main_window(app, &profile_store, None) {
+            can_remove_data_store = false;
+            show_menu_error(format!("重建窗口失败：{error}"));
+        }
+    } else {
+        native_alert("ChatGPT Rust", &format!("已删除账号空间「{}」。", target.name));
+    }
+
+    if can_remove_data_store {
+        remove_profile_data_store(app, &target.id);
+    }
+}
+
 // --- Menu event handler ---
 
 fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
     let id = event.id().as_ref();
+
+    if let Some(profile_id) = menu::extract_delete_profile_id(id) {
+        delete_profile_by_id(app, profile_id);
+        return;
+    }
+
+    if let Some(profile_id) = menu::extract_set_default_profile_id(id) {
+        set_default_profile_by_id(app, profile_id);
+        return;
+    }
 
     // Profile switching
     if let Some(profile_id) = menu::extract_profile_id(id) {
@@ -206,6 +706,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             eprintln!("failed to switch profile: {e}");
             return;
         }
+        rebuild_menu(app, &profile_store);
         if let Err(e) = browser::rebuild_main_window(app, &profile_store, None) {
             eprintln!("failed to rebuild main window: {e}");
         }
@@ -226,6 +727,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             meta.fingerprint_disabled = false;
         }
         let _ = profile_store.set_meta(&current_id, &meta);
+        rebuild_menu(app, &profile_store);
         let current_url = app
             .get_webview_window(MAIN_WINDOW_LABEL)
             .and_then(|w| w.url().ok())
@@ -247,70 +749,22 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
         }
         menu::event_id::NAV_HOME => {
             let profile_store = app.state::<ProfileStore>();
-            let profile = profile_store.current_profile();
-            let homepage = profile_store.homepage_url(&profile.id);
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(url) = Url::parse(&homepage) {
-                    let _ = w.navigate(url);
-                }
-            }
+            let homepage = current_homepage(&profile_store);
+            rebuild_main_window_to(app, homepage, "回到首页失败");
         }
         menu::event_id::NAV_RELOAD => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval("location.reload()");
-            }
+            let profile_store = app.state::<ProfileStore>();
+            let target_url = current_reload_target(app, &profile_store);
+            rebuild_main_window_to(app, target_url, "重新加载失败");
         }
         menu::event_id::ZOOM_IN => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval(
-                    r#"
-                    try {
-                      const step = 0.05;
-                      const current = parseFloat(localStorage.getItem('chatgptWebviewZoom') || '1');
-                      const next = Math.min(1.4, current + step);
-                      localStorage.setItem('chatgptWebviewZoom', String(next));
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('set_native_webview_zoom', { scale: next });
-                      }
-                    } catch (_) {}
-                    "#,
-                );
-            }
+            adjust_menu_zoom(app, 0.05);
         }
         menu::event_id::ZOOM_OUT => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval(
-                    r#"
-                    try {
-                      const step = 0.05;
-                      const current = parseFloat(localStorage.getItem('chatgptWebviewZoom') || '1');
-                      const next = Math.max(0.85, current - step);
-                      localStorage.setItem('chatgptWebviewZoom', String(next));
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('set_native_webview_zoom', { scale: next });
-                      }
-                    } catch (_) {}
-                    "#,
-                );
-            }
+            adjust_menu_zoom(app, -0.05);
         }
         menu::event_id::ZOOM_RESET => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval(
-                    r#"
-                    try {
-                      localStorage.removeItem('chatgptWebviewZoom');
-                      localStorage.removeItem('htmlZoom');
-                      document.documentElement.style.zoom = '';
-                      if (document.body) document.body.style.zoom = '';
-                      window.dispatchEvent(new Event('resize'));
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('set_native_webview_zoom', { scale: 1.0 });
-                      }
-                    } catch (_) {}
-                    "#,
-                );
-            }
+            set_menu_zoom(app, 1.0);
         }
         menu::event_id::OPEN_FINGERPRINT_TEST => {
             let profile_store = app.state::<ProfileStore>();
@@ -323,10 +777,13 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             };
             let html = privacy::fingerprint_test_page_html(engine_label);
             if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval(&format!(
-                    "document.open(); document.write({}); document.close();",
-                    serde_json::to_string(&html).unwrap_or_default()
-                ));
+                let data_url = format!(
+                    "data:text/html;charset=utf-8,{}",
+                    percent_encode_data_url(&html)
+                );
+                if let Ok(url) = Url::parse(&data_url) {
+                    let _ = w.navigate(url);
+                }
             }
         }
         menu::event_id::TOGGLE_WEBRTC => {
@@ -336,6 +793,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             let mut meta = profile_store.get_meta(&current_id);
             meta.webrtc_enabled = !meta.webrtc_enabled;
             let _ = profile_store.set_meta(&current_id, &meta);
+            rebuild_menu(app, &profile_store);
             let current_url = app
                 .get_webview_window(MAIN_WINDOW_LABEL)
                 .and_then(|w| w.url().ok())
@@ -343,7 +801,6 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             let _ = browser::rebuild_main_window(app, &profile_store, current_url);
         }
         menu::event_id::PRIVACY_STATUS => {
-            // Show privacy status dialog via JS alert
             let profile_store = app.state::<ProfileStore>();
             let profile = profile_store.current_profile();
             let meta = profile_store.get_meta(&profile.id);
@@ -367,10 +824,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
                 ep = ep_text,
                 webrtc = webrtc_text,
             );
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
-                let _ = w.eval(&format!("alert('{escaped}')"));
-            }
+            native_alert("隐私状态", &msg);
         }
         menu::event_id::FP_RANDOMIZE => {
             let profile_store = app.state::<ProfileStore>();
@@ -379,6 +833,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             meta.fingerprint = Some(fingerprint::random_fingerprint());
             meta.fingerprint_disabled = false;
             let _ = profile_store.set_meta(&current_id, &meta);
+            rebuild_menu(app, &profile_store);
             let current_url = app
                 .get_webview_window(MAIN_WINDOW_LABEL)
                 .and_then(|w| w.url().ok())
@@ -387,10 +842,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
         }
         menu::event_id::FP_ABOUT => {
             let msg = "能加强：每个空间固定一套指纹，覆盖 UA、navigator、screen、Canvas、WebGL、AudioContext 等。\n\n挡不住：TLS 指纹、HTTP/2 帧顺序、Worker/字体/GPU/IP/行为模式。\n\n本 App 只做一致性隐私指纹，不做跨引擎伪装。";
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let escaped = msg.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', "\\n");
-                let _ = w.eval(&format!("alert('{escaped}')"));
-            }
+            native_alert("关于指纹混淆", msg);
         }
         menu::event_id::TOGGLE_ENHANCED_PRIVACY => {
             let profile_store = app.state::<ProfileStore>();
@@ -398,145 +850,202 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             let mut meta = profile_store.get_meta(&current_id);
             meta.enhanced_privacy = !meta.enhanced_privacy;
             let _ = profile_store.set_meta(&current_id, &meta);
+            rebuild_menu(app, &profile_store);
             let current_url = app
                 .get_webview_window(MAIN_WINDOW_LABEL)
                 .and_then(|w| w.url().ok())
                 .map(|u| u.to_string());
             let _ = browser::rebuild_main_window(app, &profile_store, current_url);
         }
+        menu::event_id::SET_DEFAULT_PROFILE => {
+            let profile_store = app.state::<ProfileStore>();
+            let current_id = profile_store.current_profile_id();
+            set_default_profile_by_id(app, &current_id);
+        }
         menu::event_id::GO_TO_URL => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = w.eval(
-                    r#"
-                    (() => {
-                      const raw = prompt('前往网址\n输入 https:// 开头的网址：', location.href);
-                      if (!raw) return;
-                      const trimmed = raw.trim();
-                      if (!trimmed.startsWith('https://')) {
-                        alert('仅支持 https:// 网址');
-                        return;
-                      }
-                      try {
-                        const url = new URL(trimmed);
-                        if (url.hostname) location.href = trimmed;
-                      } catch (_) {
-                        alert('网址无效');
-                      }
-                    })()
-                    "#,
-                );
+            let current = current_main_window(app)
+                .and_then(|window| window.url().ok())
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| "https://chatgpt.com/".to_string());
+            let Some(raw) = native_prompt("前往网址", "输入 https:// 开头的网址：", &current) else {
+                return;
+            };
+            match parse_https_url(&raw) {
+                Ok(url) => {
+                    rebuild_main_window_to(app, url.to_string(), "前往网址失败");
+                }
+                Err(error) => show_menu_error(error),
             }
         }
         menu::event_id::ADD_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_CREATE_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const name = prompt('新建账号空间\n输入空间名称：');
-                      if (!name || !name.trim()) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_create_profile', { token, name: name.trim() });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let Some(name) = native_prompt("新建账号空间", "输入空间名称：", "") else {
+                return;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return;
+            }
+            let profile_store = app.state::<ProfileStore>();
+            match profile_store.create_profile(name) {
+                Ok(profile) => {
+                    if let Err(error) = profile_store.switch_profile(&profile.id) {
+                        show_menu_error(format!("切换空间失败：{error}"));
+                        return;
+                    }
+                    rebuild_menu(app, &profile_store);
+                    if let Err(error) = browser::rebuild_main_window(app, &profile_store, None) {
+                        show_menu_error(format!("重建窗口失败：{error}"));
+                    }
                 }
+                Err(error) => show_menu_error(format!("新建空间失败：{error}")),
             }
         }
         menu::event_id::CLONE_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_CLONE_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const name = prompt('克隆当前空间\n输入新空间名称（留空自动生成）：');
-                      if (name === null) return;
-                      const copyCookies = confirm('是否同时复制 cookies？\n\n选"确定"会复制当前空间的 cookies 到新空间。');
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_clone_profile', { token, name: name.trim(), copyCookies });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let profile_store = app.state::<ProfileStore>();
+            let current = profile_store.current_profile();
+            let default_name = format!("{} 副本", current.name);
+            let Some(name) =
+                native_prompt("克隆当前空间", "输入新空间名称（留空自动生成）：", &default_name)
+            else {
+                return;
+            };
+            let copy_cookies = native_confirm(
+                "克隆当前空间",
+                "是否同时复制 cookies？\n\n点“确定”会复制当前空间的 cookies 到新空间。",
+            );
+            let current_id = profile_store.current_profile_id();
+            match profile_store.clone_profile(&current_id, name.trim()) {
+                Ok((profile, _source_meta)) => {
+                    if copy_cookies {
+                        if let Some(source_window) = current_main_window(app) {
+                            match source_window.cookies() {
+                                Ok(cookies) => {
+                                    let cookie_values: Vec<serde_json::Value> = cookies
+                                        .iter()
+                                        .map(|c| {
+                                            serde_json::json!({
+                                                "name": c.name(),
+                                                "value": c.value(),
+                                                "domain": c.domain().unwrap_or(""),
+                                                "path": c.path().unwrap_or("/"),
+                                                "secure": c.secure().unwrap_or(false),
+                                                "http_only": c.http_only().unwrap_or(false),
+                                                "host_only": !c.domain().unwrap_or("").starts_with('.'),
+                                                "expires": c.expires_datetime().map(|dt| dt.unix_timestamp() as f64),
+                                            })
+                                        })
+                                        .collect();
+                                    if let Ok(mut pending) =
+                                        app.state::<PendingCookies>().0.lock()
+                                    {
+                                        *pending = Some(cookie_values);
+                                    }
+                                }
+                                Err(error) => eprintln!("failed to read source cookies: {error}"),
+                            }
+                        }
+                    }
+
+                    if let Err(error) = profile_store.switch_profile(&profile.id) {
+                        show_menu_error(format!("切换空间失败：{error}"));
+                        return;
+                    }
+                    rebuild_menu(app, &profile_store);
+                    if let Err(error) = browser::rebuild_main_window(app, &profile_store, None) {
+                        show_menu_error(format!("重建窗口失败：{error}"));
+                        return;
+                    }
+
+                    if copy_cookies {
+                        let cookie_values = app
+                            .state::<PendingCookies>()
+                            .0
+                            .lock()
+                            .ok()
+                            .and_then(|mut pending| pending.take());
+                        if let (Some(values), Some(window)) = (cookie_values, current_main_window(app)) {
+                            for cv in &values {
+                                let name = cv["name"].as_str().unwrap_or("");
+                                let value = cv["value"].as_str().unwrap_or("");
+                                let domain = cv["domain"].as_str().unwrap_or("");
+                                let path = cv["path"].as_str().unwrap_or("/");
+                                let secure = cv["secure"].as_bool().unwrap_or(false);
+                                let http_only = cv["http_only"].as_bool().unwrap_or(false);
+                                let host_only = cv["host_only"].as_bool().unwrap_or(false);
+                                let mut cookie = build_webview_cookie(
+                                    name, value, domain, path, secure, http_only, host_only,
+                                );
+                                if let Some(expires) = cv["expires"].as_f64() {
+                                    if expires > 0.0 {
+                                        use tauri::webview::cookie::time;
+                                        if let Ok(dt) =
+                                            time::OffsetDateTime::from_unix_timestamp(expires as i64)
+                                        {
+                                            cookie = cookie.expires(dt);
+                                        }
+                                    }
+                                }
+                                let _ = window.set_cookie(cookie.build());
+                            }
+                        }
+                    }
                 }
+                Err(error) => show_menu_error(format!("克隆空间失败：{error}")),
             }
         }
         menu::event_id::RENAME_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_RENAME_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const name = prompt('重命名当前空间\n输入新名称：');
-                      if (!name || !name.trim()) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_rename_profile', { token, name: name.trim() });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let profile_store = app.state::<ProfileStore>();
+            let current = profile_store.current_profile();
+            let Some(name) = native_prompt("重命名当前空间", "输入新名称：", &current.name) else {
+                return;
+            };
+            let name = name.trim();
+            if name.is_empty() {
+                return;
+            }
+            match profile_store.rename_profile(&current.id, name) {
+                Ok(()) => {
+                    rebuild_menu(app, &profile_store);
+                    if let Some(window) = current_main_window(app) {
+                        let title = browser::main_window_title(name, &current.id);
+                        let _ = window.set_title(&title);
+                    }
                 }
+                Err(error) => show_menu_error(format!("重命名失败：{error}")),
             }
         }
         menu::event_id::DELETE_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_DELETE_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      if (!confirm('删除当前空间？\n本空间的所有 cookie、登录态、缓存将被永久删除。其他空间不受影响。')) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_delete_profile', { token });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
-                }
-            }
+            let profile_store = app.state::<ProfileStore>();
+            let current_id = profile_store.current_profile_id();
+            delete_profile_by_id(app, &current_id);
         }
         menu::event_id::SET_HOMEPAGE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_SET_HOMEPAGE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const url = prompt('设置当前空间首页\n输入 https:// 网址：', location.href);
-                      if (url === null) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_set_homepage', { token, url: url.trim() });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let profile_store = app.state::<ProfileStore>();
+            let current_id = profile_store.current_profile_id();
+            let current_url = current_main_window(app)
+                .and_then(|window| window.url().ok())
+                .map(|url| url.to_string())
+                .unwrap_or_else(|| profile_store.homepage_url(&current_id));
+            let Some(raw) =
+                native_prompt("设置当前空间首页", "输入 https:// 网址：", &current_url)
+            else {
+                return;
+            };
+            match parse_https_url(&raw) {
+                Ok(url) => {
+                    if let Err(error) = profile_store.set_homepage(&current_id, url.as_str()) {
+                        show_menu_error(format!("设置首页失败：{error}"));
+                    }
                 }
+                Err(error) => show_menu_error(error),
             }
         }
         menu::event_id::RESET_HOMEPAGE => {
             let profile_store = app.state::<ProfileStore>();
             let current_id = profile_store.current_profile_id();
             let _ = profile_store.set_homepage(&current_id, "");
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let homepage = profile_store.homepage_url(&current_id);
-                if let Ok(url) = Url::parse(&homepage) {
-                    let _ = w.navigate(url);
-                }
-            }
+            let homepage = profile_store.homepage_url(&current_id);
+            rebuild_main_window_to(app, homepage, "恢复首页失败");
         }
         menu::event_id::EXPORT_PROFILE => {
             let profile_store = app.state::<ProfileStore>();
@@ -551,97 +1060,204 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
                 fingerprint: meta.fingerprint.clone(),
                 fingerprint_disabled: Some(meta.fingerprint_disabled),
                 enhanced_privacy_enabled: meta.enhanced_privacy,
+                webrtc_enabled: Some(meta.webrtc_enabled),
             };
             match serde_json::to_string_pretty(&doc) {
                 Ok(json) => {
-                    // Copy to clipboard using native API
                     match arboard::Clipboard::new() {
                         Ok(mut clipboard) => {
                             if let Err(e) = clipboard.set_text(&json) {
-                                eprintln!("failed to write to clipboard: {e}");
+                                show_menu_error(format!("写入剪贴板失败：{e}"));
+                            } else {
+                                native_alert("ChatGPT Rust", "已复制当前空间配置到剪贴板。");
                             }
                         }
-                        Err(e) => eprintln!("failed to access clipboard: {e}"),
+                        Err(e) => show_menu_error(format!("访问剪贴板失败：{e}")),
                     }
                 }
-                Err(e) => eprintln!("export failed: {e}"),
+                Err(e) => show_menu_error(format!("导出失败：{e}")),
             }
         }
         menu::event_id::IMPORT_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_IMPORT_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const json = prompt('导入空间配置\n粘贴之前导出的 JSON：');
-                      if (!json) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_import_profile', { token, json });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            if !native_confirm(
+                "导入空间配置",
+                "将从剪贴板读取之前导出的空间 JSON，并导入为新空间。",
+            ) {
+                return;
+            }
+            let json = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => text,
+                Err(error) => {
+                    show_menu_error(format!("读取剪贴板失败：{error}"));
+                    return;
                 }
+            };
+            let doc: ProfileExportDocument = match serde_json::from_str(&json) {
+                Ok(doc) => doc,
+                Err(error) => {
+                    show_menu_error(format!("Profile JSON 解析失败：{error}"));
+                    return;
+                }
+            };
+            if doc.schema_version != 1 {
+                show_menu_error("Profile JSON 版本不支持。");
+                return;
+            }
+            let profile_store = app.state::<ProfileStore>();
+            let name = if doc.name.trim().is_empty() {
+                "导入空间".to_string()
+            } else {
+                doc.name.clone()
+            };
+            let profile = match profile_store.create_profile(&name) {
+                Ok(profile) => profile,
+                Err(error) => {
+                    show_menu_error(format!("创建导入空间失败：{error}"));
+                    return;
+                }
+            };
+            if let Some(ref homepage) = doc.homepage {
+                if homepage.starts_with("https://") {
+                    let _ = profile_store.set_homepage(&profile.id, homepage);
+                }
+            }
+            let mut meta = profile_store.get_meta(&profile.id);
+            if let Some(fp) = doc.fingerprint {
+                meta.fingerprint = Some(fp);
+                meta.fingerprint_disabled = false;
+            } else if doc.fingerprint_disabled == Some(true) {
+                meta.fingerprint_disabled = true;
+            }
+            meta.enhanced_privacy = doc.enhanced_privacy_enabled;
+            if let Some(webrtc_enabled) = doc.webrtc_enabled {
+                meta.webrtc_enabled = webrtc_enabled;
+            }
+            let _ = profile_store.set_meta(&profile.id, &meta);
+            if let Err(error) = profile_store.switch_profile(&profile.id) {
+                show_menu_error(format!("切换导入空间失败：{error}"));
+                return;
+            }
+            rebuild_menu(app, &profile_store);
+            if let Err(error) = browser::rebuild_main_window(app, &profile_store, None) {
+                show_menu_error(format!("重建窗口失败：{error}"));
             }
         }
         menu::event_id::IMPORT_COOKIES => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_IMPORT_COOKIES) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      const json = prompt('导入 Cookies\n支持 JSON、Netscape cookies.txt、Cookie/Header String。请粘贴内容：');
-                      if (!json) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_import_cookies', { token, json });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let Some(path) = native_choose_file(
+                "选择 cookie 文件。支持 JSON、Netscape cookies.txt、Cookie/Header String 文本。将导入到当前账号空间。",
+            ) else {
+                return;
+            };
+            let raw = match fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    show_menu_error(format!("读取 cookie 文件失败：{error}"));
+                    return;
                 }
+            };
+            let label = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("cookie 文件");
+            if let Err(error) = import_cookies_into_current_window(app, &raw, label) {
+                show_menu_error(format!("Cookie 导入失败：{error}"));
+            }
+        }
+        menu::event_id::PASTE_COOKIES => {
+            if !native_confirm(
+                "粘贴 Cookies",
+                "将从剪贴板读取 Cookies 文本。支持 JSON、Netscape cookies.txt、Cookie/Header String。内容会导入到当前账号空间。",
+            ) {
+                return;
+            }
+            let raw = match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+                Ok(text) => text,
+                Err(error) => {
+                    show_menu_error(format!("读取剪贴板失败：{error}"));
+                    return;
+                }
+            };
+            if let Err(error) = import_cookies_into_current_window(app, &raw, "剪贴板") {
+                show_menu_error(format!("Cookie 导入失败：{error}"));
             }
         }
         menu::event_id::EXPORT_COOKIES => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_EXPORT_COOKIES) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_export_cookies', { token });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            let Some(window) = current_main_window(app) else {
+                show_menu_error("未找到主窗口。");
+                return;
+            };
+            let cookies = match window.cookies() {
+                Ok(cookies) => cookies,
+                Err(error) => {
+                    show_menu_error(format!("读取 cookies 失败：{error}"));
+                    return;
                 }
+            };
+            if cookies.is_empty() {
+                show_menu_error("当前空间没有可导出的 cookie。");
+                return;
+            }
+            let exported: Vec<serde_json::Value> = cookies
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "domain": c.domain().unwrap_or(""),
+                        "name": c.name(),
+                        "value": c.value(),
+                        "path": c.path().unwrap_or("/"),
+                        "secure": c.secure().unwrap_or(false),
+                        "httpOnly": c.http_only().unwrap_or(false),
+                        "session": c.expires().is_none(),
+                        "hostOnly": !c.domain().unwrap_or("").starts_with('.'),
+                        "expirationDate": c.expires_datetime().map(|dt| dt.unix_timestamp() as f64),
+                        "sameSite": match c.same_site() {
+                            Some(tauri::webview::cookie::SameSite::Lax) => "lax",
+                            Some(tauri::webview::cookie::SameSite::Strict) => "strict",
+                            Some(tauri::webview::cookie::SameSite::None) => "none",
+                            _ => "unspecified",
+                        },
+                    })
+                })
+                .collect();
+            let json = match serde_json::to_string_pretty(&exported) {
+                Ok(json) => json,
+                Err(error) => {
+                    show_menu_error(format!("JSON 序列化失败：{error}"));
+                    return;
+                }
+            };
+            match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(&json)) {
+                Ok(()) => native_alert(
+                    "ChatGPT Rust",
+                    &format!("已复制 {} 个 cookie 到剪贴板（含 HttpOnly）。", cookies.len()),
+                ),
+                Err(error) => show_menu_error(format!("写入剪贴板失败：{error}")),
             }
         }
         menu::event_id::BURN_CURRENT_PROFILE => {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                if let Ok(token) = mint_menu_token(app, MENU_BURN_CURRENT_PROFILE) {
-                    let script = menu_token_script(
-                        r#"
-                    (() => {
-                      const token = __MENU_TOKEN__;
-                      if (!confirm('焚烧当前空间？\n\n会删除当前空间所有 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭弹窗，清空页面历史，重建浏览器视图，并重新随机化指纹。\n\n保留：空间名称、首页、增强隐私设置。其他空间不受影响。')) return;
-                      if (window.__TAURI__ && window.__TAURI__.core) {
-                        window.__TAURI__.core.invoke('cmd_burn_current_profile', { token });
-                      }
-                    })()
-                    "#,
-                        &token,
-                    );
-                    let _ = w.eval(&script);
+            if !native_confirm(
+                "焚烧当前空间",
+                "会删除当前空间所有 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭弹窗，清空页面历史，重建浏览器视图，并重新随机化指纹。\n\n保留：空间名称、首页、增强隐私设置。其他空间不受影响。",
+            ) {
+                return;
+            }
+            let profile_store = app.state::<ProfileStore>();
+            let current_id = profile_store.current_profile_id();
+            if let Some(window) = current_main_window(app) {
+                if let Err(error) = window.clear_all_browsing_data() {
+                    eprintln!("failed to clear browsing data: {error}");
                 }
+            }
+            browser::close_auth_popups(app);
+            let mut meta = profile_store.get_meta(&current_id);
+            meta.fingerprint = Some(fingerprint::random_fingerprint());
+            meta.fingerprint_disabled = false;
+            let _ = profile_store.set_meta(&current_id, &meta);
+            let homepage = profile_store.homepage_url(&current_id);
+            if let Err(error) = browser::rebuild_main_window(app, &profile_store, Some(homepage)) {
+                show_menu_error(format!("重建窗口失败：{error}"));
+            } else {
+                native_alert("ChatGPT Rust", "已焚烧当前空间浏览现场，并重新随机化指纹。");
             }
         }
         menu::event_id::NEW_INCOGNITO => {
@@ -653,7 +1269,10 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             );
             let app_for_nav = app.clone();
             let app_for_download = app.clone();
-            let result = WebviewWindowBuilder::new(
+            let profile_store = app.state::<ProfileStore>();
+            let current_id = profile_store.current_profile_id();
+            let init_scripts = browser::build_init_scripts(&profile_store, &current_id);
+            let mut builder = WebviewWindowBuilder::new(
                 app,
                 label,
                 WebviewUrl::External("about:blank".parse().unwrap()),
@@ -666,11 +1285,11 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             .focused(true)
             .incognito(true)
             .on_navigation(move |url| handle_navigation(&app_for_nav, url))
-            .on_download(move |_webview, event| handle_download_event(&app_for_download, event))
-            .initialization_script(privacy::NATIVE_SHIM_SCRIPT)
-            .initialization_script(privacy::PRIVACY_SIGNALS_SCRIPT)
-            .initialization_script(CHATGPT_WEBVIEW_SCRIPT)
-            .build();
+            .on_download(move |_webview, event| handle_download_event(&app_for_download, event));
+            for script in &init_scripts {
+                builder = builder.initialization_script(script);
+            }
+            let result = builder.build();
             if let Ok(window) = result {
                 let _ = window.navigate(Url::parse("https://chatgpt.com/").unwrap());
             }
@@ -679,464 +1298,6 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             eprintln!("unhandled menu event: {id}");
         }
     }
-}
-
-// --- Tauri commands for JS-invoked operations ---
-
-#[tauri::command]
-fn cmd_create_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    name: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_CREATE_PROFILE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let profile = profile_store.create_profile(&name)?;
-    profile_store.switch_profile(&profile.id)?;
-    let menu = menu::build_app_menu(&app, &profile_store);
-    app.set_menu(menu).map_err(|e| e.to_string())?;
-    browser::rebuild_main_window(&app, &profile_store, None)?;
-    Ok(())
-}
-
-/// In-memory storage for cookies pending injection during profile clone.
-/// Avoids writing session cookies to disk.
-#[derive(Default)]
-struct PendingCookies(Mutex<Option<Vec<serde_json::Value>>>);
-
-#[tauri::command]
-fn cmd_clone_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    name: String,
-    copy_cookies: bool,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_CLONE_PROFILE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let current_id = profile_store.current_profile_id();
-    let (profile, _source_meta) = profile_store.clone_profile(&current_id, &name)?;
-
-    // Optionally copy cookies from source profile using native API
-    if copy_cookies {
-        if let Some(source_window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-            match source_window.cookies() {
-                Ok(cookies) => {
-                    // Store cookies in memory for later injection
-                    let cookie_values: Vec<serde_json::Value> = cookies.iter().map(|c| {
-                        serde_json::json!({
-                            "name": c.name(),
-                            "value": c.value(),
-                            "domain": c.domain().unwrap_or(""),
-                            "path": c.path().unwrap_or("/"),
-                            "secure": c.secure().unwrap_or(false),
-                            "http_only": c.http_only().unwrap_or(false),
-                            "host_only": !c.domain().unwrap_or("").starts_with('.'),
-                            "expires": c.expires_datetime().map(|dt| dt.unix_timestamp() as f64),
-                        })
-                    }).collect();
-
-                    let state = app.state::<PendingCookies>();
-                    let mut pending = state.0.lock().map_err(|_| "lock poisoned".to_string())?;
-                    *pending = Some(cookie_values);
-                }
-                Err(e) => eprintln!("failed to read source cookies: {e}"),
-            }
-        }
-    }
-
-    profile_store.switch_profile(&profile.id)?;
-    let menu = menu::build_app_menu(&app, &profile_store);
-    app.set_menu(menu).map_err(|e| e.to_string())?;
-    browser::rebuild_main_window(&app, &profile_store, None)?;
-
-    // If cookies were copied, inject them into the new WebView from memory
-    if copy_cookies {
-        let cookie_values = {
-            let state = app.state::<PendingCookies>();
-            let mut pending = state.0.lock().map_err(|_| "lock poisoned".to_string())?;
-            pending.take()
-        };
-
-        if let Some(values) = cookie_values {
-            if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                for cv in &values {
-                    let name = cv["name"].as_str().unwrap_or("");
-                    let value = cv["value"].as_str().unwrap_or("");
-                    let domain = cv["domain"].as_str().unwrap_or("");
-                    let path = cv["path"].as_str().unwrap_or("/");
-                    let secure = cv["secure"].as_bool().unwrap_or(false);
-                    let http_only = cv["http_only"].as_bool().unwrap_or(false);
-                    let host_only = cv["host_only"].as_bool().unwrap_or(false);
-
-                    let url_domain = domain.strip_prefix('.').unwrap_or(domain);
-                    let scheme = if secure { "https" } else { "http" };
-                    let url_str = format!("{scheme}://{url_domain}{path}");
-                    if tauri::Url::parse(&url_str).is_ok() {
-                        let mut cookie = build_webview_cookie(
-                            name,
-                            value,
-                            domain,
-                            path,
-                            secure,
-                            http_only,
-                            host_only,
-                        );
-                        if let Some(expires) = cv["expires"].as_f64() {
-                            if expires > 0.0 {
-                                use tauri::webview::cookie::time;
-                                if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(expires as i64) {
-                                    cookie = cookie.expires(dt);
-                                }
-                            }
-                        }
-                        let _ = w.set_cookie(cookie.build());
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[tauri::command]
-fn cmd_rename_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    name: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_RENAME_PROFILE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let current_id = profile_store.current_profile_id();
-
-    // Cannot rename the default profile
-    if current_id == profile::DEFAULT_PROFILE_ID {
-        return Err("cannot rename the default profile".to_string());
-    }
-
-    profile_store.rename_profile(&current_id, &name)?;
-    let menu = menu::build_app_menu(&app, &profile_store);
-    app.set_menu(menu).map_err(|e| e.to_string())?;
-    // Update window title
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        let title = browser::main_window_title(&name, &current_id);
-        let _ = w.set_title(&title);
-    }
-    Ok(())
-}
-
-#[tauri::command]
-async fn cmd_delete_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_DELETE_PROFILE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let current_id = profile_store.current_profile_id();
-
-    // Cannot delete the default profile
-    if current_id == profile::DEFAULT_PROFILE_ID {
-        return Err("cannot delete the default profile".to_string());
-    }
-
-    // Step 1: Destroy main window and auth popups to release the data store
-    browser::close_auth_popups(&app);
-    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        window
-            .destroy()
-            .map_err(|e| format!("failed to destroy main window: {e}"))?;
-    }
-
-    // Step 2: On macOS, remove the WKWebsiteDataStore now that no window uses it
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(uuid_bytes) = browser::profile_id_to_uuid_bytes(&current_id) {
-            if let Err(e) = app.remove_data_store(uuid_bytes).await {
-                eprintln!("failed to remove data store for profile '{current_id}': {e}");
-            }
-        }
-    }
-
-    // Step 3: Delete profile metadata
-    profile_store.delete_profile(&current_id)?;
-
-    // Step 4: Rebuild menu and default window
-    let menu = menu::build_app_menu(&app, &profile_store);
-    app.set_menu(menu).map_err(|e| e.to_string())?;
-    browser::rebuild_main_window(&app, &profile_store, None)?;
-    Ok(())
-}
-
-#[tauri::command]
-fn cmd_set_homepage(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    url: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_SET_HOMEPAGE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let current_id = profile_store.current_profile_id();
-    profile_store.set_homepage(&current_id, &url)?;
-    Ok(())
-}
-
-#[tauri::command]
-fn cmd_import_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    json: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_IMPORT_PROFILE, &token)?;
-    let doc: ProfileExportDocument =
-        serde_json::from_str(&json).map_err(|e| format!("JSON 解析失败: {e}"))?;
-    if doc.schema_version != 1 {
-        return Err("Profile JSON 版本不支持".to_string());
-    }
-
-    let profile_store = app.state::<ProfileStore>();
-    let name = if doc.name.trim().is_empty() {
-        "导入空间".to_string()
-    } else {
-        doc.name.clone()
-    };
-    let profile = profile_store.create_profile(&name)?;
-
-    if let Some(ref homepage) = doc.homepage {
-        if homepage.starts_with("https://") {
-            let _ = profile_store.set_homepage(&profile.id, homepage);
-        }
-    }
-
-    let mut meta = profile_store.get_meta(&profile.id);
-    if let Some(fp) = doc.fingerprint {
-        meta.fingerprint = Some(fp);
-        meta.fingerprint_disabled = false;
-    } else if doc.fingerprint_disabled == Some(true) {
-        meta.fingerprint_disabled = true;
-    }
-    meta.enhanced_privacy = doc.enhanced_privacy_enabled;
-    let _ = profile_store.set_meta(&profile.id, &meta);
-
-    profile_store.switch_profile(&profile.id)?;
-    let menu = menu::build_app_menu(&app, &profile_store);
-    app.set_menu(menu).map_err(|e| e.to_string())?;
-    browser::rebuild_main_window(&app, &profile_store, None)?;
-    Ok(())
-}
-
-#[tauri::command]
-fn cmd_import_cookies(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-    json: String,
-) -> Result<String, String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_IMPORT_COOKIES, &token)?;
-    let cookies = cookies::parse_cookie_import(&json)?;
-    let count = cookies.len();
-
-    for c in &cookies {
-        let domain = c.domain.trim();
-        let name = c.name.trim();
-        let path = if c.path.is_empty() { "/" } else { &c.path };
-        let secure = c.secure.unwrap_or(false);
-        let http_only = c.http_only.unwrap_or(false);
-        let host_only = c.host_only.unwrap_or(false);
-
-        let mut cookie = build_webview_cookie(
-            name,
-            c.value.as_str(),
-            domain,
-            path,
-            secure,
-            http_only,
-            host_only,
-        );
-
-        // Set same_site
-        cookie = match c.same_site.as_deref() {
-            Some("lax") => cookie.same_site(tauri::webview::cookie::SameSite::Lax),
-            Some("strict") => cookie.same_site(tauri::webview::cookie::SameSite::Strict),
-            Some("none") | Some("no_restriction") => {
-                cookie.same_site(tauri::webview::cookie::SameSite::None)
-            }
-            _ => cookie,
-        };
-
-        // Set expiration
-        if c.session != Some(true) {
-            if let Some(exp) = c.expiration_date {
-                use tauri::webview::cookie::time;
-                if let Ok(dt) = time::OffsetDateTime::from_unix_timestamp(exp as i64) {
-                    cookie = cookie.expires(dt);
-                }
-            }
-        }
-
-        window
-            .set_cookie(cookie.build())
-            .map_err(|e| format!("failed to set cookie '{}': {e}", c.name))?;
-    }
-
-    // Reload to pick up new cookies
-    let _ = window.eval("location.reload()");
-
-    Ok(format!("已导入 {count} 个 cookie"))
-}
-
-#[tauri::command]
-fn cmd_export_cookies(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-) -> Result<String, String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_EXPORT_COOKIES, &token)?;
-    // Use native cookie API to read all cookies (including HttpOnly)
-    let cookies = window
-        .cookies()
-        .map_err(|e| format!("failed to read cookies: {e}"))?;
-
-    if cookies.is_empty() {
-        return Err("当前空间没有可导出的 cookie".to_string());
-    }
-
-    // Convert to our export format
-    let exported: Vec<serde_json::Value> = cookies
-        .iter()
-        .map(|c| {
-            serde_json::json!({
-                "domain": c.domain().unwrap_or(""),
-                "name": c.name(),
-                "value": c.value(),
-                "path": c.path().unwrap_or("/"),
-                "secure": c.secure().unwrap_or(false),
-                "httpOnly": c.http_only().unwrap_or(false),
-                "session": c.expires().is_none(),
-                "hostOnly": !c.domain().unwrap_or("").starts_with('.'),
-                "expirationDate": c.expires_datetime().map(|dt| dt.unix_timestamp() as f64),
-                "sameSite": match c.same_site() {
-                    Some(tauri::webview::cookie::SameSite::Lax) => "lax",
-                    Some(tauri::webview::cookie::SameSite::Strict) => "strict",
-                    Some(tauri::webview::cookie::SameSite::None) => "none",
-                    _ => "unspecified",
-                },
-            })
-        })
-        .collect();
-
-    let json = serde_json::to_string_pretty(&exported)
-        .map_err(|e| format!("JSON 序列化失败: {e}"))?;
-
-    // Copy to clipboard using native API (no JS injection back into page)
-    let count = cookies.len();
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|e| format!("failed to access clipboard: {e}"))?;
-    clipboard
-        .set_text(&json)
-        .map_err(|e| format!("failed to write to clipboard: {e}"))?;
-
-    Ok(format!("已复制 {count} 个 cookie 到剪贴板（含 HttpOnly）"))
-}
-
-#[tauri::command]
-fn cmd_burn_current_profile(
-    app: AppHandle<Wry>,
-    window: WebviewWindow<Wry>,
-    token: String,
-) -> Result<(), String> {
-    ensure_trusted_command_window(&window)?;
-    consume_menu_token(&app, MENU_BURN_CURRENT_PROFILE, &token)?;
-    let profile_store = app.state::<ProfileStore>();
-    let current_id = profile_store.current_profile_id();
-
-    // Use native API to clear all browsing data (cookies, cache, localStorage, etc.)
-    if let Some(w) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-        // Clear native browsing data first (cookies, cache, Service Workers, etc.)
-        if let Err(e) = w.clear_all_browsing_data() {
-            eprintln!("failed to clear browsing data: {e}");
-        }
-
-        // Also clear JS-accessible storage as a belt-and-suspenders measure
-        let _ = w.eval(
-            r#"
-            try {
-              localStorage.clear();
-              sessionStorage.clear();
-            } catch (_) {}
-            "#,
-        );
-    }
-
-    // Close auth popups
-    browser::close_auth_popups(&app);
-
-    // Re-randomize fingerprint
-    let mut meta = profile_store.get_meta(&current_id);
-    meta.fingerprint = Some(fingerprint::random_fingerprint());
-    meta.fingerprint_disabled = false;
-    let _ = profile_store.set_meta(&current_id, &meta);
-
-    // Rebuild with homepage
-    let homepage = profile_store.homepage_url(&current_id);
-    browser::rebuild_main_window(&app, &profile_store, Some(homepage))?;
-
-    Ok(())
-}
-
-fn mint_menu_token(app: &AppHandle<Wry>, action: &'static str) -> Result<String, String> {
-    let token = format!("{action}:{}", Uuid::new_v4());
-    let state = app.state::<MenuCommandTokens>();
-    let mut tokens = state
-        .0
-        .lock()
-        .map_err(|_| "menu token lock is poisoned".to_string())?;
-    insert_menu_token(&mut tokens, &token, action);
-    Ok(token)
-}
-
-fn consume_menu_token(app: &AppHandle<Wry>, action: &'static str, token: &str) -> Result<(), String> {
-    let state = app.state::<MenuCommandTokens>();
-    let mut tokens = state
-        .0
-        .lock()
-        .map_err(|_| "menu token lock is poisoned".to_string())?;
-
-    consume_menu_token_from_map(&mut tokens, action, token)
-}
-
-fn insert_menu_token(tokens: &mut HashMap<String, &'static str>, token: &str, action: &'static str) {
-    tokens.insert(token.to_string(), action);
-}
-
-fn consume_menu_token_from_map(
-    tokens: &mut HashMap<String, &'static str>,
-    action: &'static str,
-    token: &str,
-) -> Result<(), String> {
-    match tokens.remove(token) {
-        Some(stored_action) if stored_action == action => Ok(()),
-        Some(_) => Err("menu command token does not match this action".to_string()),
-        None => Err("sensitive command requires a fresh native menu token".to_string()),
-    }
-}
-
-fn menu_token_script(script: &str, token: &str) -> String {
-    let token = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".to_string());
-    script.replace("__MENU_TOKEN__", &token)
 }
 
 fn build_webview_cookie<'a>(
@@ -1180,22 +1341,13 @@ pub fn run() {
         .manage(BlobDownloadSessions::default())
         .manage(BrowserState::new())
         .manage(PendingCookies::default())
-        .manage(MenuCommandTokens::default())
+        .manage(NativeZoomState::default())
         .invoke_handler(tauri::generate_handler![
             start_blob_download,
             append_blob_download,
             finish_blob_download,
             cancel_blob_download,
             set_native_webview_zoom,
-            cmd_create_profile,
-            cmd_clone_profile,
-            cmd_rename_profile,
-            cmd_delete_profile,
-            cmd_set_homepage,
-            cmd_import_profile,
-            cmd_import_cookies,
-            cmd_export_cookies,
-            cmd_burn_current_profile,
         ])
         .setup(move |app| {
             // Initialize profile store
@@ -1236,14 +1388,25 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("failed to build ChatGPT Rust Tauri app")
         .run(|app, event| {
-            if let RunEvent::Reopen {
-                has_visible_windows,
-                ..
-            } = event
-            {
-                if !has_visible_windows {
-                    show_main_window(app);
+            match event {
+                RunEvent::ExitRequested { api, .. } => {
+                    let browser_state = app.state::<BrowserState>();
+                    if browser_state
+                        .main_rebuild_in_progress
+                        .load(Ordering::SeqCst)
+                    {
+                        api.prevent_exit();
+                    }
                 }
+                RunEvent::Reopen {
+                    has_visible_windows,
+                    ..
+                } => {
+                    if !has_visible_windows {
+                        show_main_window(app);
+                    }
+                }
+                _ => {}
             }
         });
 }
@@ -1265,7 +1428,8 @@ fn handle_navigation(app: &AppHandle<Wry>, url: &Url) -> bool {
 fn should_stay_inside_app(url: &Url) -> bool {
     match url.scheme() {
         "https" => {}
-        "about" | "blob" | "data" => return true,
+        "about" => return url.as_str() == "about:blank",
+        "blob" | "data" => return true,
         "http" => {
             let Some(host) = url.host_str().map(|host| host.to_ascii_lowercase()) else {
                 return false;
@@ -1279,7 +1443,11 @@ fn should_stay_inside_app(url: &Url) -> bool {
         return false;
     };
 
-    if is_chatgpt_host(&host) || is_openai_auth_host(&host) || is_oauth_host(&host, url.path()) {
+    if is_chatgpt_host(&host)
+        || is_openai_auth_host(&host)
+        || is_oauth_host(&host, url.path())
+        || is_cloudflare_challenge_url(&host, url.path())
+    {
         return true;
     }
 
@@ -1327,6 +1495,10 @@ fn is_oauth_host(host: &str, path: &str) -> bool {
     }
 }
 
+fn is_cloudflare_challenge_url(host: &str, path: &str) -> bool {
+    host == "challenges.cloudflare.com" && path.starts_with("/cdn-cgi/challenge-platform/")
+}
+
 // --- Download handling ---
 
 fn handle_download_event(app: &AppHandle<Wry>, event: DownloadEvent<'_>) -> bool {
@@ -1372,8 +1544,8 @@ fn open_url_with_system_browser(url: &str) -> io::Result<()> {
 
 #[cfg(target_os = "windows")]
 fn open_url_with_system_browser(url: &str) -> io::Result<()> {
-    Command::new("cmd")
-        .args(["/C", "start", "", url])
+    Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
         .spawn()
         .map(|_| ())
 }
@@ -1420,7 +1592,10 @@ fn sanitize_filename(filename: &str) -> String {
     let mut sanitized: String = filename
         .chars()
         .map(|char| {
-            if char.is_control() || matches!(char, '/' | '\\' | ':' | '\0') {
+            if char.is_control()
+                || is_bidi_control_char(char)
+                || matches!(char, '/' | '\\' | ':' | '"' | '*' | '?' | '<' | '>' | '|' | '\0')
+            {
                 '_'
             } else {
                 char
@@ -1436,11 +1611,56 @@ fn sanitize_filename(filename: &str) -> String {
         sanitized = "chatgpt-download".to_string();
     }
 
+    if is_windows_reserved_filename(&sanitized) {
+        sanitized = format!("_{sanitized}");
+    }
+
     if sanitized.chars().count() > 180 {
         sanitized = sanitized.chars().take(180).collect();
     }
 
     sanitized
+}
+
+fn is_bidi_control_char(char: char) -> bool {
+    matches!(
+        char,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn is_windows_reserved_filename(filename: &str) -> bool {
+    let stem = Path::new(filename)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(filename)
+        .trim_end_matches('.');
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn unique_download_path(downloads_dir: &Path, filename: &str) -> PathBuf {
@@ -1527,6 +1747,21 @@ fn is_trusted_command_url(url: &Url) -> bool {
 mod tests {
     use super::*;
 
+    fn test_exported_cookie(name: &str) -> cookies::ExportedCookie {
+        cookies::ExportedCookie {
+            domain: ".chatgpt.com".to_string(),
+            name: name.to_string(),
+            value: "value".to_string(),
+            path: "/".to_string(),
+            secure: Some(true),
+            http_only: Some(true),
+            session: Some(false),
+            host_only: Some(false),
+            expiration_date: None,
+            same_site: None,
+        }
+    }
+
     #[test]
     fn keeps_chatgpt_and_auth_flows_inside_app() {
         let urls = [
@@ -1537,6 +1772,8 @@ mod tests {
             "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
             "https://appleid.apple.com/auth/authorize",
             "https://github.com/login/oauth/authorize",
+            "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/h/g/turnstile/f/ov2/av0/rch/ni8ux/0x4AAAAAAADnPIDROrmt1Wwj/light/fbE/new/normal?lang=auto",
+            "about:blank",
         ];
 
         for url in urls {
@@ -1551,10 +1788,13 @@ mod tests {
             "https://example.com/",
             "https://help.openai.com/",
             "http://chatgpt.com/",
+            "about:config",
             "https://github.com/",
             "https://github.com/tw93/Pake",
             "https://accounts.google.com/accountchooser",
             "https://accounts.google.com/signin/v2/challenge/pwd",
+            "https://challenges.cloudflare.com/",
+            "https://challenges.cloudflare.com/turnstile/v0/api.js",
             "https://x.com/account/settings",
         ];
 
@@ -1569,6 +1809,17 @@ mod tests {
         assert_eq!(sanitize_filename("../a:b\\c.txt"), "_a_b_c.txt");
         assert_eq!(sanitize_filename("..."), "chatgpt-download");
         assert_eq!(sanitize_filename(" report.csv "), "report.csv");
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("a\u{202E}txt.exe"), "a_txt.exe");
+        assert_eq!(sanitize_filename("a*?<>|.txt"), "a_____.txt");
+    }
+
+    #[test]
+    fn applescript_string_literal_filters_control_boundaries() {
+        assert_eq!(
+            applescript_string_literal("a\"b\\c\rd\0e"),
+            "\"a\\\"b\\\\cde\""
+        );
     }
 
     #[test]
@@ -1592,21 +1843,56 @@ mod tests {
     }
 
     #[test]
-    fn menu_tokens_are_one_time_and_action_bound() {
-        let mut tokens = HashMap::new();
-
-        insert_menu_token(&mut tokens, "token-1", MENU_EXPORT_COOKIES);
-        assert!(consume_menu_token_from_map(&mut tokens, MENU_IMPORT_COOKIES, "token-1").is_err());
-        assert!(consume_menu_token_from_map(&mut tokens, MENU_EXPORT_COOKIES, "token-1").is_err());
-
-        insert_menu_token(&mut tokens, "token-2", MENU_EXPORT_COOKIES);
-        assert!(consume_menu_token_from_map(&mut tokens, MENU_EXPORT_COOKIES, "token-2").is_ok());
-        assert!(consume_menu_token_from_map(&mut tokens, MENU_EXPORT_COOKIES, "token-2").is_err());
+    fn chatgpt_cookie_header_estimate_ignores_unrelated_domains() {
+        let cookies = vec![
+            tauri::webview::cookie::Cookie::build(("sid", "x".repeat(10)))
+                .domain(".chatgpt.com")
+                .path("/")
+                .build(),
+            tauri::webview::cookie::Cookie::build(("external", "x".repeat(10_000)))
+                .domain(".example.com")
+                .path("/")
+                .build(),
+        ];
+        assert_eq!(approximate_chatgpt_cookie_header_bytes(&cookies), 15);
     }
 
     #[test]
-    fn menu_token_script_escapes_token_as_js_literal() {
-        let script = menu_token_script("const token = __MENU_TOKEN__;", "a\"b\\c");
-        assert_eq!(script, r#"const token = "a\"b\\c";"#);
+    fn chatgpt_cookie_domain_matching_uses_boundaries() {
+        assert!(cookie_domain_is_chatgpt_related(".chatgpt.com"));
+        assert!(cookie_domain_is_chatgpt_related("openai.com"));
+        assert!(cookie_domain_is_chatgpt_related("platform.openai.com"));
+        assert!(cookie_domain_is_chatgpt_related("auth.openai.com"));
+        assert!(!cookie_domain_is_chatgpt_related("evilchatgpt.com"));
+        assert!(!cookie_domain_is_chatgpt_related("openai.com.evil.test"));
     }
+
+    #[test]
+    fn cookie_import_filter_keeps_only_chatgpt_login_essentials() {
+        let (filtered, skipped_count) = filter_essential_chatgpt_import_cookies(vec![
+            test_exported_cookie("consent"),
+            test_exported_cookie("__Secure-next-auth.session-token"),
+            test_exported_cookie("cf_clearance"),
+            test_exported_cookie("__Host-next-auth.csrf-token"),
+        ]);
+
+        let names: Vec<String> = filtered.into_iter().map(|cookie| cookie.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "__Secure-next-auth.session-token".to_string(),
+                "cf_clearance".to_string()
+            ]
+        );
+        assert_eq!(skipped_count, 2);
+    }
+
+    #[test]
+    fn webview_script_keeps_hot_click_path_narrow() {
+        assert!(CHATGPT_WEBVIEW_SCRIPT.contains("revokeObjectURL"));
+        assert!(CHATGPT_WEBVIEW_SCRIPT.contains(r#"a[href^="blob:"],a[href^="data:"]"#));
+        assert!(CHATGPT_WEBVIEW_SCRIPT.contains("installStopTooltipGuard"));
+        assert!(!CHATGPT_WEBVIEW_SCRIPT.contains(r#"event.key === "Process""#));
+    }
+
 }

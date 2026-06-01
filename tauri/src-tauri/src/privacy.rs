@@ -23,6 +23,18 @@ pub const WEBRTC_BLOCKER_SCRIPT: &str = r#"
 })();
 "#;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passkey_notice_avoids_layout_heavy_scan() {
+        assert!(PASSKEY_NOTICE_SCRIPT.contains("textContent"));
+        assert!(PASSKEY_NOTICE_SCRIPT.contains("5000"));
+        assert!(!PASSKEY_NOTICE_SCRIPT.contains("innerText"));
+    }
+}
+
 /// Privacy signals script — sets `navigator.globalPrivacyControl = true`.
 pub const PRIVACY_SIGNALS_SCRIPT: &str = r#"
 (() => {
@@ -64,15 +76,20 @@ pub const PASSKEY_NOTICE_SCRIPT: &str = r#"
       || normalized.endsWith('.openai.com');
   };
 
-  const pageLooksLikePasskey = () => {
+  if (!trustedHost(location.hostname)) return;
+
+  const hrefLooksLikePasskey = () => {
     const href = String(location.href || '').toLowerCase();
-    const text = String(document.body ? document.body.innerText || '' : '').toLowerCase();
-    const urlSignal = href.includes('passkey')
+    return href.includes('passkey')
       || href.includes('webauthn')
       || href.includes('security_key')
       || href.includes('publickeycredential')
       || href.includes('credential');
-    const textSignal = text.includes('使用密钥继续')
+  };
+
+  const bodyLooksLikePasskey = () => {
+    const text = String(document.body ? document.body.textContent || '' : '').toLowerCase();
+    return text.includes('使用密钥继续')
       || text.includes('通行密钥')
       || text.includes('帐户的密钥')
       || text.includes('账户的密钥')
@@ -82,11 +99,14 @@ pub const PASSKEY_NOTICE_SCRIPT: &str = r#"
       || text.includes('we found a passkey')
       || text.includes('security key to continue')
       || text.includes('use your security key');
-    return urlSignal || textSignal;
+  };
+
+  const pageLooksLikePasskey = () => {
+    return hrefLooksLikePasskey() || bodyLooksLikePasskey();
   };
 
   const showNotice = () => {
-    if (!trustedHost(location.hostname) || !pageLooksLikePasskey()) return;
+    if (!pageLooksLikePasskey()) return;
     if (document.getElementById('chatgpt-rust-passkey-notice')) return;
     if (!document.body || window.__wkPasskeyLimitationNoticeDismissed) return;
 
@@ -147,7 +167,15 @@ pub const PASSKEY_NOTICE_SCRIPT: &str = r#"
     document.body.appendChild(notice);
   };
 
-  const schedule = () => window.requestAnimationFrame(showNotice);
+  let scheduled = false;
+  const schedule = () => {
+    if (scheduled) return;
+    scheduled = true;
+    window.requestAnimationFrame(() => {
+      scheduled = false;
+      showNotice();
+    });
+  };
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', schedule, { once: true });
   } else {
@@ -157,7 +185,7 @@ pub const PASSKEY_NOTICE_SCRIPT: &str = r#"
   try {
     const observer = new MutationObserver(schedule);
     observer.observe(document.documentElement, { childList: true, subtree: true });
-    window.setTimeout(() => observer.disconnect(), 15000);
+    window.setTimeout(() => observer.disconnect(), 5000);
   } catch (_) {}
 })();
 "#;

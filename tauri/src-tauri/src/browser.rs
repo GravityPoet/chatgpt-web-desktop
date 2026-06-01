@@ -1,4 +1,8 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    thread,
+    time::Duration,
+};
 
 use tauri::{
     webview::{NewWindowFeatures, NewWindowResponse},
@@ -12,16 +16,21 @@ use crate::{
 };
 
 pub const MAIN_WINDOW_LABEL: &str = "main";
+const REBUILD_KEEPER_WINDOW_LABEL: &str = "__profile-rebuild-keeper";
+const MAIN_REBUILD_RETRY_DELAY_MS: u64 = 120;
+const MAIN_REBUILD_MAX_ATTEMPTS: u8 = 10;
 
 /// State held in Tauri's managed state for browser operations.
 pub struct BrowserState {
     pub popup_counter: AtomicUsize,
+    pub main_rebuild_in_progress: AtomicBool,
 }
 
 impl BrowserState {
     pub fn new() -> Self {
         Self {
             popup_counter: AtomicUsize::new(0),
+            main_rebuild_in_progress: AtomicBool::new(false),
         }
     }
 }
@@ -84,7 +93,7 @@ pub fn build_main_window(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
-    let init_scripts = build_init_scripts(profile_store, &profile.id);
+    let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
     let app_for_popup = app.clone();
@@ -116,6 +125,7 @@ pub fn build_main_window(
     let webview = builder
         .build()
         .map_err(|e| format!("failed to build main webview: {e}"))?;
+    let _ = crate::prune_oversized_chatgpt_cookies(&webview);
 
     // Load the homepage
     if let Ok(url) = Url::parse(&homepage) {
@@ -130,19 +140,108 @@ pub fn build_main_window(
 /// Rebuild the main window for a new profile.
 pub fn rebuild_main_window(
     app: &AppHandle<Wry>,
-    profile_store: &ProfileStore,
+    _profile_store: &ProfileStore,
     initial_url: Option<String>,
 ) -> Result<(), String> {
-    // Close existing auth popups
+    let _ = build_rebuild_keeper_window(app);
+    let browser_state = app.state::<BrowserState>();
+    if browser_state
+        .main_rebuild_in_progress
+        .swap(true, Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+
     close_auth_popups(app);
 
-    // Destroy existing main window (bypasses close handler that would just hide it)
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         window
             .destroy()
             .map_err(|e| format!("failed to destroy main window: {e}"))?;
     }
 
+    schedule_main_window_rebuild(app.clone(), initial_url, MAIN_REBUILD_MAX_ATTEMPTS);
+    Ok(())
+}
+
+fn build_rebuild_keeper_window(app: &AppHandle<Wry>) -> Option<WebviewWindow<Wry>> {
+    if app.get_webview_window(REBUILD_KEEPER_WINDOW_LABEL).is_some() {
+        return None;
+    }
+    WebviewWindowBuilder::new(
+        app,
+        REBUILD_KEEPER_WINDOW_LABEL,
+        WebviewUrl::External("about:blank".parse().ok()?),
+    )
+    .title("ChatGPT Rust")
+    .visible(true)
+    .focused(false)
+    .decorations(false)
+    .skip_taskbar(true)
+    .position(-10000.0, -10000.0)
+    .inner_size(1.0, 1.0)
+    .build()
+    .ok()
+}
+
+fn schedule_main_window_rebuild(
+    app: AppHandle<Wry>,
+    initial_url: Option<String>,
+    attempts_left: u8,
+) {
+    tauri::async_runtime::spawn_blocking(move || {
+        thread::sleep(Duration::from_millis(MAIN_REBUILD_RETRY_DELAY_MS));
+        let app_for_main = app.clone();
+        let result = app.run_on_main_thread(move || {
+            if app_for_main.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
+                if attempts_left > 0 {
+                    schedule_main_window_rebuild(app_for_main, initial_url, attempts_left - 1);
+                } else {
+                    finish_failed_main_rebuild(&app_for_main, "旧主窗口仍未释放，已保留当前窗口。");
+                }
+                return;
+            }
+
+            let result = finish_main_window_rebuild(&app_for_main, initial_url);
+            let browser_state = app_for_main.state::<BrowserState>();
+            browser_state
+                .main_rebuild_in_progress
+                .store(false, Ordering::SeqCst);
+            if let Err(error) = result {
+                eprintln!("failed to rebuild main window: {error}");
+            }
+        });
+
+        if result.is_err() {
+            let browser_state = app.state::<BrowserState>();
+            browser_state
+                .main_rebuild_in_progress
+                .store(false, Ordering::SeqCst);
+        }
+    });
+}
+
+fn finish_failed_main_rebuild(app: &AppHandle<Wry>, message: &str) {
+    let browser_state = app.state::<BrowserState>();
+    browser_state
+        .main_rebuild_in_progress
+        .store(false, Ordering::SeqCst);
+    eprintln!("failed to rebuild main window: {message}");
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+fn finish_main_window_rebuild(
+    app: &AppHandle<Wry>,
+    initial_url: Option<String>,
+) -> Result<(), String> {
+    if app.get_webview_window(MAIN_WINDOW_LABEL).is_some() {
+        return Err("main webview label is still in use".to_string());
+    }
+
+    let profile_store = app.state::<ProfileStore>();
     let profile = profile_store.current_profile();
     let homepage = initial_url.unwrap_or_else(|| profile_store.homepage_url(&profile.id));
 
@@ -156,7 +255,7 @@ pub fn rebuild_main_window(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
-    let init_scripts = build_init_scripts(profile_store, &profile.id);
+    let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
     let app_for_popup = app.clone();
@@ -187,13 +286,14 @@ pub fn rebuild_main_window(
     let webview = builder
         .build()
         .map_err(|e| format!("failed to rebuild main webview: {e}"))?;
+    let _ = crate::prune_oversized_chatgpt_cookies(&webview);
 
     if let Ok(url) = Url::parse(&homepage) {
         let _ = webview.navigate(url);
     }
 
     // Rebuild menu
-    let new_menu = menu::build_app_menu(app, profile_store);
+    let new_menu = menu::build_app_menu(app, &profile_store);
     app.set_menu(new_menu)
         .map_err(|e| format!("failed to set menu: {e}"))?;
 
@@ -307,7 +407,7 @@ fn handle_new_window(
 
 /// Get the main window title based on profile name.
 pub fn main_window_title(profile_name: &str, profile_id: &str) -> String {
-    if profile_id == DEFAULT_PROFILE_ID {
+    if profile_id == DEFAULT_PROFILE_ID && profile_name == "默认" {
         "ChatGPT Rust".to_string()
     } else {
         format!("ChatGPT Rust · {profile_name}")

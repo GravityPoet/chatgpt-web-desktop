@@ -14,12 +14,14 @@ private let minimumWebZoom: CGFloat = 0.85
 private let maximumWebZoom: CGFloat = 1.40
 private let webZoomStep: CGFloat = 0.05
 private let maximumCookieImportBytes = 2 * 1024 * 1024
+private let maximumChatGPTCookieHeaderBytes = 6 * 1024
 private let maximumBridgeDownloadBytes = 200 * 1024 * 1024
 private let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
 private let cookieImportErrorDomain = "ChatGPTSwiftWeb.CookieImport"
 private let defaultHeaderCookieImportDomain = ".chatgpt.com"
 private let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"
 private let currentProfileDefaultsKey = "ChatGPTSwiftWeb.CurrentProfileID"
+private let startupProfileDefaultsKey = "ChatGPTSwiftWeb.StartupProfileID"
 private let defaultProfileID = "default"
 private let profileHomepageDefaultsPrefix = "ChatGPTSwiftWeb.ProfileHomepage."
 private let profileFingerprintDefaultsPrefix = "ChatGPTSwiftWeb.ProfileFingerprint."
@@ -42,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         buildMenu()
         installKeyboardZoomShortcuts()
         let needsIsolationFallbackNotice = reconcileProfileIsolationOnLaunch()
+        ProfileStore.applyStartupProfileIfAvailable()
         ProfileStore.ensurePrivacyBaseline()
 
         let profile = ProfileStore.currentProfile()
@@ -167,7 +170,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         homeItem.keyEquivalentModifierMask = [.command, .shift]
         homeItem.target = self
         navigationMenu.addItem(NSMenuItem.separator())
-        navigationMenu.addItem(withTitle: "重新加载", action: #selector(BrowserWindowController.reload(_:)), keyEquivalent: "r")
+        let reloadItem = navigationMenu.addItem(withTitle: "重新加载", action: #selector(reloadAction(_:)), keyEquivalent: "r")
+        reloadItem.target = self
         navigationItem.submenu = navigationMenu
         mainMenu.addItem(navigationItem)
 
@@ -342,7 +346,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             guard let url else {
                 return
             }
-            self?.mainController?.navigate(to: url)
+            self?.rebuildMainController(initialURL: url)
         }
     }
 
@@ -355,7 +359,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func goHomeAction(_ sender: Any?) {
-        BrowserWindowController.keyWindowController()?.goHome(sender)
+        let profile = ProfileStore.currentProfile()
+        rebuildMainController(initialURL: ProfileStore.homepageURL(for: profile.id))
+    }
+
+    @objc private func reloadAction(_ sender: Any?) {
+        let profile = ProfileStore.currentProfile()
+        let target = mainController?.currentURL() ?? ProfileStore.homepageURL(for: profile.id)
+        rebuildMainController(initialURL: target)
     }
 
     @objc private func setProfileHomepageAction(_ sender: Any?) {
@@ -370,14 +381,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 return
             }
             ProfileStore.setHomepage(url, for: profile.id)
-            self.mainController?.navigate(to: url)
+            self.rebuildMainController(initialURL: url)
         }
     }
 
     @objc private func resetProfileHomepageAction(_ sender: Any?) {
         let profile = ProfileStore.currentProfile()
         ProfileStore.removeHomepage(for: profile.id)
-        mainController?.goHome(sender)
+        rebuildMainController(initialURL: ProfileStore.homepageURL(for: profile.id))
     }
 
     @objc private func openIncognitoWindow(_ sender: Any?) {
@@ -406,6 +417,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         updateWebRTCProtectionMenuItem()
         updateEnhancedPrivacyMenuItem()
         rebuildMainController()
+    }
+
+    @objc private func setCurrentProfileAsDefaultAction(_ sender: Any?) {
+        setProfileAsDefault(id: ProfileStore.currentProfileID())
+    }
+
+    @objc private func setProfileAsDefaultAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else {
+            return
+        }
+        setProfileAsDefault(id: id)
+    }
+
+    private func setProfileAsDefault(id: String) {
+        let previousCurrentID = ProfileStore.currentProfileID()
+        guard ProfileStore.setStartupProfileID(id) else {
+            presentError("设置默认空间失败：找不到目标空间。")
+            return
+        }
+        profilesMenu.map(rebuildProfilesMenu(_:))
+        if previousCurrentID != id {
+            rebuildMainController()
+        }
+        let profileName = ProfileStore.loadProfiles().first(where: { $0.id == id })?.name ?? "目标空间"
+        presentInfo("已将「\(profileName)」设为默认空间。")
     }
 
     @objc private func selectFingerprintPreset(_ sender: NSMenuItem) {
@@ -560,7 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             profiles.append(profile)
             ProfileStore.save(profiles)
             ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profile.id)
-            ProfileStore.setEnhancedPrivacyEnabled(true, for: profile.id)
+            ProfileStore.setEnhancedPrivacyEnabled(false, for: profile.id)
             ProfileStore.setCurrentProfileID(profile.id)
             self.rebuildMainController()
         }
@@ -568,9 +604,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     @objc private func renameCurrentProfileAction(_ sender: Any?) {
         let currentID = ProfileStore.currentProfileID()
-        guard currentID != defaultProfileID else {
-            return
-        }
         var profiles = ProfileStore.loadProfiles()
         guard let idx = profiles.firstIndex(where: { $0.id == currentID }) else {
             return
@@ -606,12 +639,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func deleteCurrentProfileAction(_ sender: Any?) {
-        let currentID = ProfileStore.currentProfileID()
-        guard currentID != defaultProfileID else {
+        deleteProfile(id: ProfileStore.currentProfileID())
+    }
+
+    @objc private func deleteProfileAction(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? String else {
             return
         }
+        deleteProfile(id: id)
+    }
+
+    private func deleteProfile(id: String) {
+        guard id != defaultProfileID else {
+            presentError("默认空间不能删除，可以重命名或清理数据。")
+            return
+        }
+        let currentID = ProfileStore.currentProfileID()
         var profiles = ProfileStore.loadProfiles()
-        guard let idx = profiles.firstIndex(where: { $0.id == currentID }) else {
+        guard let idx = profiles.firstIndex(where: { $0.id == id }) else {
+            presentError("删除失败：找不到目标空间。")
             return
         }
         let profile = profiles[idx]
@@ -629,8 +675,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         ProfileStore.removeHomepage(for: profile.id)
         ProfileStore.setFingerprint(nil, for: profile.id)
         ProfileStore.setEnhancedPrivacyEnabled(false, for: profile.id)
-        ProfileStore.setCurrentProfileID(defaultProfileID)
-        rebuildMainController()
+        ProfileStore.clearStartupProfileIfNeeded(profile.id)
+        profilesMenu.map(rebuildProfilesMenu(_:))
+        if currentID == profile.id {
+            ProfileStore.setCurrentProfileID(defaultProfileID)
+            rebuildMainController()
+        }
         if #available(macOS 14.0, *), let uuid = UUID(uuidString: profile.id) {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 WKWebsiteDataStore.remove(forIdentifier: uuid) { _ in }
@@ -667,28 +717,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
 
         let currentID = ProfileStore.currentProfileID()
+        let defaultID = ProfileStore.startupProfileID()
         let profiles = ProfileStore.loadProfiles()
         for profile in profiles {
-            let item = menu.addItem(withTitle: profile.name, action: #selector(switchToProfile(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = profile.id
-            item.state = profile.id == currentID ? .on : .off
-            item.isEnabled = isolationAvailable || profile.id == defaultProfileID
+            let title = profile.id == currentID ? "● \(profile.name)" : "  \(profile.name)"
+            let profileItem = menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
+            let profileMenu = NSMenu(title: profile.name)
+
+            let switchItem = profileMenu.addItem(withTitle: "切换到本空间", action: #selector(switchToProfile(_:)), keyEquivalent: "")
+            switchItem.target = self
+            switchItem.representedObject = profile.id
+            switchItem.isEnabled = (isolationAvailable || profile.id == defaultProfileID) && profile.id != currentID
+
+            let setDefaultItem = profileMenu.addItem(withTitle: "设为默认空间", action: #selector(setProfileAsDefaultAction(_:)), keyEquivalent: "")
+            setDefaultItem.target = self
+            setDefaultItem.representedObject = profile.id
+            setDefaultItem.isEnabled = (isolationAvailable || profile.id == defaultProfileID) && profile.id != defaultID
+
+            profileMenu.addItem(NSMenuItem.separator())
+            let deleteItem = profileMenu.addItem(withTitle: "删除本空间…", action: #selector(deleteProfileAction(_:)), keyEquivalent: "")
+            deleteItem.target = self
+            deleteItem.representedObject = profile.id
+            deleteItem.isEnabled = isolationAvailable && profile.id != defaultProfileID
+
+            profileItem.submenu = profileMenu
         }
         menu.addItem(NSMenuItem.separator())
         let setHomeItem = menu.addItem(withTitle: "设置当前空间首页…", action: #selector(setProfileHomepageAction(_:)), keyEquivalent: "")
         setHomeItem.target = self
-        let resetHomeItem = menu.addItem(withTitle: "恢复默认首页并打开", action: #selector(resetProfileHomepageAction(_:)), keyEquivalent: "")
-        resetHomeItem.target = self
-        let hasHomepage = UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + currentID) != nil
-        resetHomeItem.isEnabled = hasHomepage
+        let setDefaultItem = menu.addItem(withTitle: "设为默认空间", action: #selector(setCurrentProfileAsDefaultAction(_:)), keyEquivalent: "")
+        setDefaultItem.target = self
+        setDefaultItem.isEnabled = (isolationAvailable || currentID == defaultProfileID) && currentID != defaultID
         menu.addItem(NSMenuItem.separator())
         let addItem = menu.addItem(withTitle: "新建账号空间…", action: #selector(addProfileAction(_:)), keyEquivalent: "")
         addItem.target = self
         addItem.isEnabled = isolationAvailable
-        let cloneItem = menu.addItem(withTitle: "克隆当前空间…", action: #selector(cloneCurrentProfileAction(_:)), keyEquivalent: "")
-        cloneItem.target = self
-        cloneItem.isEnabled = isolationAvailable
         let exportItem = menu.addItem(withTitle: "导出当前空间配置…", action: #selector(exportCurrentProfileAction(_:)), keyEquivalent: "")
         exportItem.target = self
         let importItem = menu.addItem(withTitle: "导入空间配置…", action: #selector(importProfileAction(_:)), keyEquivalent: "")
@@ -696,7 +759,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         importItem.isEnabled = isolationAvailable
         let renameItem = menu.addItem(withTitle: "重命名当前空间…", action: #selector(renameCurrentProfileAction(_:)), keyEquivalent: "")
         renameItem.target = self
-        renameItem.isEnabled = isolationAvailable && currentID != defaultProfileID
+        renameItem.isEnabled = isolationAvailable || currentID == defaultProfileID
         let deleteItem = menu.addItem(withTitle: "删除当前空间…", action: #selector(deleteCurrentProfileAction(_:)), keyEquivalent: "")
         deleteItem.target = self
         deleteItem.isEnabled = isolationAvailable && currentID != defaultProfileID
@@ -788,7 +851,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func mainWindowTitle(for profile: WebProfile) -> String {
-        profile.id == defaultProfileID ? "ChatGPT Swift" : "ChatGPT Swift · \(profile.name)"
+        if profile.id == defaultProfileID && profile.name == "默认" {
+            return "ChatGPT Swift"
+        }
+        return "ChatGPT Swift · \(profile.name)"
     }
 
     private func ensureIsolationAvailable() -> Bool {
@@ -805,8 +871,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func updateWebRTCProtectionMenuItem() {
-        webRTCProtectionItem?.title = "启用 WebRTC 防护"
-        webRTCProtectionItem?.state = PrivacySettings.isWebRTCProtectionEnabled() ? .on : .off
+        webRTCProtectionItem?.title = PrivacySettings.isWebRTCProtectionEnabled()
+            ? "关闭 WebRTC 防护"
+            : "启用 WebRTC 防护"
+        webRTCProtectionItem?.state = .off
     }
 
     private func updateEnhancedPrivacyMenuItem() {
@@ -1681,11 +1749,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     private func importCookies(_ cookies: [HTTPCookie]) {
+        let parsedCount = cookies.count
+        let importableCookies = cookies.filter { Self.isChatGPTEssentialCookieName($0.name) }
+        let skippedCount = parsedCount - importableCookies.count
+        guard !importableCookies.isEmpty else {
+            presentError("Cookie 导入失败：未发现关键 ChatGPT 登录 cookie。为避免请求头过大导致白屏，已拒绝导入低价值 cookie。")
+            return
+        }
+
         let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
         let group = DispatchGroup()
-        let importedIdentities = Set(cookies.map(CookieIdentity.init))
+        let importedIdentities = Set(importableCookies.map(CookieIdentity.init))
 
-        for cookie in cookies {
+        for cookie in importableCookies {
             group.enter()
             cookieStore.setCookie(cookie) {
                 group.leave()
@@ -1697,50 +1773,120 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
                 return
             }
 
-            cookieStore.getAllCookies { [weak self] storedCookies in
+            self.pruneOversizedChatGPTCookies(in: cookieStore) { [weak self] prunedCount in
                 guard let self else {
                     return
                 }
 
-                let storedIdentities = Set(storedCookies.map(CookieIdentity.init))
-                let missingCookies = cookies.filter { !storedIdentities.contains(CookieIdentity($0)) }
-                let storedCount = importedIdentities.intersection(storedIdentities).count
-                let importedLoginNames = Set(cookies.map(\.name).filter(Self.isChatGPTLoginCookieName))
-                let storedLoginNames = Set(storedCookies.map(\.name).filter { importedLoginNames.contains($0) })
-                let missingLoginNames = importedLoginNames.subtracting(storedLoginNames).sorted()
-                let profileName = self.profileDisplayName() ?? "默认"
+                cookieStore.getAllCookies { [weak self] storedCookies in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else {
+                            return
+                        }
 
-                var lines = [
-                    "当前空间：\(profileName)",
-                    "已解析 \(cookies.count) 个 cookie；WebKit 当前可读到 \(storedCount)/\(importedIdentities.count) 个目标 cookie。"
-                ]
+                        let storedIdentities = Set(storedCookies.map(CookieIdentity.init))
+                        let missingCookies = importableCookies.filter { !storedIdentities.contains(CookieIdentity($0)) }
+                        let storedCount = importedIdentities.intersection(storedIdentities).count
+                        let importedLoginNames = Set(importableCookies.map(\.name).filter(Self.isChatGPTEssentialCookieName))
+                        let storedLoginNames = Set(storedCookies.map(\.name).filter { importedLoginNames.contains($0) })
+                        let missingLoginNames = importedLoginNames.subtracting(storedLoginNames).sorted()
+                        let profileName = self.profileDisplayName() ?? "默认"
 
-                if importedLoginNames.isEmpty {
-                    lines.append("提示：本次内容没有 ChatGPT session-token，通常不能直接免登录。")
-                } else if missingLoginNames.isEmpty {
-                    lines.append("关键登录 cookie 已写入：\(importedLoginNames.sorted().joined(separator: ", "))")
-                } else {
-                    lines.append("缺失关键登录 cookie：\(missingLoginNames.joined(separator: ", "))")
+                        var lines = [
+                            "当前空间：\(profileName)",
+                            "已解析 \(parsedCount) 个 cookie，导入 \(importableCookies.count) 个关键 cookie，跳过 \(skippedCount) 个低价值 cookie；WebKit 当前可读到 \(storedCount)/\(importedIdentities.count) 个目标 cookie。"
+                        ]
+
+                        let hasSessionCookie = importedLoginNames.contains(where: Self.isChatGPTSessionCookieName)
+                        if !hasSessionCookie {
+                            lines.append("提示：本次内容没有 ChatGPT session-token，通常不能直接免登录。")
+                        } else if missingLoginNames.isEmpty {
+                            lines.append("关键登录 cookie 已写入：\(importedLoginNames.sorted().joined(separator: ", "))")
+                        } else {
+                            lines.append("缺失关键登录 cookie：\(missingLoginNames.joined(separator: ", "))")
+                        }
+
+                        if prunedCount > 0 {
+                            lines.append("已清理 \(prunedCount) 个低价值旧 cookie，避免请求头过大。")
+                        }
+
+                        if !missingCookies.isEmpty {
+                            let names = missingCookies.prefix(8).map(\.name).joined(separator: ", ")
+                            let suffix = missingCookies.count > 8 ? " 等 \(missingCookies.count) 个" : ""
+                            lines.append("未写入：\(names)\(suffix)")
+                        }
+
+                        lines.append("正在刷新页面。")
+                        self.presentAlert(lines.joined(separator: "\n"), style: missingCookies.isEmpty && missingLoginNames.isEmpty ? .informational : .warning)
+                        self.webView.reload()
+                    }
                 }
-
-                if !missingCookies.isEmpty {
-                    let names = missingCookies.prefix(8).map(\.name).joined(separator: ", ")
-                    let suffix = missingCookies.count > 8 ? " 等 \(missingCookies.count) 个" : ""
-                    lines.append("未写入：\(names)\(suffix)")
-                }
-
-                lines.append("正在刷新页面。")
-                self.presentAlert(lines.joined(separator: "\n"), style: missingCookies.isEmpty && missingLoginNames.isEmpty ? .informational : .warning)
-                self.webView.reload()
             }
         }
     }
 
-    private static func isChatGPTLoginCookieName(_ name: String) -> Bool {
+    private func pruneOversizedChatGPTCookies(in cookieStore: WKHTTPCookieStore, completion: @escaping (Int) -> Void) {
+        cookieStore.getAllCookies { storedCookies in
+            let finish: (Int) -> Void = { count in
+                DispatchQueue.main.async {
+                    completion(count)
+                }
+            }
+            let headerBytes = storedCookies
+                .filter(Self.isChatGPTRelatedCookie)
+                .reduce(0) { $0 + $1.name.utf8.count + $1.value.utf8.count + 2 }
+            guard headerBytes > maximumChatGPTCookieHeaderBytes else {
+                finish(0)
+                return
+            }
+
+            let removableCookies = storedCookies
+                .filter(Self.isChatGPTRelatedCookie)
+                .filter { !Self.isChatGPTEssentialCookieName($0.name) }
+            guard !removableCookies.isEmpty else {
+                finish(0)
+                return
+            }
+
+            let group = DispatchGroup()
+            for cookie in removableCookies {
+                group.enter()
+                cookieStore.delete(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main) {
+                completion(removableCookies.count)
+            }
+        }
+    }
+
+    private static func isChatGPTRelatedCookie(_ cookie: HTTPCookie) -> Bool {
+        isAllowedCookieDomain(cookie.domain)
+    }
+
+    fileprivate static func isAllowedCookieDomain(_ domain: String) -> Bool {
+        var normalized = domain
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        while normalized.hasPrefix(".") {
+            normalized.removeFirst()
+        }
+        return normalized == "chatgpt.com"
+            || normalized.hasSuffix(".chatgpt.com")
+            || normalized == "openai.com"
+            || normalized.hasSuffix(".openai.com")
+    }
+
+    fileprivate static func isChatGPTEssentialCookieName(_ name: String) -> Bool {
         name.hasPrefix("__Secure-next-auth.session-token")
             || name == "cf_clearance"
             || name == "__Secure-oai-is"
             || name == "oai-sc"
+    }
+
+    fileprivate static func isChatGPTSessionCookieName(_ name: String) -> Bool {
+        name.hasPrefix("__Secure-next-auth.session-token")
     }
 
     private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
@@ -3271,6 +3417,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         } catch (_) {}
         return url;
       };
+      if (URL.revokeObjectURL) {
+        const originalRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+        URL.revokeObjectURL = (url) => {
+          blobURLs.delete(url);
+          return originalRevokeObjectURL(url);
+        };
+      }
 
       function readBlob(blob) {
         if (!blob || typeof blob.size !== 'number' || blob.size > maxBlobDownloadBytes) {
@@ -3304,25 +3457,67 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return fallback || 'chatgpt-image.png';
       }
 
-      function imageTargetFromEvent(event) {
-        const path = event.composedPath ? event.composedPath() : [];
-        for (const node of path) {
-          if (!node || node === window || node === document) continue;
-          if (node instanceof HTMLImageElement || node instanceof HTMLCanvasElement) return node;
-        }
-        const target = event.target;
-        if (target && target.closest) {
-          return target.closest('img, canvas');
-        }
-        return null;
-      }
+            function imageTargetFromEvent(event) {
+              const path = event.composedPath ? event.composedPath() : [];
+              for (const node of path) {
+                if (!node || node === window || node === document) continue;
+                if (node instanceof HTMLImageElement || node instanceof HTMLCanvasElement) return node;
+              }
+              const target = event.target;
+              if (target && target.closest) {
+                return target.closest('img, canvas');
+              }
+              return null;
+            }
 
-      async function imagePayload(target) {
-        if (target instanceof HTMLCanvasElement) {
-          const dataURL = target.toDataURL('image/png');
-          if (dataURL.length > maxBlobDownloadBytes * 2 + 4096) throw new Error('Canvas image is too large for this bridge');
-          return { filename: 'chatgpt-canvas.png', dataURL };
-        }
+            function installStopTooltipGuard() {
+              if (!isTrustedPage()) return;
+              const stopTooltipLabels = [
+                '停止回答',
+                'Stop generating',
+                'Stop response',
+                'Stop answering'
+              ];
+              const tooltipSelector = '[role="tooltip"], [data-radix-popper-content-wrapper]';
+              let guardTimer = 0;
+
+              function hideStopTooltips() {
+                guardTimer = 0;
+                for (const tooltip of document.querySelectorAll(tooltipSelector)) {
+                  const text = (tooltip.textContent || '').trim();
+                  if (!stopTooltipLabels.some((label) => text.includes(label))) continue;
+                  tooltip.style.setProperty('display', 'none', 'important');
+                  tooltip.style.setProperty('visibility', 'hidden', 'important');
+                  tooltip.setAttribute('data-wk-hidden-stop-tooltip', 'true');
+                }
+              }
+
+              function scheduleGuard() {
+                if (guardTimer) return;
+                guardTimer = window.setTimeout(hideStopTooltips, 80);
+              }
+
+              const root = document.documentElement || document.body;
+              if (!root) {
+                document.addEventListener('DOMContentLoaded', installStopTooltipGuard, { once: true });
+                return;
+              }
+
+              scheduleGuard();
+              document.addEventListener('pointermove', scheduleGuard, true);
+              document.addEventListener('focusin', scheduleGuard, true);
+              new MutationObserver(scheduleGuard).observe(root, {
+                childList: true,
+                subtree: true
+              });
+            }
+
+            async function imagePayload(target) {
+              if (target instanceof HTMLCanvasElement) {
+                const dataURL = target.toDataURL('image/png');
+                if (dataURL.length > maxBlobDownloadBytes * 2 + 4096) throw new Error('Canvas image is too large for this bridge');
+                return { filename: 'chatgpt-canvas.png', dataURL };
+              }
 
         const src = target.currentSrc || target.src || '';
         if (!src) throw new Error('Image has no source URL');
@@ -3340,11 +3535,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             return { filename, dataURL: await readBlob(await response.blob()) };
           }
         } catch (_) {}
-        return { filename, url: url.href };
-      }
+              return { filename, url: url.href };
+            }
 
-      document.addEventListener('contextmenu', (event) => {
-        if (!isTrustedPage()) return;
+            installStopTooltipGuard();
+
+            document.addEventListener('contextmenu', (event) => {
+              if (!isTrustedPage()) return;
         const target = imageTargetFromEvent(event);
         if (!target) return;
         event.preventDefault();
@@ -3361,12 +3558,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
       }, true);
 
       document.addEventListener('click', async (event) => {
-        const target = event.target && event.target.closest ? event.target.closest('a[href]') : null;
+        const target = event.target && event.target.closest ? event.target.closest('a[href^="blob:"],a[href^="data:"]') : null;
         if (!target) return;
         if (!isTrustedPage()) return;
 
         const href = target.href || '';
-        if (!href.startsWith('blob:') && !href.startsWith('data:')) return;
 
         event.preventDefault();
         event.stopImmediatePropagation();
@@ -3415,8 +3611,16 @@ private struct CookieIdentity: Hashable {
 
     init(_ cookie: HTTPCookie) {
         name = cookie.name
-        domain = cookie.domain.lowercased()
+        domain = Self.normalizedDomain(cookie.domain)
         path = cookie.path
+    }
+
+    private static func normalizedDomain(_ domain: String) -> String {
+        var normalized = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while normalized.hasPrefix(".") {
+            normalized.removeFirst()
+        }
+        return normalized
     }
 }
 
@@ -3510,8 +3714,15 @@ private struct ExportedBrowserCookie: Codable {
         guard !trimmedDomain.isEmpty else {
             throw BrowserWindowController.cookieImportError("cookie 域名为空")
         }
+        guard BrowserWindowController.isAllowedCookieDomain(trimmedDomain) else {
+            throw BrowserWindowController.cookieImportError("cookie 域名不在 ChatGPT/OpenAI 白名单中：\(trimmedDomain)")
+        }
         guard cookiePath.hasPrefix("/") else {
             throw BrowserWindowController.cookieImportError("cookie path 无效")
+        }
+        guard !cookiePath.utf8.contains(0),
+              !cookiePath.split(separator: "/").contains(where: { $0 == ".." }) else {
+            throw BrowserWindowController.cookieImportError("cookie path 不安全")
         }
 
         var properties: [HTTPCookiePropertyKey: Any] = [
@@ -3941,24 +4152,34 @@ private enum FingerprintCatalog {
                   { re: /\\(\\s*any-pointer\\s*:\\s*fine\\s*\\)/i, value: false },
                   { re: /\\(\\s*any-pointer\\s*:\\s*coarse\\s*\\)/i, value: true }
                 ];
+                const mediaOverrideCache = new Map();
                 function matchMedia(query) {
                   const result = origMatchMedia.call(this, query);
                   try {
                     const q = String(query || '');
-                    for (const rule of touchOverrides) {
-                      if (rule.re.test(q)) {
-                        return Object.assign({}, result, {
-                          matches: rule.value,
-                          media: q,
-                          onchange: null,
-                          addEventListener: result.addEventListener ? result.addEventListener.bind(result) : function () {},
-                          removeEventListener: result.removeEventListener ? result.removeEventListener.bind(result) : function () {},
-                          addListener: result.addListener ? result.addListener.bind(result) : function () {},
-                          removeListener: result.removeListener ? result.removeListener.bind(result) : function () {},
-                          dispatchEvent: result.dispatchEvent ? result.dispatchEvent.bind(result) : function () { return true; }
-                        });
+                    if (!/(hover|pointer)/i.test(q)) return result;
+                    let override = mediaOverrideCache.get(q);
+                    if (override === undefined) {
+                      override = null;
+                      for (const rule of touchOverrides) {
+                        if (rule.re.test(q)) {
+                          override = rule.value;
+                          break;
+                        }
                       }
+                      mediaOverrideCache.set(q, override);
                     }
+                    if (override === null) return result;
+                    return Object.assign({}, result, {
+                      matches: override,
+                      media: q,
+                      onchange: null,
+                      addEventListener: result.addEventListener ? result.addEventListener.bind(result) : function () {},
+                      removeEventListener: result.removeEventListener ? result.removeEventListener.bind(result) : function () {},
+                      addListener: result.addListener ? result.addListener.bind(result) : function () {},
+                      removeListener: result.removeListener ? result.removeListener.bind(result) : function () {},
+                      dispatchEvent: result.dispatchEvent ? result.dispatchEvent.bind(result) : function () { return true; }
+                    });
                   } catch (_) {}
                   return result;
                 }
@@ -4011,11 +4232,14 @@ private enum FingerprintCatalog {
             }
           } catch (_) {}
 
+          const maxNoiseWrites = 4096;
+          const boundedNoiseStep = (length, minimum) => Math.max(minimum, Math.ceil((length || 0) / maxNoiseWrites));
           const applyCanvasNoise = (imageData, offset) => {
             try {
               const data = imageData && imageData.data;
               if (!data) return imageData;
-              for (let i = offset || 0; i < data.length; i += 97) {
+              const step = boundedNoiseStep(data.length, 251);
+              for (let i = offset || 0; i < data.length; i += step) {
                 data[i] = Math.max(0, Math.min(255, data[i] + noise(i)));
               }
             } catch (_) {}
@@ -4026,8 +4250,8 @@ private enum FingerprintCatalog {
               if (!canvas || !canvas.width || !canvas.height) return;
               const ctx = canvas.getContext('2d', { willReadFrequently: true });
               if (!ctx) return;
-              const width = Math.min(8, canvas.width);
-              const height = Math.min(8, canvas.height);
+              const width = Math.min(4, canvas.width);
+              const height = Math.min(4, canvas.height);
               const imageData = ctx.getImageData(0, 0, width, height);
               applyCanvasNoise(imageData, 3);
               ctx.putImageData(imageData, 0, 0);
@@ -4073,7 +4297,8 @@ private enum FingerprintCatalog {
                 try {
                   const pixels = arguments[6];
                   if (pixels && typeof pixels.length === 'number') {
-                    for (let i = 0; i < pixels.length; i += 101) {
+                    const step = boundedNoiseStep(pixels.length, 257);
+                    for (let i = 0; i < pixels.length; i += step) {
                       pixels[i] = Math.max(0, Math.min(255, pixels[i] + noise(i + 11)));
                     }
                   }
@@ -4091,7 +4316,8 @@ private enum FingerprintCatalog {
                 return function getChannelData() {
                   const data = original.apply(this, arguments);
                   try {
-                    for (let i = 0; i < data.length; i += 113) {
+                    const step = boundedNoiseStep(data.length, 293);
+                    for (let i = 0; i < data.length; i += step) {
                       data[i] += noise(i + 23) * 0.0000001;
                     }
                   } catch (_) {}
@@ -4104,7 +4330,8 @@ private enum FingerprintCatalog {
                 return function getFloatFrequencyData(array) {
                   const result = original.apply(this, arguments);
                   try {
-                    for (let i = 0; i < array.length; i += 127) {
+                    const step = boundedNoiseStep(array.length, 307);
+                    for (let i = 0; i < array.length; i += step) {
                       array[i] += noise(i + 31) * 0.0001;
                     }
                   } catch (_) {}
@@ -4222,7 +4449,7 @@ private enum ProfileStore {
             ensureFingerprintBaseline(for: profile.id)
             let enhancedKey = profileEnhancedPrivacyDefaultsPrefix + profile.id
             if UserDefaults.standard.object(forKey: enhancedKey) == nil {
-                UserDefaults.standard.set(true, forKey: enhancedKey)
+                UserDefaults.standard.set(false, forKey: enhancedKey)
             }
         }
         UserDefaults.standard.synchronize()
@@ -4249,6 +4476,56 @@ private enum ProfileStore {
             save(profiles)
         }
         return profiles
+    }
+
+    static func startupProfileID() -> String {
+        let profiles = loadProfiles()
+        if let stored = UserDefaults.standard.string(forKey: startupProfileDefaultsKey),
+           profiles.contains(where: { $0.id == stored }) {
+            return stored
+        }
+        return defaultProfileID
+    }
+
+    @discardableResult
+    static func setStartupProfileID(_ id: String) -> Bool {
+        var profiles = loadProfiles()
+        guard let idx = profiles.firstIndex(where: { $0.id == id }) else {
+            return false
+        }
+        let profile = profiles.remove(at: idx)
+        profiles.insert(profile, at: 0)
+        save(profiles)
+        UserDefaults.standard.set(id, forKey: startupProfileDefaultsKey)
+        UserDefaults.standard.set(id, forKey: currentProfileDefaultsKey)
+        UserDefaults.standard.synchronize()
+        return true
+    }
+
+    static func clearStartupProfileIfNeeded(_ id: String) {
+        guard UserDefaults.standard.string(forKey: startupProfileDefaultsKey) == id else {
+            return
+        }
+        UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func applyStartupProfileIfAvailable() {
+        guard let stored = UserDefaults.standard.string(forKey: startupProfileDefaultsKey) else {
+            return
+        }
+        let profiles = loadProfiles()
+        guard profiles.contains(where: { $0.id == stored }) else {
+            UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
+            UserDefaults.standard.synchronize()
+            return
+        }
+        if stored != defaultProfileID {
+            guard #available(macOS 14.0, *) else {
+                return
+            }
+        }
+        setCurrentProfileID(stored)
     }
 
     static func save(_ profiles: [WebProfile]) {
@@ -4359,7 +4636,7 @@ private enum ProfileStore {
 private enum PrivacySettings {
     static func isWebRTCProtectionRequested() -> Bool {
         if UserDefaults.standard.object(forKey: webRTCProtectionDefaultsKey) == nil {
-            return true
+            return false
         }
         return UserDefaults.standard.bool(forKey: webRTCProtectionDefaultsKey)
     }
@@ -4377,25 +4654,25 @@ private enum PrivacySettings {
 private let webRTCBlockerScript = """
 (() => {
   if (window.__wkRTCGuard) return;
-	  try {
-	    Object.defineProperty(window, '__wkRTCGuard', { value: true, configurable: false, writable: false });
-	  } catch (_) {}
-	  try {
-	    const markFake = window.__wkMarkNative || ((fn) => fn);
-	    const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceCandidate', 'RTCSessionDescription', 'RTCDataChannel'];
-	    for (const name of names) {
-	      try {
-	        Object.defineProperty(window, name, { value: undefined, configurable: false, writable: false });
-	      } catch (_) {}
-	    }
-	    if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
-	      const original = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
-	      const enumerateDevices = function enumerateDevices() { return original().then(() => []); };
-	      markFake(enumerateDevices, 'enumerateDevices');
-	      navigator.mediaDevices.enumerateDevices = enumerateDevices;
-	    }
-	  } catch (_) {}
-	})();
+        try {
+          Object.defineProperty(window, '__wkRTCGuard', { value: true, configurable: false, writable: false });
+        } catch (_) {}
+        try {
+          const markFake = window.__wkMarkNative || ((fn) => fn);
+          const names = ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceCandidate', 'RTCSessionDescription', 'RTCDataChannel'];
+          for (const name of names) {
+            try {
+              Object.defineProperty(window, name, { value: undefined, configurable: false, writable: false });
+            } catch (_) {}
+          }
+          if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+            const original = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices);
+            const enumerateDevices = function enumerateDevices() { return original().then(() => []); };
+            markFake(enumerateDevices, 'enumerateDevices');
+            navigator.mediaDevices.enumerateDevices = enumerateDevices;
+          }
+        } catch (_) {}
+      })();
 """
 
 private let privacySignalsScript = """

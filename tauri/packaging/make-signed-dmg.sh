@@ -27,7 +27,11 @@ rm -rf "$DIST_APP" "$DMG_PATH"
 
 /usr/bin/ditto --norsrc "$TAURI_APP" "$DIST_APP"
 /usr/bin/xattr -cr "$DIST_APP" 2>/dev/null || true
-/usr/bin/codesign --force --deep --sign - "$DIST_APP" >/dev/null
+SIGN_IDENTITY="${CHATGPT_RUST_CODESIGN_IDENTITY:-}"
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$("$ROOT/packaging/ensure-local-codesign-cert.sh")"
+fi
+/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$DIST_APP" >/dev/null
 /usr/bin/codesign --verify --deep --strict "$DIST_APP"
 
 /usr/bin/ditto --norsrc "$DIST_APP" "$STAGING/$APP_NAME.app"

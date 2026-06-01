@@ -9,11 +9,14 @@ use crate::profile::ProfileStore;
 /// Menu event identifiers — emitted as menu item IDs.
 pub mod event_id {
     pub const IMPORT_COOKIES: &str = "menu:import-cookies";
+    pub const PASTE_COOKIES: &str = "menu:paste-cookies";
     pub const EXPORT_COOKIES: &str = "menu:export-cookies";
     pub const BURN_CURRENT_PROFILE: &str = "menu:burn-current-profile";
     pub const GO_TO_URL: &str = "menu:go-to-url";
     pub const NEW_INCOGNITO: &str = "menu:new-incognito";
     pub const SWITCH_PROFILE_PREFIX: &str = "menu:switch-profile:";
+    pub const SET_DEFAULT_PROFILE_PREFIX: &str = "menu:set-default-profile:";
+    pub const DELETE_PROFILE_PREFIX: &str = "menu:delete-profile:";
     pub const FP_PRESET_PREFIX: &str = "menu:fp-preset:";
     pub const FP_RANDOMIZE: &str = "menu:fp-randomize";
     pub const FP_ABOUT: &str = "menu:fp-about";
@@ -21,6 +24,7 @@ pub mod event_id {
     pub const OPEN_FINGERPRINT_TEST: &str = "menu:open-fingerprint-test";
     pub const SET_HOMEPAGE: &str = "menu:set-homepage";
     pub const RESET_HOMEPAGE: &str = "menu:reset-homepage";
+    pub const SET_DEFAULT_PROFILE: &str = "menu:set-default-profile";
     pub const ADD_PROFILE: &str = "menu:add-profile";
     pub const CLONE_PROFILE: &str = "menu:clone-profile";
     pub const EXPORT_PROFILE: &str = "menu:export-profile";
@@ -40,8 +44,19 @@ pub mod event_id {
 
 /// Build the full application menu.
 pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Menu<Wry> {
+    // --- App menu ---
+    let app_menu = SubmenuBuilder::with_id(app, "app-menu", "ChatGPT Rust")
+        .item(&PredefinedMenuItem::about(app, Some("关于 ChatGPT Rust"), None).unwrap())
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, Some("退出 ChatGPT Rust")).unwrap())
+        .build()
+        .unwrap();
+
     // --- File menu ---
     let import_cookies = MenuItemBuilder::with_id(event_id::IMPORT_COOKIES, "导入 Cookies...")
+        .build(app)
+        .unwrap();
+    let paste_cookies = MenuItemBuilder::with_id(event_id::PASTE_COOKIES, "粘贴 Cookies...")
         .build(app)
         .unwrap();
     let export_cookies = MenuItemBuilder::with_id(event_id::EXPORT_COOKIES, "导出 Cookies...")
@@ -63,6 +78,7 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
 
     let file_menu = SubmenuBuilder::with_id(app, "file-menu", "文件")
         .item(&import_cookies)
+        .item(&paste_cookies)
         .item(&export_cookies)
         .item(&burn)
         .separator()
@@ -75,7 +91,19 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
         .build()
         .unwrap();
 
-    // --- View menu ---
+    // --- Edit menu ---
+    let edit_menu = SubmenuBuilder::with_id(app, "edit-menu", "编辑")
+        .item(&PredefinedMenuItem::undo(app, Some("撤销")).unwrap())
+        .item(&PredefinedMenuItem::redo(app, Some("重做")).unwrap())
+        .separator()
+        .item(&PredefinedMenuItem::cut(app, Some("剪切")).unwrap())
+        .item(&PredefinedMenuItem::copy(app, Some("复制")).unwrap())
+        .item(&PredefinedMenuItem::paste(app, Some("粘贴")).unwrap())
+        .item(&PredefinedMenuItem::select_all(app, Some("全选")).unwrap())
+        .build()
+        .unwrap();
+
+    // --- Navigation menu ---
     let back = MenuItemBuilder::with_id(event_id::NAV_BACK, "后退")
         .accelerator("CmdOrCtrl+[")
         .build(app)
@@ -92,6 +120,17 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
         .accelerator("CmdOrCtrl+R")
         .build(app)
         .unwrap();
+
+    let navigation_menu = SubmenuBuilder::with_id(app, "navigation-menu", "导航")
+        .item(&back)
+        .item(&forward)
+        .item(&home)
+        .separator()
+        .item(&reload)
+        .build()
+        .unwrap();
+
+    // --- View menu ---
     let zoom_in = MenuItemBuilder::with_id(event_id::ZOOM_IN, "放大")
         .accelerator("CmdOrCtrl+=")
         .build(app)
@@ -106,12 +145,6 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
         .unwrap();
 
     let view_menu = SubmenuBuilder::with_id(app, "view-menu", "视图")
-        .item(&back)
-        .item(&forward)
-        .item(&home)
-        .separator()
-        .item(&reload)
-        .separator()
         .item(&zoom_in)
         .item(&zoom_out)
         .item(&zoom_reset)
@@ -119,7 +152,14 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
         .unwrap();
 
     // --- Privacy menu ---
-    let webrtc = MenuItemBuilder::with_id(event_id::TOGGLE_WEBRTC, "启用 WebRTC 防护")
+    let current_id = profile_store.current_profile_id();
+    let current_meta = profile_store.get_meta(&current_id);
+    let webrtc_title = if current_meta.webrtc_enabled {
+        "关闭 WebRTC 防护"
+    } else {
+        "启用 WebRTC 防护"
+    };
+    let webrtc = MenuItemBuilder::with_id(event_id::TOGGLE_WEBRTC, webrtc_title)
         .build(app)
         .unwrap();
     let privacy_status = MenuItemBuilder::with_id(event_id::PRIVACY_STATUS, "隐私状态...")
@@ -137,11 +177,22 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
         .build()
         .unwrap();
 
+    // --- Window menu ---
+    let window_menu = SubmenuBuilder::with_id(app, "window-menu", "窗口")
+        .item(&PredefinedMenuItem::minimize(app, Some("最小化")).unwrap())
+        .item(&PredefinedMenuItem::maximize(app, Some("缩放")).unwrap())
+        .build()
+        .unwrap();
+
     // --- Assemble ---
     MenuBuilder::new(app)
+        .item(&app_menu)
         .item(&file_menu)
+        .item(&edit_menu)
+        .item(&navigation_menu)
         .item(&view_menu)
         .item(&privacy_menu)
+        .item(&window_menu)
         .build()
         .unwrap()
 }
@@ -153,19 +204,49 @@ fn build_profiles_submenu(
 ) -> Submenu<Wry> {
     let profiles = profile_store.list_profiles();
     let current_id = profile_store.current_profile_id();
+    let default_id = profile_store.default_profile_id();
     let current_meta = profile_store.get_meta(&current_id);
 
     let mut builder = SubmenuBuilder::with_id(app, "profiles-submenu", "账号空间");
 
     for profile in &profiles {
-        let id = format!("{}{}", event_id::SWITCH_PROFILE_PREFIX, profile.id);
         let title = if profile.id == current_id {
             format!("● {}", profile.name)
         } else {
             format!("  {}", profile.name)
         };
-        let item = MenuItemBuilder::with_id(id, title).build(app).unwrap();
-        builder = builder.item(&item);
+        let profile_menu_id = format!("profile-actions:{}", profile.id);
+        let mut profile_builder = SubmenuBuilder::with_id(app, profile_menu_id, title);
+
+        let switch = MenuItemBuilder::with_id(
+            format!("{}{}", event_id::SWITCH_PROFILE_PREFIX, profile.id),
+            "切换到本空间",
+        )
+        .enabled(profile.id != current_id)
+        .build(app)
+        .unwrap();
+        let set_default = MenuItemBuilder::with_id(
+            format!("{}{}", event_id::SET_DEFAULT_PROFILE_PREFIX, profile.id),
+            "设为默认空间",
+        )
+        .enabled(profile.id != default_id)
+        .build(app)
+        .unwrap();
+        let delete = MenuItemBuilder::with_id(
+            format!("{}{}", event_id::DELETE_PROFILE_PREFIX, profile.id),
+            "删除本空间…",
+        )
+        .enabled(profile.id != crate::profile::DEFAULT_PROFILE_ID)
+        .build(app)
+        .unwrap();
+
+        profile_builder = profile_builder
+            .item(&switch)
+            .item(&set_default)
+            .separator()
+            .item(&delete);
+        let profile_menu = profile_builder.build().unwrap();
+        builder = builder.item(&profile_menu);
     }
 
     builder = builder.separator();
@@ -196,17 +277,15 @@ fn build_profiles_submenu(
         .build(app)
         .unwrap();
     builder = builder.item(&set_home);
-    let reset_home = MenuItemBuilder::with_id(event_id::RESET_HOMEPAGE, "恢复默认首页并打开")
+    let set_default = MenuItemBuilder::with_id(event_id::SET_DEFAULT_PROFILE, "设为默认空间")
+        .enabled(current_id != profile_store.default_profile_id())
         .build(app)
         .unwrap();
-    builder = builder.item(&reset_home);
+    builder = builder.item(&set_default);
 
     builder = builder.separator();
 
     let add = MenuItemBuilder::with_id(event_id::ADD_PROFILE, "新建账号空间…")
-        .build(app)
-        .unwrap();
-    let clone = MenuItemBuilder::with_id(event_id::CLONE_PROFILE, "克隆当前空间…")
         .build(app)
         .unwrap();
     let export = MenuItemBuilder::with_id(event_id::EXPORT_PROFILE, "导出当前空间配置…")
@@ -218,7 +297,6 @@ fn build_profiles_submenu(
     let is_default = current_id == crate::profile::DEFAULT_PROFILE_ID;
 
     let rename = MenuItemBuilder::with_id(event_id::RENAME_PROFILE, "重命名当前空间…")
-        .enabled(!is_default)
         .build(app)
         .unwrap();
     let delete = MenuItemBuilder::with_id(event_id::DELETE_PROFILE, "删除当前空间…")
@@ -228,7 +306,6 @@ fn build_profiles_submenu(
 
     builder = builder
         .item(&add)
-        .item(&clone)
         .item(&export)
         .item(&import)
         .item(&rename)
@@ -316,6 +393,14 @@ fn build_fingerprint_submenu(
 /// Helper to extract profile ID from a switch-profile menu event ID.
 pub fn extract_profile_id(event_id: &str) -> Option<&str> {
     event_id.strip_prefix(event_id::SWITCH_PROFILE_PREFIX)
+}
+
+pub fn extract_set_default_profile_id(event_id: &str) -> Option<&str> {
+    event_id.strip_prefix(event_id::SET_DEFAULT_PROFILE_PREFIX)
+}
+
+pub fn extract_delete_profile_id(event_id: &str) -> Option<&str> {
+    event_id.strip_prefix(event_id::DELETE_PROFILE_PREFIX)
 }
 
 /// Helper to extract preset ID from a fingerprint preset menu event ID.

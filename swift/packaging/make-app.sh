@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$ROOT/.." && pwd)"
 APP_NAME="ChatGPT Swift"
 BINARY_NAME="ChatGPTSwiftWeb"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
@@ -9,10 +10,15 @@ CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 ICON_SOURCE="$ROOT/../tauri/src-tauri/icons/icon.icns"
+SIGN_IDENTITY="${CHATGPT_SWIFT_CODESIGN_IDENTITY:-}"
 
 cd "$ROOT"
 
 swift build -c release
+
+if [[ -z "$SIGN_IDENTITY" ]]; then
+  SIGN_IDENTITY="$("$REPO_ROOT/tauri/packaging/ensure-local-codesign-cert.sh")"
+fi
 
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS" "$RESOURCES"
@@ -28,7 +34,7 @@ fi
 
 chmod +x "$MACOS/$BINARY_NAME"
 
-/usr/bin/codesign --force --deep --sign - "$APP_DIR"
+/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
 /usr/bin/codesign --verify --deep --strict "$APP_DIR"
 
 echo "$APP_DIR"

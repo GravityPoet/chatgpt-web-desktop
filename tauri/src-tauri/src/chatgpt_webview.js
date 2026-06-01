@@ -124,6 +124,13 @@
       objectUrlCache.set(url, blob);
       return url;
     };
+    if (window.URL.revokeObjectURL) {
+      const originalRevokeObjectUrl = window.URL.revokeObjectURL.bind(window.URL);
+      window.URL.revokeObjectURL = function (url) {
+        objectUrlCache.delete(url);
+        return originalRevokeObjectUrl(url);
+      };
+    }
   }
 
   function installDownloadInterceptor() {
@@ -132,13 +139,12 @@
       function (event) {
         const anchor =
           event.target && typeof event.target.closest === "function"
-            ? event.target.closest("a[href]")
+            ? event.target.closest('a[href^="blob:"],a[href^="data:"]')
             : null;
 
         if (!anchor) return;
 
         const href = anchor.href || "";
-        if (!href.startsWith("blob:") && !href.startsWith("data:")) return;
 
         const filename = cleanFilename(anchor.download || filenameFromUrl(href));
         event.preventDefault();
@@ -147,6 +153,47 @@
       },
       true,
     );
+  }
+
+  function installStopTooltipGuard() {
+    const stopTooltipLabels = [
+      "停止回答",
+      "Stop generating",
+      "Stop response",
+      "Stop answering",
+    ];
+    const tooltipSelector = '[role="tooltip"], [data-radix-popper-content-wrapper]';
+    let guardTimer = 0;
+
+    function hideStopTooltips() {
+      guardTimer = 0;
+      for (const tooltip of document.querySelectorAll(tooltipSelector)) {
+        const text = (tooltip.textContent || "").trim();
+        if (!stopTooltipLabels.some((label) => text.includes(label))) continue;
+        tooltip.style.setProperty("display", "none", "important");
+        tooltip.style.setProperty("visibility", "hidden", "important");
+        tooltip.setAttribute("data-wk-hidden-stop-tooltip", "true");
+      }
+    }
+
+    function scheduleGuard() {
+      if (guardTimer) return;
+      guardTimer = window.setTimeout(hideStopTooltips, 80);
+    }
+
+    const root = document.documentElement || document.body;
+    if (!root) {
+      document.addEventListener("DOMContentLoaded", installStopTooltipGuard, { once: true });
+      return;
+    }
+
+    scheduleGuard();
+    document.addEventListener("pointermove", scheduleGuard, true);
+    document.addEventListener("focusin", scheduleGuard, true);
+    new MutationObserver(scheduleGuard).observe(root, {
+      childList: true,
+      subtree: true,
+    });
   }
 
   function resetInjectedZoom() {
@@ -219,19 +266,12 @@
   }
 
   function installCompositionGuard() {
-    document.addEventListener(
-      "keydown",
-      function (event) {
-        if (event.key === "Process") {
-          event.stopPropagation();
-        }
-      },
-      true,
-    );
+    // Do not intercept IME "Process" key events; ChatGPT handles composition better natively.
   }
 
   function install() {
     resetInjectedZoom();
+    installStopTooltipGuard();
     installNativeZoomShortcuts();
     installDownloadInterceptor();
     installCompositionGuard();

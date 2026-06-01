@@ -14,12 +14,15 @@ const PROFILES_DIR: &str = "profiles";
 const PROFILES_JSON: &str = "profiles.json";
 const META_JSON: &str = "meta.json";
 const WEBVIEW_DATA_DIR: &str = "webview-data";
+const CURRENT_META_VERSION: u32 = 2;
 
 /// Persisted list of profiles and current selection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfilesManifest {
     pub profiles: Vec<WebProfile>,
     pub current_profile_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile_id: Option<String>,
 }
 
 /// A single account space.
@@ -33,33 +36,32 @@ pub struct WebProfile {
 /// Per-profile metadata stored in `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMeta {
+    #[serde(default)]
+    pub meta_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub homepage: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<FingerprintProfile>,
     #[serde(default)]
     pub fingerprint_disabled: bool,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub enhanced_privacy: bool,
     /// Whether WebRTC blocker is enabled for this profile.
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub webrtc_enabled: bool,
 }
 
 impl Default for ProfileMeta {
     fn default() -> Self {
         Self {
+            meta_version: CURRENT_META_VERSION,
             homepage: None,
             fingerprint: None,
             fingerprint_disabled: false,
-            enhanced_privacy: true,
-            webrtc_enabled: true,
+            enhanced_privacy: false,
+            webrtc_enabled: false,
         }
     }
-}
-
-fn default_true() -> bool {
-    true
 }
 
 /// Thread-safe profile store backed by filesystem.
@@ -90,6 +92,13 @@ impl ProfileStore {
             if !m.profiles.iter().any(|p| p.id == m.current_profile_id) {
                 m.current_profile_id = DEFAULT_PROFILE_ID.to_string();
             }
+            if let Some(default_id) = m.default_profile_id.clone() {
+                if m.profiles.iter().any(|p| p.id == default_id) {
+                    m.current_profile_id = default_id;
+                } else {
+                    m.default_profile_id = None;
+                }
+            }
             m
         } else {
             let m = Self::default_manifest();
@@ -101,6 +110,7 @@ impl ProfileStore {
         let default_dir = base_dir.join(DEFAULT_PROFILE_ID);
         fs::create_dir_all(default_dir.join(WEBVIEW_DATA_DIR))
             .map_err(|e| format!("failed to create default profile directory: {e}"))?;
+        Self::migrate_profile_meta_defaults(&base_dir, &manifest.profiles)?;
 
         Ok(Self {
             base_dir,
@@ -129,6 +139,32 @@ impl ProfileStore {
     pub fn current_profile_id(&self) -> String {
         let m = self.inner.lock().unwrap();
         m.current_profile_id.clone()
+    }
+
+    /// Get the user-selected startup profile ID. Falls back to the built-in default profile.
+    pub fn default_profile_id(&self) -> String {
+        let m = self.inner.lock().unwrap();
+        m.default_profile_id
+            .as_ref()
+            .filter(|id| m.profiles.iter().any(|p| &p.id == *id))
+            .cloned()
+            .unwrap_or_else(|| DEFAULT_PROFILE_ID.to_string())
+    }
+
+    /// Mark a profile as the startup default and move it to the first menu position.
+    pub fn set_default_profile(&self, id: &str) -> Result<WebProfile, String> {
+        let mut m = self.inner.lock().unwrap();
+        let idx = m
+            .profiles
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| format!("profile '{id}' not found"))?;
+        let profile = m.profiles.remove(idx);
+        m.profiles.insert(0, profile.clone());
+        m.default_profile_id = Some(id.to_string());
+        m.current_profile_id = id.to_string();
+        Self::persist_manifest(&self.base_dir, &m)?;
+        Ok(profile)
     }
 
     /// Switch to a different profile. Returns the new profile.
@@ -175,8 +211,8 @@ impl ProfileStore {
         // Write default meta.json with stable random fingerprint
         let meta = ProfileMeta {
             fingerprint: Some(crate::fingerprint::random_fingerprint()),
-            enhanced_privacy: true,
-            webrtc_enabled: true,
+            enhanced_privacy: false,
+            webrtc_enabled: false,
             ..Default::default()
         };
         Self::write_meta(&profile_dir, &meta)?;
@@ -187,11 +223,8 @@ impl ProfileStore {
         Ok(profile)
     }
 
-    /// Rename a profile. The default profile cannot be renamed.
+    /// Rename a profile.
     pub fn rename_profile(&self, id: &str, new_name: &str) -> Result<(), String> {
-        if id == DEFAULT_PROFILE_ID {
-            return Err("cannot rename the default profile".to_string());
-        }
         let new_name = new_name.trim().to_string();
         if new_name.is_empty() {
             return Err("profile name cannot be empty".to_string());
@@ -231,6 +264,9 @@ impl ProfileStore {
         if m.current_profile_id == id {
             m.current_profile_id = DEFAULT_PROFILE_ID.to_string();
         }
+        if m.default_profile_id.as_deref() == Some(id) {
+            m.default_profile_id = None;
+        }
 
         Self::persist_manifest(&self.base_dir, &m)?;
 
@@ -246,10 +282,7 @@ impl ProfileStore {
         let profile_dir = self.base_dir.join(profile_id);
         let meta_path = profile_dir.join(META_JSON);
         if meta_path.exists() {
-            fs::read_to_string(&meta_path)
-                .ok()
-                .and_then(|s| serde_json::from_str(&s).ok())
-                .unwrap_or_default()
+            Self::read_meta(&profile_dir).unwrap_or_default()
         } else {
             ProfileMeta::default()
         }
@@ -296,15 +329,9 @@ impl ProfileStore {
     }
 
     /// Get the webview data directory for a profile.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
     pub fn webview_data_dir(&self, profile_id: &str) -> PathBuf {
-        self.base_dir
-            .join(profile_id)
-            .join(WEBVIEW_DATA_DIR)
-    }
-
-    /// Get the profile directory (contains meta.json and webview-data/).
-    pub fn profile_dir(&self, profile_id: &str) -> PathBuf {
-        self.base_dir.join(profile_id)
+        self.base_dir.join(profile_id).join(WEBVIEW_DATA_DIR)
     }
 
     /// Clone a profile: copies name base, homepage, enhanced privacy, webrtc setting.
@@ -379,6 +406,7 @@ impl ProfileStore {
         ProfilesManifest {
             profiles: vec![Self::default_profile()],
             current_profile_id: DEFAULT_PROFILE_ID.to_string(),
+            default_profile_id: None,
         }
     }
 
@@ -386,8 +414,15 @@ impl ProfileStore {
         let path = base_dir.join(PROFILES_JSON);
         let json = serde_json::to_string_pretty(manifest)
             .map_err(|e| format!("failed to serialize profiles: {e}"))?;
-        fs::write(&path, json)
+        Self::atomic_write_string(&path, &json)
             .map_err(|e| format!("failed to write profiles.json: {e}"))
+    }
+
+    fn read_meta(profile_dir: &Path) -> Option<ProfileMeta> {
+        let path = profile_dir.join(META_JSON);
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
     }
 
     fn write_meta(profile_dir: &Path, meta: &ProfileMeta) -> Result<(), String> {
@@ -396,8 +431,45 @@ impl ProfileStore {
         let path = profile_dir.join(META_JSON);
         let json = serde_json::to_string_pretty(meta)
             .map_err(|e| format!("failed to serialize meta: {e}"))?;
-        fs::write(&path, json)
+        Self::atomic_write_string(&path, &json)
             .map_err(|e| format!("failed to write meta.json: {e}"))
+    }
+
+    fn atomic_write_string(path: &Path, contents: &str) -> std::io::Result<()> {
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("profile-data");
+        let temp_path = parent.join(format!(".{filename}.{}.tmp", Uuid::new_v4()));
+        fs::write(&temp_path, contents)?;
+        fs::rename(&temp_path, path).or_else(|error| {
+            let _ = fs::remove_file(&temp_path);
+            Err(error)
+        })
+    }
+
+    fn migrate_profile_meta_defaults(
+        base_dir: &Path,
+        profiles: &[WebProfile],
+    ) -> Result<(), String> {
+        for profile in profiles {
+            let profile_dir = base_dir.join(&profile.id);
+            let meta_path = profile_dir.join(META_JSON);
+            if !meta_path.exists() {
+                continue;
+            }
+            let Some(mut meta) = Self::read_meta(&profile_dir) else {
+                continue;
+            };
+            if meta.meta_version >= CURRENT_META_VERSION {
+                continue;
+            }
+            meta.webrtc_enabled = false;
+            meta.meta_version = CURRENT_META_VERSION;
+            Self::write_meta(&profile_dir, &meta)?;
+        }
+        Ok(())
     }
 }
 
@@ -424,8 +496,10 @@ pub struct ProfileExportDocument {
     pub fingerprint: Option<FingerprintProfile>,
     #[serde(rename = "fingerprintDisabled", skip_serializing_if = "Option::is_none")]
     pub fingerprint_disabled: Option<bool>,
-    #[serde(rename = "enhancedPrivacyEnabled")]
+    #[serde(rename = "enhancedPrivacyEnabled", default)]
     pub enhanced_privacy_enabled: bool,
+    #[serde(rename = "webrtcEnabled", default, skip_serializing_if = "Option::is_none")]
+    pub webrtc_enabled: Option<bool>,
 }
 
 #[cfg(test)]
@@ -484,9 +558,15 @@ mod tests {
     }
 
     #[test]
-    fn cannot_rename_or_delete_default() {
+    fn can_rename_default_but_not_delete_it() {
         let (store, _dir) = make_store();
-        assert!(store.rename_profile(DEFAULT_PROFILE_ID, "X").is_err());
+        store.rename_profile(DEFAULT_PROFILE_ID, "主空间").unwrap();
+        let profiles = store.list_profiles();
+        let default_profile = profiles
+            .iter()
+            .find(|pp| pp.id == DEFAULT_PROFILE_ID)
+            .unwrap();
+        assert_eq!(default_profile.name, "主空间");
         assert!(store.delete_profile(DEFAULT_PROFILE_ID).is_err());
     }
 
@@ -497,6 +577,42 @@ mod tests {
         store.switch_profile(&p.id).unwrap();
         store.delete_profile(&p.id).unwrap();
         assert_eq!(store.current_profile_id(), DEFAULT_PROFILE_ID);
+    }
+
+    #[test]
+    fn delete_profile_removes_only_requested_profile() {
+        let (store, _dir) = make_store();
+        let first = store.create_profile("First").unwrap();
+        let second = store.create_profile("Second").unwrap();
+
+        store.delete_profile(&first.id).unwrap();
+        let profiles = store.list_profiles();
+        assert!(!profiles.iter().any(|profile| profile.id == first.id));
+        assert!(profiles.iter().any(|profile| profile.id == second.id));
+
+        store.delete_profile(&second.id).unwrap();
+        let profiles = store.list_profiles();
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].id, DEFAULT_PROFILE_ID);
+    }
+
+    #[test]
+    fn set_default_profile_reorders_and_reopens_as_current() {
+        let dir = TempDir::new().unwrap();
+        let store = ProfileStore::new(dir.path()).unwrap();
+        let first = store.create_profile("First").unwrap();
+        let second = store.create_profile("Second").unwrap();
+
+        store.set_default_profile(&second.id).unwrap();
+        let profiles = store.list_profiles();
+        assert_eq!(profiles[0].id, second.id);
+        assert_eq!(store.default_profile_id(), second.id);
+        drop(store);
+
+        let reopened = ProfileStore::new(dir.path()).unwrap();
+        assert_eq!(reopened.current_profile_id(), second.id);
+        assert_eq!(reopened.list_profiles()[0].id, second.id);
+        assert!(reopened.delete_profile(&first.id).is_ok());
     }
 
     #[test]
@@ -517,10 +633,10 @@ mod tests {
     }
 
     #[test]
-    fn meta_enhanced_privacy_defaults_true() {
+    fn meta_enhanced_privacy_defaults_false() {
         let (store, _dir) = make_store();
         let meta = store.get_meta(DEFAULT_PROFILE_ID);
-        assert!(meta.enhanced_privacy);
+        assert!(!meta.enhanced_privacy);
     }
 
     #[test]
@@ -566,10 +682,60 @@ mod tests {
     }
 
     #[test]
-    fn webrtc_defaults_to_enabled() {
+    fn webrtc_defaults_to_disabled() {
         let (store, _dir) = make_store();
         let meta = store.get_meta(DEFAULT_PROFILE_ID);
+        assert!(!meta.webrtc_enabled);
+        let p = store.create_profile("No RTC").unwrap();
+        let new_meta = store.get_meta(&p.id);
+        assert!(!new_meta.webrtc_enabled);
+    }
+
+    #[test]
+    fn legacy_webrtc_default_migrates_to_disabled_once() {
+        let dir = TempDir::new().unwrap();
+        let store = ProfileStore::new(dir.path()).unwrap();
+        let p = store.create_profile("Legacy RTC").unwrap();
+        drop(store);
+
+        let meta_path = dir
+            .path()
+            .join(PROFILES_DIR)
+            .join(&p.id)
+            .join(META_JSON);
+        std::fs::write(
+            &meta_path,
+            r#"{"enhanced_privacy":false,"webrtc_enabled":true}"#,
+        )
+        .unwrap();
+
+        let reopened = ProfileStore::new(dir.path()).unwrap();
+        let meta = reopened.get_meta(&p.id);
+        assert!(!meta.webrtc_enabled);
+        assert_eq!(meta.meta_version, CURRENT_META_VERSION);
+
+        let mut meta = reopened.get_meta(&p.id);
+        meta.webrtc_enabled = true;
+        reopened.set_meta(&p.id, &meta).unwrap();
+        drop(reopened);
+
+        let reopened = ProfileStore::new(dir.path()).unwrap();
+        let meta = reopened.get_meta(&p.id);
         assert!(meta.webrtc_enabled);
+        assert_eq!(meta.meta_version, CURRENT_META_VERSION);
+    }
+
+    #[test]
+    fn profile_export_document_allows_missing_privacy_fields() {
+        let json = r#"{
+          "schemaVersion": 1,
+          "exportedAt": "0",
+          "sourceProfileID": "default",
+          "name": "导入空间"
+        }"#;
+        let doc: ProfileExportDocument = serde_json::from_str(json).unwrap();
+        assert!(!doc.enhanced_privacy_enabled);
+        assert_eq!(doc.webrtc_enabled, None);
     }
 
     #[test]

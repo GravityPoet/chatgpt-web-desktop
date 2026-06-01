@@ -330,24 +330,34 @@ pub fn enhanced_privacy_script(
                   {{ re: /\\(\\s*any-pointer\\s*:\\s*fine\\s*\\)/i, value: false }},
                   {{ re: /\\(\\s*any-pointer\\s*:\\s*coarse\\s*\\)/i, value: true }}
                 ];
+                const mediaOverrideCache = new Map();
                 function matchMedia(query) {{
                   const result = origMatchMedia.call(this, query);
                   try {{
                     const q = String(query || '');
-                    for (const rule of touchOverrides) {{
-                      if (rule.re.test(q)) {{
-                        return Object.assign({{}}, result, {{
-                          matches: rule.value,
-                          media: q,
-                          onchange: null,
-                          addEventListener: result.addEventListener ? result.addEventListener.bind(result) : function () {{}},
-                          removeEventListener: result.removeEventListener ? result.removeEventListener.bind(result) : function () {{}},
-                          addListener: result.addListener ? result.addListener.bind(result) : function () {{}},
-                          removeListener: result.removeListener ? result.removeListener.bind(result) : function () {{}},
-                          dispatchEvent: result.dispatchEvent ? result.dispatchEvent.bind(result) : function () {{ return true; }}
-                        }});
+                    if (!/(hover|pointer)/i.test(q)) return result;
+                    let override = mediaOverrideCache.get(q);
+                    if (override === undefined) {{
+                      override = null;
+                      for (const rule of touchOverrides) {{
+                        if (rule.re.test(q)) {{
+                          override = rule.value;
+                          break;
+                        }}
                       }}
+                      mediaOverrideCache.set(q, override);
                     }}
+                    if (override === null) return result;
+                    return Object.assign({{}}, result, {{
+                      matches: override,
+                      media: q,
+                      onchange: null,
+                      addEventListener: result.addEventListener ? result.addEventListener.bind(result) : function () {{}},
+                      removeEventListener: result.removeEventListener ? result.removeEventListener.bind(result) : function () {{}},
+                      addListener: result.addListener ? result.addListener.bind(result) : function () {{}},
+                      removeListener: result.removeListener ? result.removeListener.bind(result) : function () {{}},
+                      dispatchEvent: result.dispatchEvent ? result.dispatchEvent.bind(result) : function () {{ return true; }}
+                    }});
                   }} catch (_) {{}}
                   return result;
                 }}
@@ -400,11 +410,14 @@ pub fn enhanced_privacy_script(
             }}
           }} catch (_) {{}}
 
+          const maxNoiseWrites = 4096;
+          const boundedNoiseStep = (length, minimum) => Math.max(minimum, Math.ceil((length || 0) / maxNoiseWrites));
           const applyCanvasNoise = (imageData, offset) => {{
             try {{
               const data = imageData && imageData.data;
               if (!data) return imageData;
-              for (let i = offset || 0; i < data.length; i += 97) {{
+              const step = boundedNoiseStep(data.length, 251);
+              for (let i = offset || 0; i < data.length; i += step) {{
                 data[i] = Math.max(0, Math.min(255, data[i] + noise(i)));
               }}
             }} catch (_) {{}}
@@ -415,8 +428,8 @@ pub fn enhanced_privacy_script(
               if (!canvas || !canvas.width || !canvas.height) return;
               const ctx = canvas.getContext('2d', {{ willReadFrequently: true }});
               if (!ctx) return;
-              const width = Math.min(8, canvas.width);
-              const height = Math.min(8, canvas.height);
+              const width = Math.min(4, canvas.width);
+              const height = Math.min(4, canvas.height);
               const imageData = ctx.getImageData(0, 0, width, height);
               applyCanvasNoise(imageData, 3);
               ctx.putImageData(imageData, 0, 0);
@@ -462,7 +475,8 @@ pub fn enhanced_privacy_script(
                 try {{
                   const pixels = arguments[6];
                   if (pixels && typeof pixels.length === 'number') {{
-                    for (let i = 0; i < pixels.length; i += 101) {{
+                    const step = boundedNoiseStep(pixels.length, 257);
+                    for (let i = 0; i < pixels.length; i += step) {{
                       pixels[i] = Math.max(0, Math.min(255, pixels[i] + noise(i + 11)));
                     }}
                   }}
@@ -480,7 +494,8 @@ pub fn enhanced_privacy_script(
                 return function getChannelData() {{
                   const data = original.apply(this, arguments);
                   try {{
-                    for (let i = 0; i < data.length; i += 113) {{
+                    const step = boundedNoiseStep(data.length, 293);
+                    for (let i = 0; i < data.length; i += step) {{
                       data[i] += noise(i + 23) * 0.0000001;
                     }}
                   }} catch (_) {{}}
@@ -493,7 +508,8 @@ pub fn enhanced_privacy_script(
                 return function getFloatFrequencyData(array) {{
                   const result = original.apply(this, arguments);
                   try {{
-                    for (let i = 0; i < array.length; i += 127) {{
+                    const step = boundedNoiseStep(array.length, 307);
+                    for (let i = 0; i < array.length; i += step) {{
                       array[i] += noise(i + 31) * 0.0001;
                     }}
                   }} catch (_) {{}}
@@ -867,6 +883,7 @@ mod tests {
         let script = enhanced_privacy_script("test-profile", None);
         assert!(script.contains("__wkEnhancedPrivacy"));
         assert!(script.contains("applyCanvasNoise"));
+        assert!(script.contains("maxNoiseWrites"));
         assert!(script.contains("patchWebGL"));
     }
 

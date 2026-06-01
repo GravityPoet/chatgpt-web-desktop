@@ -36,6 +36,19 @@ fn default_path() -> String {
 const MAX_COOKIE_IMPORT_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_HEADER_COOKIE_IMPORT_DOMAIN: &str = ".chatgpt.com";
 
+/// Cookie names that are useful for restoring a ChatGPT session without
+/// carrying enough low-value state to trigger HTTP 431 on chatgpt.com.
+pub(crate) fn is_chatgpt_essential_cookie_name(name: &str) -> bool {
+    is_chatgpt_session_cookie_name(name)
+        || name == "cf_clearance"
+        || name == "__Secure-oai-is"
+        || name == "oai-sc"
+}
+
+pub(crate) fn is_chatgpt_session_cookie_name(name: &str) -> bool {
+    name.starts_with("__Secure-next-auth.session-token")
+}
+
 /// Allowed cookie domains for import (ChatGPT/OpenAI related).
 const ALLOWED_DOMAINS: &[&str] = &[
     "chatgpt.com",
@@ -161,6 +174,9 @@ fn validate_cookies(cookies: &[ExportedCookie]) -> Result<(), String> {
         if !path.starts_with('/') {
             return Err(format!("第 {} 个 cookie path 无效: {}", i + 1, path));
         }
+        if path.as_bytes().contains(&0) || path.split('/').any(|segment| segment == "..") {
+            return Err(format!("第 {} 个 cookie path 不安全: {}", i + 1, path));
+        }
         if !is_domain_allowed(&domain) {
             return Err(format!(
                 "第 {} 个 cookie 域名不在白名单中: {}（仅允许 ChatGPT/OpenAI 相关域名）",
@@ -217,7 +233,7 @@ fn parse_netscape_cookie_text(text: &str) -> Result<Vec<ExportedCookie>, String>
             continue;
         }
 
-        let fields: Vec<&str> = line.split_whitespace().collect();
+        let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 7 {
             return Err(format!("Netscape 第 {} 行字段不足", line_index + 1));
         }
@@ -370,7 +386,7 @@ fn parse_set_cookie_line(line: &str) -> Result<ExportedCookie, String> {
                 }
             }
             "expires" => {
-                if let Ok(expires) = value.parse::<f64>() {
+                if let Some(expires) = parse_set_cookie_expires(value) {
                     expiration_date = Some(expires);
                     session = false;
                 }
@@ -445,6 +461,19 @@ fn is_set_cookie_attribute_name(name: &str) -> bool {
     )
 }
 
+fn parse_set_cookie_expires(value: &str) -> Option<f64> {
+    if let Ok(expires) = value.parse::<f64>() {
+        return Some(expires);
+    }
+
+    use tauri::webview::cookie::time::{
+        format_description::well_known::Rfc2822, OffsetDateTime,
+    };
+    OffsetDateTime::parse(value, &Rfc2822)
+        .ok()
+        .map(|datetime| datetime.unix_timestamp() as f64)
+}
+
 fn is_netscape_boolean(value: &str) -> bool {
     parse_netscape_boolean(value).is_some()
 }
@@ -465,7 +494,8 @@ fn current_unix_time() -> f64 {
 }
 
 /// Serialize cookies to JSON for export.
-pub fn export_cookies_json(cookies: &[ExportedCookie]) -> Result<String, String> {
+#[cfg(test)]
+fn export_cookies_json(cookies: &[ExportedCookie]) -> Result<String, String> {
     serde_json::to_string_pretty(cookies).map_err(|e| format!("JSON 序列化失败: {e}"))
 }
 
@@ -561,6 +591,7 @@ mod tests {
         assert!(is_domain_allowed("sub.chatgpt.com"));
         assert!(is_domain_allowed("openai.com"));
         assert!(is_domain_allowed(".openai.com"));
+        assert!(is_domain_allowed("platform.openai.com"));
         assert!(is_domain_allowed("auth.openai.com"));
 
         // Should NOT match (boundary attack)
@@ -616,6 +647,13 @@ mod tests {
     }
 
     #[test]
+    fn reject_unsafe_cookie_path() {
+        let json = r#"[{"domain": ".chatgpt.com", "name": "sid", "value": "x", "path": "/../admin"}]"#;
+        let err = parse_cookie_json(json).unwrap_err();
+        assert!(err.contains("path 不安全"));
+    }
+
+    #[test]
     fn parse_cookie_header_string() {
         let text = "Cookie: __Secure-next-auth.session-token=abc; cf_clearance=xyz";
         let cookies = parse_cookie_import(text).unwrap();
@@ -623,6 +661,26 @@ mod tests {
         assert_eq!(cookies[0].domain, ".chatgpt.com");
         assert_eq!(cookies[0].secure, Some(true));
         assert_eq!(cookies[1].name, "cf_clearance");
+    }
+
+    #[test]
+    fn identifies_essential_chatgpt_cookies() {
+        assert!(is_chatgpt_essential_cookie_name(
+            "__Secure-next-auth.session-token.0"
+        ));
+        assert!(is_chatgpt_essential_cookie_name("cf_clearance"));
+        assert!(is_chatgpt_essential_cookie_name("__Secure-oai-is"));
+        assert!(is_chatgpt_essential_cookie_name("oai-sc"));
+        assert!(!is_chatgpt_essential_cookie_name("consent"));
+        assert!(!is_chatgpt_essential_cookie_name("__Host-next-auth.csrf-token"));
+    }
+
+    #[test]
+    fn identifies_chatgpt_session_cookies() {
+        assert!(is_chatgpt_session_cookie_name(
+            "__Secure-next-auth.session-token.1"
+        ));
+        assert!(!is_chatgpt_session_cookie_name("cf_clearance"));
     }
 
     #[test]
@@ -635,6 +693,16 @@ mod tests {
         assert_eq!(cookies[0].secure, Some(true));
         assert_eq!(cookies[0].http_only, Some(true));
         assert_eq!(cookies[0].same_site.as_deref(), Some("Lax"));
+        assert_eq!(cookies[0].session, Some(false));
+        assert!(cookies[0].expiration_date.is_some());
+    }
+
+    #[test]
+    fn parse_set_cookie_http_date_expires() {
+        let text = "Set-Cookie: cf_clearance=abc; Domain=.chatgpt.com; Path=/; Secure; Expires=Wed, 09 Jun 2027 10:18:14 GMT";
+        let cookies = parse_cookie_import(text).unwrap();
+        assert_eq!(cookies.len(), 1);
+        assert_eq!(cookies[0].name, "cf_clearance");
         assert_eq!(cookies[0].session, Some(false));
         assert!(cookies[0].expiration_date.is_some());
     }
