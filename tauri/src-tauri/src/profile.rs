@@ -57,7 +57,7 @@ impl Default for ProfileMeta {
             meta_version: CURRENT_META_VERSION,
             homepage: None,
             fingerprint: None,
-            fingerprint_disabled: false,
+            fingerprint_disabled: true,
             enhanced_privacy: false,
             webrtc_enabled: false,
         }
@@ -635,10 +635,13 @@ mod tests {
     }
 
     #[test]
-    fn meta_enhanced_privacy_defaults_false() {
+    fn default_profile_privacy_controls_start_disabled() {
         let (store, _dir) = make_store();
         let meta = store.get_meta(DEFAULT_PROFILE_ID);
+        assert!(meta.fingerprint.is_none());
+        assert!(meta.fingerprint_disabled);
         assert!(!meta.enhanced_privacy);
+        assert!(!meta.webrtc_enabled);
     }
 
     #[test]
