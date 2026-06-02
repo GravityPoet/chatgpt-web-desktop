@@ -168,9 +168,21 @@ pub fn build_app_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) -> Men
     let fp_test = MenuItemBuilder::with_id(event_id::OPEN_FINGERPRINT_TEST, "打开指纹检测页")
         .build(app)
         .unwrap();
+    let fp_submenu = build_fingerprint_submenu(app, profile_store);
+    let ep_title = if current_meta.enhanced_privacy {
+        "● 增强隐私模式（当前空间）"
+    } else {
+        "  增强隐私模式（当前空间）"
+    };
+    let ep_item = MenuItemBuilder::with_id(event_id::TOGGLE_ENHANCED_PRIVACY, ep_title)
+        .build(app)
+        .unwrap();
 
     let privacy_menu = SubmenuBuilder::with_id(app, "privacy-menu", "隐私")
         .item(&webrtc)
+        .separator()
+        .item(&fp_submenu)
+        .item(&ep_item)
         .separator()
         .item(&privacy_status)
         .item(&fp_test)
@@ -205,7 +217,6 @@ fn build_profiles_submenu(
     let profiles = profile_store.list_profiles();
     let current_id = profile_store.current_profile_id();
     let default_id = profile_store.default_profile_id();
-    let current_meta = profile_store.get_meta(&current_id);
 
     let mut builder = SubmenuBuilder::with_id(app, "profiles-submenu", "账号空间");
 
@@ -251,32 +262,14 @@ fn build_profiles_submenu(
 
     builder = builder.separator();
 
-    // Fingerprint presets submenu
-    let fp_submenu = build_fingerprint_submenu(app, profile_store);
-    builder = builder.item(&fp_submenu);
-
-    // Enhanced privacy toggle
-    let ep_title = if current_meta.enhanced_privacy {
-        "● 增强隐私模式（当前空间）"
-    } else {
-        "  增强隐私模式（当前空间）"
-    };
-    let ep_item = MenuItemBuilder::with_id(event_id::TOGGLE_ENHANCED_PRIVACY, ep_title)
-        .build(app)
-        .unwrap();
-    builder = builder.item(&ep_item);
-
-    let fp_test = MenuItemBuilder::with_id(event_id::OPEN_FINGERPRINT_TEST, "打开指纹检测页")
-        .build(app)
-        .unwrap();
-    builder = builder.item(&fp_test);
-
-    builder = builder.separator();
-
     let set_home = MenuItemBuilder::with_id(event_id::SET_HOMEPAGE, "设置当前空间首页…")
         .build(app)
         .unwrap();
     builder = builder.item(&set_home);
+    let reset_home = MenuItemBuilder::with_id(event_id::RESET_HOMEPAGE, "恢复默认首页")
+        .build(app)
+        .unwrap();
+    builder = builder.item(&reset_home);
     let set_default = MenuItemBuilder::with_id(event_id::SET_DEFAULT_PROFILE, "设为默认空间")
         .enabled(current_id != profile_store.default_profile_id())
         .build(app)
@@ -332,9 +325,9 @@ fn build_fingerprint_submenu(
 
     // Off option
     let off_title = if is_off {
-        "● 默认（不混淆）"
+        "● 默认 Safari（不混淆）"
     } else {
-        "  默认（不混淆）"
+        "  默认 Safari（不混淆）"
     };
     let off_item = MenuItemBuilder::with_id(
         format!("{}{}", event_id::FP_PRESET_PREFIX, fingerprint::OFF_PRESET_ID),

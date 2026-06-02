@@ -274,9 +274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 return
             }
             let profileID = ProfileStore.currentProfileID()
-            ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profileID)
+            ProfileStore.disableFingerprint(for: profileID)
             self.rebuildMainController()
-            self.presentInfo("已焚烧当前空间浏览现场，并为当前空间重新随机化指纹。空间名称、首页和增强隐私设置已保留。")
+            self.presentInfo("已焚烧当前空间浏览现场，并恢复为默认 Safari 指纹。空间名称、首页和增强隐私设置已保留。")
         }
     }
 
@@ -564,7 +564,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         alert.informativeText = """
         能加强：每个空间固定一套 Safari/WebKit 家族指纹，覆盖 UA、navigator、screen、Intl、触控、Canvas、WebGL、AudioContext、GPC、WebRTC 暴露面等常见 JS 层信号。
 
-        推荐做法：保持每个空间长期使用同一套指纹，只在「焚烧当前空间」后重新随机化。不要频繁切换成完全不同设备。
+        推荐做法：日常保持默认 Safari 指纹；只有明确需要隔离特征时，再手动选择或随机化当前空间指纹。不要频繁切换成完全不同设备。
 
         挡不住：
         - TLS 指纹（JA3 / JA4）：WKWebView 使用系统网络栈，App 无法逐站点修改。
@@ -595,7 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             let profile = WebProfile(id: UUID().uuidString, name: name, createdAt: Date())
             profiles.append(profile)
             ProfileStore.save(profiles)
-            ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profile.id)
+            ProfileStore.disableFingerprint(for: profile.id)
             ProfileStore.setEnhancedPrivacyEnabled(false, for: profile.id)
             ProfileStore.setCurrentProfileID(profile.id)
             self.rebuildMainController()
@@ -894,7 +894,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
            let url = URL(string: homepage) {
             ProfileStore.setHomepage(url, for: newProfile.id)
         }
-        ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: newProfile.id)
+        ProfileStore.disableFingerprint(for: newProfile.id)
         ProfileStore.setEnhancedPrivacyEnabled(ProfileStore.isEnhancedPrivacyEnabled(for: sourceID), for: newProfile.id)
 
         let switchToNewProfile = { [weak self] in
@@ -1347,7 +1347,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     func confirmBurnCurrentProfileData(completion: @escaping () -> Void) {
         let alert = NSAlert()
         alert.messageText = "焚烧当前空间？"
-        alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并重新随机化当前空间指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
+        alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并恢复默认 Safari 指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "焚烧并重建")
         alert.addButton(withTitle: "取消")
@@ -4462,7 +4462,7 @@ private enum ProfileStore {
               UserDefaults.standard.object(forKey: disabledKey) == nil else {
             return
         }
-        setFingerprint(FingerprintCatalog.randomProfile(), for: profileID)
+        disableFingerprint(for: profileID)
     }
 
     static func loadProfiles() -> [WebProfile] {
@@ -4595,6 +4595,9 @@ private enum ProfileStore {
 
     static func fingerprint(for profileID: String?) -> FingerprintProfile? {
         guard let profileID else {
+            return nil
+        }
+        guard !isFingerprintDisabled(for: profileID) else {
             return nil
         }
         let key = profileFingerprintDefaultsPrefix + profileID
