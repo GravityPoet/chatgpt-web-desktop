@@ -1444,7 +1444,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
             if navigationAction.targetFrame?.isMainFrame == true,
                Self.canRewriteForPrivacy(navigationAction.request),
-               Self.needsPrivacyRewrite(request: navigationAction.request, cleanedURL: cleanedURL, sourceURL: webView.url) {
+                Self.needsPrivacyRewrite(request: navigationAction.request, cleanedURL: cleanedURL, sourceURL: webView.url, profileID: profileID) {
                 webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: webView.url, profileID: profileID))
                 decisionHandler(.cancel)
                 return
@@ -2505,18 +2505,23 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private static func makeConfiguration(messageHandler: WKScriptMessageHandler, persistent: Bool, profileID: String?) -> WKWebViewConfiguration {
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
-        userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        let fingerprint = ProfileStore.fingerprint(for: profileID)
+        let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
+        let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
+        if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled {
+            userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
-        if let fingerprint = ProfileStore.fingerprint(for: profileID) {
+        if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
-        if ProfileStore.isEnhancedPrivacyEnabled(for: profileID) {
-            let script = FingerprintCatalog.enhancedPrivacyScript(profileID: profileID, fingerprint: ProfileStore.fingerprint(for: profileID))
+        if enhancedPrivacyEnabled {
+            userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+            let script = FingerprintCatalog.enhancedPrivacyScript(profileID: profileID, fingerprint: fingerprint)
             userContentController.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
-        if PrivacySettings.isWebRTCProtectionEnabled() {
+        if webRTCProtectionEnabled {
             userContentController.addUserScript(WKUserScript(source: webRTCBlockerScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
 
@@ -2560,6 +2565,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
     private static func isOpenAISentinelHost(_ host: String) -> Bool {
         host == "sentinel.openai.com"
+    }
+
+    private static func isCloudflareChallengeURL(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else {
+            return false
+        }
+        return host == "challenges.cloudflare.com" && url.path.hasPrefix("/cdn-cgi/challenge-platform/")
     }
 
     private static func isOpenAIFamilyHost(_ host: String) -> Bool {
@@ -2661,6 +2673,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return isChatGPTHost(host)
             || isOpenAIAuthHost(host)
             || isOpenAISentinelHost(host)
+            || isCloudflareChallengeURL(url)
             || isOAuthContinuationHost(url)
             || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
     }
@@ -2681,14 +2694,20 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return method == "GET" || method == "HEAD"
     }
 
-    private static func needsPrivacyRewrite(request: URLRequest, cleanedURL: URL, sourceURL: URL?) -> Bool {
+    private static func needsPrivacyRewrite(request: URLRequest, cleanedURL: URL, sourceURL: URL?, profileID: String?) -> Bool {
         guard let originalURL = request.url else {
             return false
         }
         if cleanedURL.absoluteString != originalURL.absoluteString {
             return true
         }
-        if request.value(forHTTPHeaderField: "Sec-GPC") != "1" {
+        if ProfileStore.isEnhancedPrivacyEnabled(for: profileID),
+           request.value(forHTTPHeaderField: "Sec-GPC") != "1" {
+            return true
+        }
+        if ProfileStore.fingerprint(for: profileID) != nil,
+           let acceptLanguage = acceptLanguageHeader(for: profileID),
+           request.value(forHTTPHeaderField: "Accept-Language") != acceptLanguage {
             return true
         }
         guard shouldTrimReferrer(from: sourceURL, to: cleanedURL) else {
@@ -2705,8 +2724,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     ) -> URLRequest {
         let cleanedURL = cleanTrackingParameters(from: url)
         var request = URLRequest(url: cleanedURL, cachePolicy: cachePolicy)
-        request.setValue("1", forHTTPHeaderField: "Sec-GPC")
-        if let acceptLanguage = acceptLanguageHeader(for: profileID) {
+        if ProfileStore.isEnhancedPrivacyEnabled(for: profileID) {
+            request.setValue("1", forHTTPHeaderField: "Sec-GPC")
+        }
+        if ProfileStore.fingerprint(for: profileID) != nil,
+           let acceptLanguage = acceptLanguageHeader(for: profileID) {
             request.setValue(acceptLanguage, forHTTPHeaderField: "Accept-Language")
         }
         if shouldTrimReferrer(from: sourceURL, to: cleanedURL),
@@ -3407,23 +3429,50 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
           return false;
         }
       };
+      if (!isTrustedPage()) return;
+
+      const looksLikeCloudflareChallenge = () => {
+        try {
+          const href = String(location.href || '').toLowerCase();
+          if (href.includes('/cdn-cgi/challenge-platform/')) return true;
+          if (document.querySelector([
+            'iframe[src*="challenges.cloudflare.com"]',
+            '.cf-turnstile',
+            '#cf-challenge-running',
+            '#challenge-stage',
+            '[data-cf-challenge]'
+          ].join(','))) return true;
+          const text = String(document.body ? document.body.textContent || '' : '').toLowerCase();
+          return text.includes('cloudflare') && (
+            text.includes('verifying') ||
+            text.includes('checking') ||
+            text.includes('正在验证') ||
+            text.includes('验证')
+          );
+        } catch (_) {
+          return false;
+        }
+      };
 
       const blobURLs = new Map();
-      const originalCreateObjectURL = URL.createObjectURL.bind(URL);
-      URL.createObjectURL = (value) => {
-        const url = originalCreateObjectURL(value);
-        try {
-          if (value instanceof Blob) blobURLs.set(url, value);
-        } catch (_) {}
-        return url;
-      };
-      if (URL.revokeObjectURL) {
-        const originalRevokeObjectURL = URL.revokeObjectURL.bind(URL);
-        URL.revokeObjectURL = (url) => {
-          blobURLs.delete(url);
-          return originalRevokeObjectURL(url);
+      const installBlobURLCache = () => {
+        if (!URL.createObjectURL) return;
+        const originalCreateObjectURL = URL.createObjectURL.bind(URL);
+        URL.createObjectURL = (value) => {
+          const url = originalCreateObjectURL(value);
+          try {
+            if (value instanceof Blob) blobURLs.set(url, value);
+          } catch (_) {}
+          return url;
         };
-      }
+        if (URL.revokeObjectURL) {
+          const originalRevokeObjectURL = URL.revokeObjectURL.bind(URL);
+          URL.revokeObjectURL = (url) => {
+            blobURLs.delete(url);
+            return originalRevokeObjectURL(url);
+          };
+        }
+      };
 
       function readBlob(blob) {
         if (!blob || typeof blob.size !== 'number' || blob.size > maxBlobDownloadBytes) {
@@ -3538,10 +3587,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
               return { filename, url: url.href };
             }
 
-            installStopTooltipGuard();
+            const installPageHooks = () => {
+              if (looksLikeCloudflareChallenge()) return;
+              installBlobURLCache();
+              installStopTooltipGuard();
 
-            document.addEventListener('contextmenu', (event) => {
-              if (!isTrustedPage()) return;
+              document.addEventListener('contextmenu', (event) => {
+                if (!isTrustedPage()) return;
         const target = imageTargetFromEvent(event);
         if (!target) return;
         event.preventDefault();
@@ -3555,9 +3607,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         }).catch((error) => {
           console.error('[WebView] image context menu failed', error);
         });
-      }, true);
+              }, true);
 
-      document.addEventListener('click', async (event) => {
+              document.addEventListener('click', async (event) => {
         const target = event.target && event.target.closest ? event.target.closest('a[href^="blob:"],a[href^="data:"]') : null;
         if (!target) return;
         if (!isTrustedPage()) return;
@@ -3576,7 +3628,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         } catch (error) {
           console.error('[WebView] blob download bridge failed', error);
         }
-      }, true);
+              }, true);
+            };
+
+            if (document.readyState === 'loading') {
+              document.addEventListener('DOMContentLoaded', installPageHooks, { once: true });
+            } else {
+              installPageHooks();
+            }
     })();
     """
 }

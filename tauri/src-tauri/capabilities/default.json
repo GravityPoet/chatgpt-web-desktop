@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "main-capability",
-  "description": "Capability for remote ChatGPT/OpenAI pages. Download and zoom are directly callable; sensitive commands also require a one-time native-menu token.",
+  "description": "Capability for remote ChatGPT pages. Only download and zoom bridge commands are callable from the webview.",
   "windows": ["main", "auth-*", "incognito-*"],
   "remote": {
     "urls": [
@@ -17,15 +17,6 @@
     "allow-start-blob-download",
     "allow-append-blob-download",
     "allow-finish-blob-download",
-    "allow-cancel-blob-download",
-    "allow-cmd-create-profile",
-    "allow-cmd-clone-profile",
-    "allow-cmd-rename-profile",
-    "allow-cmd-delete-profile",
-    "allow-cmd-set-homepage",
-    "allow-cmd-import-profile",
-    "allow-cmd-import-cookies",
-    "allow-cmd-export-cookies",
-    "allow-cmd-burn-current-profile"
+    "allow-cancel-blob-download"
   ]
 }

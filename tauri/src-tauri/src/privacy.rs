@@ -59,6 +59,7 @@ pub const PRIVACY_SIGNALS_SCRIPT: &str = r#"
 "#;
 
 /// Passkey limitation notice script — shows a banner on passkey pages.
+#[allow(dead_code)]
 pub const PASSKEY_NOTICE_SCRIPT: &str = r#"
 (() => {
   if (window.__wkPasskeyLimitationNoticeInstalled) return;
