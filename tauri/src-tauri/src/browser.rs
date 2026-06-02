@@ -174,7 +174,7 @@ fn build_rebuild_keeper_window(app: &AppHandle<Wry>) -> Option<WebviewWindow<Wry
         WebviewUrl::External("about:blank".parse().ok()?),
     )
     .title("ChatGPT Rust")
-    .visible(true)
+    .visible(false)
     .focused(false)
     .decorations(false)
     .skip_taskbar(true)
@@ -182,6 +182,12 @@ fn build_rebuild_keeper_window(app: &AppHandle<Wry>) -> Option<WebviewWindow<Wry
     .inner_size(1.0, 1.0)
     .build()
     .ok()
+}
+
+fn destroy_rebuild_keeper_window(app: &AppHandle<Wry>) {
+    if let Some(window) = app.get_webview_window(REBUILD_KEEPER_WINDOW_LABEL) {
+        let _ = window.destroy();
+    }
 }
 
 fn schedule_main_window_rebuild(
@@ -227,6 +233,7 @@ fn finish_failed_main_rebuild(app: &AppHandle<Wry>, message: &str) {
         .main_rebuild_in_progress
         .store(false, Ordering::SeqCst);
     eprintln!("failed to rebuild main window: {message}");
+    destroy_rebuild_keeper_window(app);
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.show();
         let _ = window.set_focus();
@@ -296,6 +303,8 @@ fn finish_main_window_rebuild(
     let new_menu = menu::build_app_menu(app, &profile_store);
     app.set_menu(new_menu)
         .map_err(|e| format!("failed to set menu: {e}"))?;
+
+    destroy_rebuild_keeper_window(app);
 
     Ok(())
 }

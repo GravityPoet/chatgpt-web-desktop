@@ -208,9 +208,10 @@ impl ProfileStore {
         fs::create_dir_all(profile_dir.join(WEBVIEW_DATA_DIR))
             .map_err(|e| format!("failed to create profile directory: {e}"))?;
 
-        // Write default meta.json with stable random fingerprint
+        // Write default meta.json with native WebKit/Safari fingerprinting.
         let meta = ProfileMeta {
-            fingerprint: Some(crate::fingerprint::random_fingerprint()),
+            fingerprint: None,
+            fingerprint_disabled: true,
             enhanced_privacy: false,
             webrtc_enabled: false,
             ..Default::default()
@@ -335,7 +336,7 @@ impl ProfileStore {
     }
 
     /// Clone a profile: copies name base, homepage, enhanced privacy, webrtc setting.
-    /// Always generates a new stable random fingerprint for the clone.
+    /// Fingerprint spoofing stays disabled for the clone unless the user enables it later.
     /// Returns (new_profile, source_meta) so caller can optionally copy cookies.
     pub fn clone_profile(&self, source_id: &str, new_name: &str) -> Result<(WebProfile, ProfileMeta), String> {
         let source_meta = self.get_meta(source_id);
@@ -364,10 +365,11 @@ impl ProfileStore {
 
         let profile = self.create_profile(&name)?;
 
-        // Copy homepage, enhanced privacy, webrtc from source
-        // But always generate a new random fingerprint (already done by create_profile)
+        // Copy homepage, enhanced privacy, webrtc from source. Keep native fingerprinting.
         let mut new_meta = self.get_meta(&profile.id);
         new_meta.homepage = source_meta.homepage.clone();
+        new_meta.fingerprint = None;
+        new_meta.fingerprint_disabled = true;
         new_meta.enhanced_privacy = source_meta.enhanced_privacy;
         new_meta.webrtc_enabled = source_meta.webrtc_enabled;
         self.set_meta(&profile.id, &new_meta)?;
@@ -655,18 +657,16 @@ mod tests {
     }
 
     #[test]
-    fn new_profile_has_random_fingerprint() {
+    fn new_profile_defaults_to_native_fingerprint() {
         let (store, _dir) = make_store();
         let p = store.create_profile("FP Test").unwrap();
         let meta = store.get_meta(&p.id);
-        assert!(meta.fingerprint.is_some(), "new profile should have a fingerprint");
-        let fp = meta.fingerprint.unwrap();
-        assert!(fp.preset_id.starts_with("random-"), "fingerprint should be random");
-        assert!(!fp.user_agent.is_empty());
+        assert!(meta.fingerprint.is_none());
+        assert!(meta.fingerprint_disabled);
     }
 
     #[test]
-    fn clone_gets_new_fingerprint_different_from_source() {
+    fn clone_defaults_to_native_fingerprint() {
         let (store, _dir) = make_store();
         let source_meta = store.get_meta(DEFAULT_PROFILE_ID);
         // Ensure source has a fingerprint
@@ -676,9 +676,9 @@ mod tests {
 
         let (clone, _) = store.clone_profile(DEFAULT_PROFILE_ID, "").unwrap();
         let clone_meta = store.get_meta(&clone.id);
-        let source_fp = store.get_meta(DEFAULT_PROFILE_ID).fingerprint.unwrap();
-        let clone_fp = clone_meta.fingerprint.unwrap();
-        assert_ne!(source_fp.preset_id, clone_fp.preset_id, "clone should have a different fingerprint");
+        assert!(store.get_meta(DEFAULT_PROFILE_ID).fingerprint.is_some());
+        assert!(clone_meta.fingerprint.is_none());
+        assert!(clone_meta.fingerprint_disabled);
     }
 
     #[test]

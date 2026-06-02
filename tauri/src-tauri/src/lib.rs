@@ -28,6 +28,7 @@ const MAX_BLOB_DOWNLOAD_BYTES: usize = 200 * 1024 * 1024;
 const MAX_CHATGPT_COOKIE_HEADER_BYTES: usize = 6 * 1024;
 const MIN_WEBVIEW_ZOOM: f64 = 0.85;
 const MAX_WEBVIEW_ZOOM: f64 = 1.40;
+const WEBVIEW_ZOOM_STORAGE_KEY: &str = "chatgptWebviewZoom";
 
 // --- Download session management ---
 
@@ -167,7 +168,7 @@ fn cancel_blob_download(
 fn set_native_webview_zoom(window: WebviewWindow<Wry>, scale: f64) -> Result<f64, String> {
     ensure_trusted_command_window(&window)?;
 
-    let clamped = scale.clamp(MIN_WEBVIEW_ZOOM, MAX_WEBVIEW_ZOOM);
+    let clamped = clamp_webview_zoom(scale);
     window
         .set_zoom(clamped)
         .map_err(|error| format!("failed to set native webview zoom: {error}"))?;
@@ -317,13 +318,30 @@ fn rebuild_menu(app: &AppHandle<Wry>, profile_store: &ProfileStore) {
     }
 }
 
+fn clamp_webview_zoom(scale: f64) -> f64 {
+    if scale.is_finite() {
+        scale.clamp(MIN_WEBVIEW_ZOOM, MAX_WEBVIEW_ZOOM)
+    } else {
+        1.0
+    }
+}
+
+fn webview_zoom_persistence_script(scale: f64) -> String {
+    format!(
+        "try {{ window.localStorage.setItem({key:?}, {value:?}); }} catch (_) {{}}",
+        key = WEBVIEW_ZOOM_STORAGE_KEY,
+        value = format!("{:.2}", clamp_webview_zoom(scale)),
+    )
+}
+
 fn set_menu_zoom(app: &AppHandle<Wry>, next: f64) {
-    let clamped = next.clamp(MIN_WEBVIEW_ZOOM, MAX_WEBVIEW_ZOOM);
+    let clamped = clamp_webview_zoom(next);
     if let Some(window) = current_main_window(app) {
         if let Err(error) = window.set_zoom(clamped) {
             show_menu_error(format!("缩放失败：{error}"));
             return;
         }
+        let _ = window.eval(&webview_zoom_persistence_script(clamped));
     }
     if let Ok(mut zoom) = app.state::<NativeZoomState>().0.lock() {
         *zoom = clamped;
@@ -841,7 +859,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             let _ = browser::rebuild_main_window(app, &profile_store, current_url);
         }
         menu::event_id::FP_ABOUT => {
-            let msg = "能加强：每个空间固定一套指纹，覆盖 UA、navigator、screen、Canvas、WebGL、AudioContext 等。\n\n挡不住：TLS 指纹、HTTP/2 帧顺序、Worker/字体/GPU/IP/行为模式。\n\n本 App 只做一致性隐私指纹，不做跨引擎伪装。";
+            let msg = "默认：使用系统 WebKit/Safari 指纹，不做混淆。\n\n可选混淆：每个空间固定一套指纹，覆盖 UA、navigator、screen、Canvas、WebGL、AudioContext 等。\n\n挡不住：TLS 指纹、HTTP/2 帧顺序、Worker/字体/GPU/IP/行为模式。\n\n建议：日常保持默认 Safari 指纹；只有明确需要隔离特征时，再手动选择或随机化当前空间指纹。";
             native_alert("关于指纹混淆", msg);
         }
         menu::event_id::TOGGLE_ENHANCED_PRIVACY => {
@@ -1237,7 +1255,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
         menu::event_id::BURN_CURRENT_PROFILE => {
             if !native_confirm(
                 "焚烧当前空间",
-                "会删除当前空间所有 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭弹窗，清空页面历史，重建浏览器视图，并重新随机化指纹。\n\n保留：空间名称、首页、增强隐私设置。其他空间不受影响。",
+                "会删除当前空间所有 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭弹窗，清空页面历史，重建浏览器视图，并恢复默认 Safari 指纹。\n\n保留：空间名称、首页、增强隐私设置。其他空间不受影响。",
             ) {
                 return;
             }
@@ -1250,14 +1268,14 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             }
             browser::close_auth_popups(app);
             let mut meta = profile_store.get_meta(&current_id);
-            meta.fingerprint = Some(fingerprint::random_fingerprint());
-            meta.fingerprint_disabled = false;
+            meta.fingerprint = None;
+            meta.fingerprint_disabled = true;
             let _ = profile_store.set_meta(&current_id, &meta);
             let homepage = profile_store.homepage_url(&current_id);
             if let Err(error) = browser::rebuild_main_window(app, &profile_store, Some(homepage)) {
                 show_menu_error(format!("重建窗口失败：{error}"));
             } else {
-                native_alert("ChatGPT Rust", "已焚烧当前空间浏览现场，并重新随机化指纹。");
+                native_alert("ChatGPT Rust", "已焚烧当前空间浏览现场，并恢复默认 Safari 指纹。");
             }
         }
         menu::event_id::NEW_INCOGNITO => {
@@ -1289,9 +1307,15 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             for script in &init_scripts {
                 builder = builder.initialization_script(script);
             }
-            let result = builder.build();
-            if let Ok(window) = result {
-                let _ = window.navigate(Url::parse("https://chatgpt.com/").unwrap());
+            match builder.build() {
+                Ok(window) => {
+                    if let Ok(url) = Url::parse("https://chatgpt.com/") {
+                        if let Err(error) = window.navigate(url) {
+                            show_menu_error(format!("打开无痕窗口失败：{error}"));
+                        }
+                    }
+                }
+                Err(error) => show_menu_error(format!("新建无痕窗口失败：{error}")),
             }
         }
         _ => {
@@ -1399,12 +1423,9 @@ pub fn run() {
                     }
                 }
                 RunEvent::Reopen {
-                    has_visible_windows,
                     ..
                 } => {
-                    if !has_visible_windows {
-                        show_main_window(app);
-                    }
+                    show_main_window(app);
                 }
                 _ => {}
             }
@@ -1840,6 +1861,21 @@ mod tests {
         assert!(validate_blob_download_size(MAX_BLOB_DOWNLOAD_BYTES).is_ok());
         assert!(validate_blob_download_size(0).is_err());
         assert!(validate_blob_download_size(MAX_BLOB_DOWNLOAD_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn clamps_webview_zoom_to_supported_range() {
+        assert_eq!(clamp_webview_zoom(0.5), MIN_WEBVIEW_ZOOM);
+        assert_eq!(clamp_webview_zoom(2.0), MAX_WEBVIEW_ZOOM);
+        assert_eq!(clamp_webview_zoom(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn menu_zoom_persists_to_webview_zoom_storage_key() {
+        let script = webview_zoom_persistence_script(1.2);
+        assert!(script.contains(WEBVIEW_ZOOM_STORAGE_KEY));
+        assert!(script.contains("1.20"));
+        assert!(CHATGPT_WEBVIEW_SCRIPT.contains(WEBVIEW_ZOOM_STORAGE_KEY));
     }
 
     #[test]
