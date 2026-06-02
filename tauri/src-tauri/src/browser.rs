@@ -19,6 +19,8 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 const REBUILD_KEEPER_WINDOW_LABEL: &str = "__profile-rebuild-keeper";
 const MAIN_REBUILD_RETRY_DELAY_MS: u64 = 120;
 const MAIN_REBUILD_MAX_ATTEMPTS: u8 = 10;
+const DEFAULT_MACOS_SAFARI_USER_AGENT: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
 
 /// State held in Tauri's managed state for browser operations.
 pub struct BrowserState {
@@ -93,6 +95,7 @@ pub fn build_main_window(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
+    let user_agent = profile_user_agent(&profile_store, &profile.id);
     let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
@@ -102,6 +105,7 @@ pub fn build_main_window(
     let builder = WebviewWindowBuilder::from_config(app, &window_config)
         .map_err(|e| format!("failed to create window from config: {e}"))?
         .title(&title)
+        .user_agent(&user_agent)
         .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
         .on_new_window(move |url, features| {
             handle_new_window(&app_for_popup, url, features)
@@ -125,6 +129,9 @@ pub fn build_main_window(
     let webview = builder
         .build()
         .map_err(|e| format!("failed to build main webview: {e}"))?;
+    if let Err(error) = crate::apply_pending_cookies(app, &webview) {
+        eprintln!("failed to apply pending cookies: {error}");
+    }
     let _ = crate::prune_oversized_chatgpt_cookies(&webview);
 
     // Load the homepage
@@ -214,7 +221,10 @@ fn schedule_main_window_rebuild(
                 .main_rebuild_in_progress
                 .store(false, Ordering::SeqCst);
             if let Err(error) = result {
-                eprintln!("failed to rebuild main window: {error}");
+                finish_failed_main_rebuild(
+                    &app_for_main,
+                    &format!("新主窗口创建失败，已停止本次重建：{error}"),
+                );
             }
         });
 
@@ -233,6 +243,7 @@ fn finish_failed_main_rebuild(app: &AppHandle<Wry>, message: &str) {
         .main_rebuild_in_progress
         .store(false, Ordering::SeqCst);
     eprintln!("failed to rebuild main window: {message}");
+    crate::show_menu_error(message);
     destroy_rebuild_keeper_window(app);
     if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
         let _ = window.show();
@@ -262,6 +273,7 @@ fn finish_main_window_rebuild(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
+    let user_agent = profile_user_agent(&profile_store, &profile.id);
     let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
@@ -271,6 +283,7 @@ fn finish_main_window_rebuild(
     let builder = WebviewWindowBuilder::from_config(app, &window_config)
         .map_err(|e| format!("failed to create window from config: {e}"))?
         .title(&title)
+        .user_agent(&user_agent)
         .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
         .on_new_window(move |url, features| {
             handle_new_window(&app_for_popup, url, features)
@@ -293,6 +306,9 @@ fn finish_main_window_rebuild(
     let webview = builder
         .build()
         .map_err(|e| format!("failed to rebuild main webview: {e}"))?;
+    if let Err(error) = crate::apply_pending_cookies(app, &webview) {
+        eprintln!("failed to apply pending cookies: {error}");
+    }
     let _ = crate::prune_oversized_chatgpt_cookies(&webview);
 
     if let Ok(url) = Url::parse(&homepage) {
@@ -320,24 +336,26 @@ pub fn close_auth_popups(app: &AppHandle<Wry>) {
 
 /// Build initialization scripts for a profile.
 pub fn build_init_scripts(profile_store: &ProfileStore, profile_id: &str) -> Vec<String> {
-    let mut scripts: Vec<String> = vec![
-        privacy::NATIVE_SHIM_SCRIPT.to_string(),
-        privacy::PRIVACY_SIGNALS_SCRIPT.to_string(),
-        CHATGPT_WEBVIEW_SCRIPT.to_string(),
-        privacy::PASSKEY_NOTICE_SCRIPT.to_string(),
-    ];
-
     let meta = profile_store.get_meta(profile_id);
+    let fingerprint_enabled = meta.fingerprint.is_some() && !meta.fingerprint_disabled;
+    let privacy_mutation_enabled =
+        fingerprint_enabled || meta.enhanced_privacy || meta.webrtc_enabled;
+
+    let mut scripts: Vec<String> = vec![CHATGPT_WEBVIEW_SCRIPT.to_string()];
+    if privacy_mutation_enabled {
+        scripts.push(privacy::NATIVE_SHIM_SCRIPT.to_string());
+    }
 
     // Fingerprint override
-    if let Some(ref fp) = meta.fingerprint {
-        if !meta.fingerprint_disabled {
+    if fingerprint_enabled {
+        if let Some(ref fp) = meta.fingerprint {
             scripts.push(fingerprint::fingerprint_script(fp));
         }
     }
 
     // Enhanced privacy (Canvas/WebGL/Audio noise, GPC, etc.)
     if meta.enhanced_privacy {
+        scripts.push(privacy::PRIVACY_SIGNALS_SCRIPT.to_string());
         scripts.push(fingerprint::enhanced_privacy_script(
             profile_id,
             meta.fingerprint.as_ref(),
@@ -352,6 +370,18 @@ pub fn build_init_scripts(profile_store: &ProfileStore, profile_id: &str) -> Vec
     scripts
 }
 
+/// Native HTTP user agent for the WebView.
+/// Keep the default close to Safari/WKWebView so Cloudflare sees a coherent browser surface.
+pub(crate) fn profile_user_agent(profile_store: &ProfileStore, profile_id: &str) -> String {
+    let meta = profile_store.get_meta(profile_id);
+    if !meta.fingerprint_disabled {
+        if let Some(fingerprint) = meta.fingerprint {
+            return fingerprint.user_agent;
+        }
+    }
+    DEFAULT_MACOS_SAFARI_USER_AGENT.to_string()
+}
+
 /// Handle new window requests (auth popups).
 /// Auth popups share the current profile's data store.
 fn handle_new_window(
@@ -360,7 +390,13 @@ fn handle_new_window(
     features: NewWindowFeatures,
 ) -> NewWindowResponse<Wry> {
     if !crate::should_stay_inside_app(&target_url) {
-        crate::open_external_url(&target_url);
+        if crate::should_open_in_app_root(&target_url) {
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                let _ = window.navigate(target_url);
+            }
+        } else {
+            crate::open_external_url(&target_url);
+        }
         return NewWindowResponse::Deny;
     }
 
@@ -378,6 +414,7 @@ fn handle_new_window(
 
     let profile_store = app.state::<ProfileStore>();
     let current_id = profile_store.current_profile_id();
+    let user_agent = profile_user_agent(&profile_store, &current_id);
 
     let app_for_nav = app.clone();
     let app_for_download = app.clone();
@@ -393,6 +430,7 @@ fn handle_new_window(
     .resizable(true)
     .center()
     .focused(true)
+    .user_agent(&user_agent)
     .window_features(features)
     .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
     .on_download(move |_webview, event| {
@@ -420,5 +458,55 @@ pub fn main_window_title(profile_name: &str, profile_id: &str) -> String {
         "ChatGPT Rust".to_string()
     } else {
         format!("ChatGPT Rust · {profile_name}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profile::ProfileMeta;
+
+    #[test]
+    fn default_profile_uses_minimal_init_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(temp.path()).unwrap();
+
+        let scripts = build_init_scripts(&store, DEFAULT_PROFILE_ID);
+
+        assert_eq!(scripts.len(), 1);
+        assert!(scripts[0].contains("looksLikeCloudflareChallenge"));
+        assert!(scripts[0].contains("installNativeZoomShortcuts"));
+        assert!(!scripts[0].contains("__wkNativeShim"));
+        assert!(!scripts[0].contains("__wkEnhancedPrivacy"));
+    }
+
+    #[test]
+    fn default_profile_uses_safari_user_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(temp.path()).unwrap();
+
+        let user_agent = profile_user_agent(&store, DEFAULT_PROFILE_ID);
+
+        assert!(user_agent.contains("Version/26.5 Safari/605.1.15"));
+        assert!(!user_agent.to_ascii_lowercase().contains("tauri"));
+        assert!(!user_agent.to_ascii_lowercase().contains("wry"));
+    }
+
+    #[test]
+    fn enhanced_privacy_opts_into_privacy_mutation_scripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(temp.path()).unwrap();
+        let meta = ProfileMeta {
+            enhanced_privacy: true,
+            ..Default::default()
+        };
+        store.set_meta(DEFAULT_PROFILE_ID, &meta).unwrap();
+
+        let scripts = build_init_scripts(&store, DEFAULT_PROFILE_ID);
+        let combined = scripts.join("\n");
+
+        assert!(combined.contains("__wkNativeShim"));
+        assert!(combined.contains("__wkPrivacySignals"));
+        assert!(combined.contains("__wkEnhancedPrivacy"));
     }
 }

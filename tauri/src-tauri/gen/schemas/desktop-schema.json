@@ -189,60 +189,6 @@
           "markdownDescription": "Enables the cancel_blob_download command without any pre-configured scope."
         },
         {
-          "description": "Enables the cmd_burn_current_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-burn-current-profile",
-          "markdownDescription": "Enables the cmd_burn_current_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_clone_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-clone-profile",
-          "markdownDescription": "Enables the cmd_clone_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_create_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-create-profile",
-          "markdownDescription": "Enables the cmd_create_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_delete_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-delete-profile",
-          "markdownDescription": "Enables the cmd_delete_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_export_cookies command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-export-cookies",
-          "markdownDescription": "Enables the cmd_export_cookies command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_import_cookies command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-import-cookies",
-          "markdownDescription": "Enables the cmd_import_cookies command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_import_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-import-profile",
-          "markdownDescription": "Enables the cmd_import_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_rename_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-rename-profile",
-          "markdownDescription": "Enables the cmd_rename_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Enables the cmd_set_homepage command without any pre-configured scope.",
-          "type": "string",
-          "const": "allow-cmd-set-homepage",
-          "markdownDescription": "Enables the cmd_set_homepage command without any pre-configured scope."
-        },
-        {
           "description": "Enables the finish_blob_download command without any pre-configured scope.",
           "type": "string",
           "const": "allow-finish-blob-download",
@@ -271,60 +217,6 @@
           "type": "string",
           "const": "deny-cancel-blob-download",
           "markdownDescription": "Denies the cancel_blob_download command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_burn_current_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-burn-current-profile",
-          "markdownDescription": "Denies the cmd_burn_current_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_clone_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-clone-profile",
-          "markdownDescription": "Denies the cmd_clone_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_create_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-create-profile",
-          "markdownDescription": "Denies the cmd_create_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_delete_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-delete-profile",
-          "markdownDescription": "Denies the cmd_delete_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_export_cookies command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-export-cookies",
-          "markdownDescription": "Denies the cmd_export_cookies command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_import_cookies command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-import-cookies",
-          "markdownDescription": "Denies the cmd_import_cookies command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_import_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-import-profile",
-          "markdownDescription": "Denies the cmd_import_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_rename_profile command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-rename-profile",
-          "markdownDescription": "Denies the cmd_rename_profile command without any pre-configured scope."
-        },
-        {
-          "description": "Denies the cmd_set_homepage command without any pre-configured scope.",
-          "type": "string",
-          "const": "deny-cmd-set-homepage",
-          "markdownDescription": "Denies the cmd_set_homepage command without any pre-configured scope."
         },
         {
           "description": "Denies the finish_blob_download command without any pre-configured scope.",

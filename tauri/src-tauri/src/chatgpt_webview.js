@@ -28,6 +28,36 @@
 
   if (!isTrustedPage()) return;
 
+  function looksLikeCloudflareChallenge() {
+    try {
+      const href = String(window.location.href || "").toLowerCase();
+      if (href.includes("/cdn-cgi/challenge-platform/")) return true;
+      if (
+        document.querySelector(
+          [
+            'iframe[src*="challenges.cloudflare.com"]',
+            ".cf-turnstile",
+            "#cf-challenge-running",
+            "#challenge-stage",
+            "[data-cf-challenge]",
+          ].join(","),
+        )
+      ) {
+        return true;
+      }
+      const text = String(document.body ? document.body.textContent || "" : "").toLowerCase();
+      return (
+        text.includes("cloudflare") &&
+        (text.includes("verifying") ||
+          text.includes("checking") ||
+          text.includes("正在验证") ||
+          text.includes("验证"))
+      );
+    } catch (_) {
+      return false;
+    }
+  }
+
   const maxBlobDownloadBytes = 200 * 1024 * 1024;
   const zoomStorageKey = "chatgptWebviewZoom";
   const minZoom = 0.85;
@@ -57,6 +87,37 @@
       return cleanFilename(last || "chatgpt-download");
     } catch (_) {
       return "chatgpt-download";
+    }
+  }
+
+  function showDownloadNotice(message) {
+    try {
+      const existing = document.getElementById("chatgpt-rust-download-notice");
+      if (existing) existing.remove();
+
+      const notice = document.createElement("div");
+      notice.id = "chatgpt-rust-download-notice";
+      notice.setAttribute("role", "status");
+      notice.style.cssText = [
+        "position:fixed",
+        "right:18px",
+        "bottom:18px",
+        "z-index:2147483647",
+        "max-width:min(420px,calc(100vw - 36px))",
+        "box-sizing:border-box",
+        "padding:12px 14px",
+        "border-radius:10px",
+        "background:rgba(17,17,17,.94)",
+        "color:#fff",
+        "box-shadow:0 12px 32px rgba(0,0,0,.22)",
+        "font:14px/1.45 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif",
+      ].join(";");
+      notice.textContent = message;
+      document.body.appendChild(notice);
+      window.setTimeout(() => notice.remove(), 5200);
+    } catch (_) {
+      // Console fallback keeps the page behavior intact if DOM insertion is blocked.
+      console.error(message);
     }
   }
 
@@ -110,14 +171,21 @@
   async function handleSpecialDownload(url, filename) {
     try {
       const buffer = await specialUrlToBuffer(url);
-      return await saveBytes(filename, buffer);
+      const saved = await saveBytes(filename, buffer);
+      if (!saved) {
+        showDownloadNotice("下载没有保存。请重试，或在浏览器中打开后另存。");
+      }
+      return saved;
     } catch (error) {
       console.error("WebView special download failed", error);
+      showDownloadNotice("下载失败，未写入文件。请重试，或在浏览器中打开后另存。");
       return false;
     }
   }
 
-  if (window.URL && window.URL.createObjectURL) {
+  function installObjectUrlCache() {
+    if (!window.URL || !window.URL.createObjectURL) return;
+
     const originalCreateObjectUrl = window.URL.createObjectURL.bind(window.URL);
     window.URL.createObjectURL = function (blob) {
       const url = originalCreateObjectUrl(blob);
@@ -270,6 +338,8 @@
   }
 
   function install() {
+    if (looksLikeCloudflareChallenge()) return;
+    installObjectUrlCache();
     resetInjectedZoom();
     installStopTooltipGuard();
     installNativeZoomShortcuts();
