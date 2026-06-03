@@ -83,6 +83,19 @@ pub fn platform_presets() -> Vec<FingerprintProfile> {
     }
 }
 
+/// The complete, engine-consistent default user agent for the current platform, used when no
+/// fingerprint preset overrides it. WKWebView (macOS) and WebKitGTK (Linux) report a truncated
+/// native UA — it stops at "(KHTML, like Gecko)" with no "Version/.. Safari/.." token — which
+/// Cloudflare reads as a non-standard client and challenges repeatedly. WebView2 (Windows) already
+/// reports a complete Edge UA, so it keeps its native UA (returns `None`).
+pub fn platform_default_user_agent() -> Option<String> {
+    match PlatformEngine::current() {
+        PlatformEngine::SafariWebKit => Some(MAC_SAFARI17_UA.to_string()),
+        PlatformEngine::WebKitGtk => Some(LINUX_WEBKITGTK_UA.to_string()),
+        PlatformEngine::Chromium => None,
+    }
+}
+
 /// Get a specific preset by ID.
 pub fn preset_by_id(id: &str) -> Option<FingerprintProfile> {
     platform_presets().into_iter().find(|p| p.preset_id == id)
