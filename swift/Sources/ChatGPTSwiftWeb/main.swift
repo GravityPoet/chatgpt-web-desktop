@@ -28,6 +28,12 @@ private let profileFingerprintDefaultsPrefix = "ChatGPTSwiftWeb.ProfileFingerpri
 private let profileFingerprintDisabledDefaultsPrefix = "ChatGPTSwiftWeb.ProfileFingerprintDisabled."
 private let profileEnhancedPrivacyDefaultsPrefix = "ChatGPTSwiftWeb.ProfileEnhancedPrivacy."
 private let webRTCProtectionDefaultsKey = "ChatGPTSwiftWeb.WebRTCProtectionEnabled"
+private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPartyLinksInApp"
+// WKWebView's native user agent stops at "(KHTML, like Gecko)" with no "Version/.. Safari/.."
+// token. Cloudflare reads that truncated UA as a non-standard client and issues repeated
+// challenges. This is the complete, engine-consistent Safari UA used when no fingerprint preset
+// overrides it, so the WebKit engine presents as the real Safari it actually is.
+private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15"
 private var singleInstanceLockFileDescriptor: CInt = -1
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
@@ -172,6 +178,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         navigationMenu.addItem(NSMenuItem.separator())
         let reloadItem = navigationMenu.addItem(withTitle: "重新加载", action: #selector(reloadAction(_:)), keyEquivalent: "r")
         reloadItem.target = self
+        navigationMenu.addItem(NSMenuItem.separator())
+        let copyURLItem = navigationMenu.addItem(withTitle: "复制当前页链接", action: #selector(copyCurrentURLAction(_:)), keyEquivalent: "c")
+        copyURLItem.keyEquivalentModifierMask = [.command, .shift]
+        copyURLItem.target = self
         navigationItem.submenu = navigationMenu
         mainMenu.addItem(navigationItem)
 
@@ -289,6 +299,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         rebuildMainController(initialURL: currentURL)
     }
 
+    @objc private func toggleThirdPartyLinksInApp(_ sender: NSMenuItem) {
+        let enabled = !PrivacySettings.keepThirdPartyLinksInApp()
+        PrivacySettings.setKeepThirdPartyLinksInApp(enabled)
+        sender.state = enabled ? .on : .off
+    }
+
     @objc private func showPrivacyStatus(_ sender: Any?) {
         let profile = ProfileStore.currentProfile()
         let fingerprint = ProfileStore.fingerprint(for: profile.id)
@@ -364,9 +380,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func reloadAction(_ sender: Any?) {
-        let profile = ProfileStore.currentProfile()
-        let target = mainController?.currentURL() ?? ProfileStore.homepageURL(for: profile.id)
-        rebuildMainController(initialURL: target)
+        guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
+            return
+        }
+        if controller.isShowingBlankContent {
+            // Blank or crashed view: webView.reload() has no back-forward item to refresh, so the page
+            // stays white. Rebuild the main window (fresh content process, clean Cloudflare retry) or
+            // hard-reload a popup so the page actually comes back — restoring the old recover-from-blank
+            // behavior while keeping lightweight, state-preserving reloads for healthy pages.
+            if controller === mainController {
+                rebuildMainController(initialURL: controller.currentURL())
+            } else {
+                controller.hardReload()
+            }
+        } else {
+            controller.reload(sender)
+        }
+    }
+
+    @objc private func copyCurrentURLAction(_ sender: Any?) {
+        guard let url = (BrowserWindowController.keyWindowController() ?? mainController)?.currentURL() else {
+            return
+        }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(url.absoluteString, forType: .string)
     }
 
     @objc private func setProfileHomepageAction(_ sender: Any?) {
@@ -780,6 +817,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         webRTCProtectionItem = webRTCItem
         updateWebRTCProtectionMenuItem()
 
+        let thirdPartyItem = menu.addItem(withTitle: "第三方链接在 App 内打开", action: #selector(toggleThirdPartyLinksInApp(_:)), keyEquivalent: "")
+        thirdPartyItem.target = self
+        thirdPartyItem.state = PrivacySettings.keepThirdPartyLinksInApp() ? .on : .off
+
         menu.addItem(NSMenuItem.separator())
         let fingerprintItem = menu.addItem(withTitle: "指纹预设", action: nil, keyEquivalent: "")
         let fingerprintMenu = NSMenu(title: "指纹预设")
@@ -1103,6 +1144,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private var closeHandler: (() -> Void)?
     private var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
     private var isDisposing = false
+    private var downloadDestinations: [ObjectIdentifier: URL] = [:]
 
     init(
         initialURL: URL?,
@@ -1125,6 +1167,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         webView = WKWebView(frame: .zero, configuration: webConfiguration)
         if let fingerprint = ProfileStore.fingerprint(for: profileID) {
             webView.customUserAgent = fingerprint.userAgent
+        } else {
+            // Default profile (no fingerprint preset): override the truncated native WKWebView UA
+            // with a complete Safari UA. Setting it here on the web view covers the main window,
+            // incognito windows, and OAuth popups, which all flow through this initializer.
+            webView.customUserAgent = defaultSafariUserAgent
         }
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -1163,6 +1210,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
     @objc func reload(_ sender: Any?) {
         webView.reload()
+    }
+
+    /// True when the web view has no live, loaded content — the content process crashed, a provisional
+    /// load failed, or nothing ever loaded. In these states `reload()` is a no-op and the view stays blank.
+    var isShowingBlankContent: Bool {
+        webView.url == nil || webView.backForwardList.currentItem == nil
+    }
+
+    /// Re-issue a full load (restarting a dead content process) instead of refreshing the back-forward
+    /// list. Falls back to the profile homepage when there is no current URL to recover.
+    func hardReload() {
+        let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
+        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
     }
 
     var canGoBack: Bool {
@@ -1329,7 +1389,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 let data = try encoder.encode(exported)
-                try data.write(to: url, options: [.atomic])
+                try data.write(to: url, options: [.atomic, .completeFileProtection])
                 self.presentInfo("已导出 \(cookies.count) 个 cookie 到 \(url.lastPathComponent)。")
             } catch {
                 self.presentError("Cookie 导出失败：\(error.localizedDescription)")
@@ -1426,16 +1486,25 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             return
         }
 
+        if #available(macOS 11.3, *), navigationAction.shouldPerformDownload {
+            // Links flagged for download (e.g. <a download> for large blob/data exports) stream to disk
+            // through WKDownload instead of the base64 bridge, so there is no size ceiling.
+            decisionHandler(.download)
+            return
+        }
+
         let cleanedURL = Self.cleanTrackingParameters(from: url)
 
         let sourceURL = webView.url
 
         if navigationAction.targetFrame == nil {
-            if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
-                openPopup(url: cleanedURL)
-            } else {
-                browserLogger.info("Opening target-frame-less external URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
+            // New window / window.open / target=_blank. Default to an in-app popup; only a deliberate
+            // click on a genuine third-party link is handed to the system browser.
+            if Self.shouldOpenInSystemBrowser(cleanedURL, navigationType: navigationAction.navigationType) {
+                browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
                 NSWorkspace.shared.open(cleanedURL)
+            } else {
+                openPopup(url: cleanedURL)
             }
             decisionHandler(.cancel)
             return
@@ -1450,16 +1519,33 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
                 return
             }
             decisionHandler(.allow)
-        } else {
-            browserLogger.info("Opening external URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
+        } else if Self.shouldOpenInSystemBrowser(cleanedURL, navigationType: navigationAction.navigationType) {
+            browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
             NSWorkspace.shared.open(cleanedURL)
             decisionHandler(.cancel)
+        } else {
+            // Non-trusted but not a deliberate third-party click (e.g. an auto-redirect or scripted
+            // navigation): keep it in-app rather than bouncing the whole session to the system browser.
+            decisionHandler(.allow)
         }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
+        // window self-heals instead of stranding the user on a blank page.
+        browserLogger.error("Web content process terminated; reloading to recover blank view")
+        let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
+        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
+    }
+
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        // Surface the failure so a blank window after a failed load is diagnosable in the unified log.
+        browserLogger.error("Provisional navigation failed: \(error.localizedDescription, privacy: .public)")
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -1515,16 +1601,22 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
     @available(macOS 11.3, *)
     func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
-        completionHandler(uniqueDownloadURL(suggestedFilename: suggestedFilename))
+        let destination = uniqueDownloadURL(suggestedFilename: suggestedFilename)
+        downloadDestinations[ObjectIdentifier(download)] = destination
+        completionHandler(destination)
     }
 
     @available(macOS 11.3, *)
     func downloadDidFinish(_ download: WKDownload) {
         NSSound.beep()
+        if let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) {
+            NSWorkspace.shared.activateFileViewerSelecting([destination])
+        }
     }
 
     @available(macOS 11.3, *)
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
+        downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
         presentError("下载失败：\(error.localizedDescription)")
     }
 
@@ -2571,11 +2663,21 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         guard let host = url.host?.lowercased() else {
             return false
         }
-        return host == "challenges.cloudflare.com" && url.path.hasPrefix("/cdn-cgi/challenge-platform/")
+        return host == "challenges.cloudflare.com"
     }
 
     private static func isOpenAIFamilyHost(_ host: String) -> Bool {
         host == "openai.com" || host.hasSuffix(".openai.com")
+    }
+
+    /// OpenAI's own surfaces beyond the bare ChatGPT host: the marketing/help/platform sites, the
+    /// static and user-content CDNs, and Sora. They belong to the same product family, so links into
+    /// them open in-app instead of bouncing to the system browser.
+    private static func isOpenAIEcosystemHost(_ host: String) -> Bool {
+        isOpenAIFamilyHost(host)
+            || host == "oaistatic.com" || host.hasSuffix(".oaistatic.com")
+            || host == "oaiusercontent.com" || host.hasSuffix(".oaiusercontent.com")
+            || host == "sora.com" || host.hasSuffix(".sora.com")
     }
 
     private static func isTrustedAuthSourceHost(_ host: String) -> Bool {
@@ -2671,11 +2773,28 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         }
 
         return isChatGPTHost(host)
+            || isOpenAIEcosystemHost(host)
             || isOpenAIAuthHost(host)
             || isOpenAISentinelHost(host)
             || isCloudflareChallengeURL(url)
             || isOAuthContinuationHost(url)
             || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
+    }
+
+    /// Only a deliberate user click on a genuine third-party https link should leave the app for the
+    /// system browser. Automatic redirects, script-driven navigations, and ChatGPT's own popups stay
+    /// in-app, so the user is never bounced to the default browser unexpectedly mid-session.
+    private static func shouldOpenInSystemBrowser(_ url: URL, navigationType: WKNavigationType) -> Bool {
+        if PrivacySettings.keepThirdPartyLinksInApp() {
+            return false
+        }
+        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+            return false
+        }
+        if shouldOpenInsideApp(url) {
+            return false
+        }
+        return navigationType == .linkActivated
     }
 
     private static func loggableURL(_ url: URL) -> String {
@@ -3616,6 +3735,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
 
         const href = target.href || '';
 
+        const cachedBlob = blobURLs.get(href);
+        const exceedsBridge = (cachedBlob && typeof cachedBlob.size === 'number' && cachedBlob.size > maxBlobDownloadBytes)
+          || (href.startsWith('data:') && href.length > maxBlobDownloadBytes * 2 + 4096);
+        if (exceedsBridge) {
+          // Too large for the base64 bridge — let WebKit's native downloader stream it to disk instead
+          // of materializing a multi-hundred-MB data URL across the IPC boundary.
+          return;
+        }
+
         event.preventDefault();
         event.stopImmediatePropagation();
 
@@ -3872,7 +4000,7 @@ private enum FingerprintCatalog {
     static let offPresetID = "off"
     static let defaultAcceptLanguages = ["zh-CN", "en-US"]
 
-    private static let macSafari17UserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15"
+    private static let macSafari17UserAgent = defaultSafariUserAgent
     private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
     private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
 
@@ -4709,6 +4837,15 @@ private enum PrivacySettings {
 
     static func setWebRTCProtectionEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: webRTCProtectionDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func keepThirdPartyLinksInApp() -> Bool {
+        UserDefaults.standard.bool(forKey: keepThirdPartyLinksInAppDefaultsKey)
+    }
+
+    static func setKeepThirdPartyLinksInApp(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: keepThirdPartyLinksInAppDefaultsKey)
         UserDefaults.standard.synchronize()
     }
 }
