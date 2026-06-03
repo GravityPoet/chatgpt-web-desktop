@@ -1386,7 +1386,7 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             let profile_store = app.state::<ProfileStore>();
             let current_id = profile_store.current_profile_id();
             let init_scripts = browser::build_init_scripts(&profile_store, &current_id);
-            let user_agent = browser::profile_user_agent(&profile_store, &current_id);
+            let user_agent = browser::effective_user_agent(&profile_store, &current_id);
             let mut builder = WebviewWindowBuilder::new(
                 app,
                 label,
@@ -1399,9 +1399,11 @@ fn handle_menu_event(app: &AppHandle<Wry>, event: tauri::menu::MenuEvent) {
             .center()
             .focused(true)
             .incognito(true)
-            .user_agent(&user_agent)
             .on_navigation(move |url| handle_navigation(&app_for_nav, url))
             .on_download(move |_webview, event| handle_download_event(&app_for_download, event));
+            if let Some(user_agent) = user_agent.as_deref() {
+                builder = builder.user_agent(user_agent);
+            }
             for script in &init_scripts {
                 builder = builder.initialization_script(script);
             }

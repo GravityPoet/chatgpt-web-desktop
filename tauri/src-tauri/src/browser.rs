@@ -19,8 +19,6 @@ pub const MAIN_WINDOW_LABEL: &str = "main";
 const REBUILD_KEEPER_WINDOW_LABEL: &str = "__profile-rebuild-keeper";
 const MAIN_REBUILD_RETRY_DELAY_MS: u64 = 120;
 const MAIN_REBUILD_MAX_ATTEMPTS: u8 = 10;
-const DEFAULT_MACOS_SAFARI_USER_AGENT: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
 
 /// State held in Tauri's managed state for browser operations.
 pub struct BrowserState {
@@ -95,17 +93,20 @@ pub fn build_main_window(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
-    let user_agent = profile_user_agent(&profile_store, &profile.id);
+    let user_agent = effective_user_agent(&profile_store, &profile.id);
     let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
     let app_for_popup = app.clone();
     let app_for_download = app.clone();
 
-    let builder = WebviewWindowBuilder::from_config(app, &window_config)
+    let mut builder = WebviewWindowBuilder::from_config(app, &window_config)
         .map_err(|e| format!("failed to create window from config: {e}"))?
-        .title(&title)
-        .user_agent(&user_agent)
+        .title(&title);
+    if let Some(user_agent) = user_agent.as_deref() {
+        builder = builder.user_agent(user_agent);
+    }
+    let builder = builder
         .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
         .on_new_window(move |url, features| {
             handle_new_window(&app_for_popup, url, features)
@@ -273,17 +274,20 @@ fn finish_main_window_rebuild(
         .ok_or_else(|| "missing main window configuration".to_string())?;
 
     let title = main_window_title(&profile.name, &profile.id);
-    let user_agent = profile_user_agent(&profile_store, &profile.id);
+    let user_agent = effective_user_agent(&profile_store, &profile.id);
     let init_scripts = build_init_scripts(&profile_store, &profile.id);
 
     let app_for_nav = app.clone();
     let app_for_popup = app.clone();
     let app_for_download = app.clone();
 
-    let builder = WebviewWindowBuilder::from_config(app, &window_config)
+    let mut builder = WebviewWindowBuilder::from_config(app, &window_config)
         .map_err(|e| format!("failed to create window from config: {e}"))?
-        .title(&title)
-        .user_agent(&user_agent)
+        .title(&title);
+    if let Some(user_agent) = user_agent.as_deref() {
+        builder = builder.user_agent(user_agent);
+    }
+    let builder = builder
         .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
         .on_new_window(move |url, features| {
             handle_new_window(&app_for_popup, url, features)
@@ -370,16 +374,31 @@ pub fn build_init_scripts(profile_store: &ProfileStore, profile_id: &str) -> Vec
     scripts
 }
 
-/// Native HTTP user agent for the WebView.
-/// Keep the default close to Safari/WKWebView so Cloudflare sees a coherent browser surface.
-pub(crate) fn profile_user_agent(profile_store: &ProfileStore, profile_id: &str) -> String {
+/// Optional HTTP user-agent override for profiles with explicit fingerprinting.
+/// When fingerprinting is disabled, leave WKWebView's native user-agent untouched.
+pub(crate) fn profile_user_agent_override(
+    profile_store: &ProfileStore,
+    profile_id: &str,
+) -> Option<String> {
     let meta = profile_store.get_meta(profile_id);
     if !meta.fingerprint_disabled {
         if let Some(fingerprint) = meta.fingerprint {
-            return fingerprint.user_agent;
+            return Some(fingerprint.user_agent);
         }
     }
-    DEFAULT_MACOS_SAFARI_USER_AGENT.to_string()
+    None
+}
+
+/// Resolve the user agent to apply to a webview: an explicit fingerprint override when the profile
+/// has one, otherwise the platform's complete default UA. This is what every webview should use so
+/// the default profile does not ship the truncated native WKWebView/WebKitGTK UA that Cloudflare
+/// flags. Returns `None` only on platforms whose native UA is already complete (Windows/WebView2).
+pub(crate) fn effective_user_agent(
+    profile_store: &ProfileStore,
+    profile_id: &str,
+) -> Option<String> {
+    profile_user_agent_override(profile_store, profile_id)
+        .or_else(fingerprint::platform_default_user_agent)
 }
 
 /// Handle new window requests (auth popups).
@@ -414,12 +433,12 @@ fn handle_new_window(
 
     let profile_store = app.state::<ProfileStore>();
     let current_id = profile_store.current_profile_id();
-    let user_agent = profile_user_agent(&profile_store, &current_id);
+    let user_agent = effective_user_agent(&profile_store, &current_id);
 
     let app_for_nav = app.clone();
     let app_for_download = app.clone();
 
-    let builder = WebviewWindowBuilder::new(
+    let mut builder = WebviewWindowBuilder::new(
         app,
         label,
         WebviewUrl::External("about:blank".parse().expect("about:blank is valid")),
@@ -429,8 +448,11 @@ fn handle_new_window(
     .min_inner_size(720.0, 480.0)
     .resizable(true)
     .center()
-    .focused(true)
-    .user_agent(&user_agent)
+    .focused(true);
+    if let Some(user_agent) = user_agent.as_deref() {
+        builder = builder.user_agent(user_agent);
+    }
+    let builder = builder
     .window_features(features)
     .on_navigation(move |url| crate::handle_navigation(&app_for_nav, url))
     .on_download(move |_webview, event| {
@@ -481,15 +503,31 @@ mod tests {
     }
 
     #[test]
-    fn default_profile_uses_safari_user_agent() {
+    fn default_profile_has_no_explicit_user_agent_override() {
         let temp = tempfile::tempdir().unwrap();
         let store = ProfileStore::new(temp.path()).unwrap();
 
-        let user_agent = profile_user_agent(&store, DEFAULT_PROFILE_ID);
+        // The explicit-override layer stays None for the default profile (no fingerprint preset).
+        assert!(profile_user_agent_override(&store, DEFAULT_PROFILE_ID).is_none());
+    }
 
-        assert!(user_agent.contains("Version/26.5 Safari/605.1.15"));
-        assert!(!user_agent.to_ascii_lowercase().contains("tauri"));
-        assert!(!user_agent.to_ascii_lowercase().contains("wry"));
+    #[test]
+    fn default_profile_effective_user_agent_matches_platform_default() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(temp.path()).unwrap();
+
+        // The effective UA falls back to the platform default, so the default profile never ships
+        // the truncated native WKWebView/WebKitGTK UA that Cloudflare challenges repeatedly.
+        let effective = effective_user_agent(&store, DEFAULT_PROFILE_ID);
+        assert_eq!(effective, fingerprint::platform_default_user_agent());
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let ua = effective.expect("macOS/Linux supply a complete default user agent");
+            assert!(
+                ua.contains("Safari/605.1.15"),
+                "default UA must carry a Safari token: {ua}"
+            );
+        }
     }
 
     #[test]
