@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px -apple-system, system-ui, sans-serif; margin: 0; padding: 12px; width: 240px; }
+    h1 { font-size: 13px; margin: 0 0 8px; }
+    select { width: 100%; padding: 5px; box-sizing: border-box; }
+    button { margin-top: 8px; width: 100%; padding: 6px; cursor: pointer; }
+    .row { margin-top: 8px; }
+    .muted { color: #666; font-size: 11px; margin-top: 6px; min-height: 14px; }
+    #cur { font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>时区伪装 / Timezone</h1>
+  <div class="row">当前生效:<span id="cur">—</span></div>
+  <div class="row"><select id="tz"></select></div>
+  <button id="auto">自动匹配当前 IP</button>
+  <div class="muted" id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>
