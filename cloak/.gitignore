@@ -1,0 +1,16 @@
+.DS_Store
+.build/
+.swiftpm/
+dist/
+*.app/
+*.dmg
+*.log
+*.tmp
+
+.env
+.env.*
+*cookie*
+*cookies*
+*session*
+*token*
+*secret*
