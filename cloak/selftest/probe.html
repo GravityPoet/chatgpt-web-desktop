@@ -1,0 +1,88 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Cloak self-test probe</title>
+<!--
+  Self-contained fingerprint probe. Defines window.__runProbe() returning a
+  Promise<result>. Driven headfully over CDP by run-selftest.mjs; also openable
+  by hand for a quick eyeball. The worker-timezone check is the one that caught
+  the JS-only spoof leak: a Web Worker reads its own Intl zone, which a page-world
+  spoof cannot reach — only the TZ env var (engine level) makes it match.
+-->
+<pre id="out">running…</pre>
+<script>
+window.__runProbe = async function () {
+  const out = { ts: Date.now() };
+  const nav = navigator;
+
+  out.webdriver = nav.webdriver === true;              // true == BAD
+  out.userAgent = nav.userAgent;
+  out.platform = nav.platform;
+  out.languages = nav.languages;
+  out.hardwareConcurrency = nav.hardwareConcurrency;
+  out.deviceMemory = (typeof nav.deviceMemory !== "undefined") ? nav.deviceMemory : null;
+
+  // High-entropy client hints (the UA-CH side; honest-Mac should read macOS).
+  try {
+    out.uaData = nav.userAgentData
+      ? await nav.userAgentData.getHighEntropyValues(
+          ["platform", "platformVersion", "architecture", "bitness", "model", "uaFullVersion"])
+      : null;
+  } catch (e) { out.uaData = { error: String(e) }; }
+
+  // Timezone — main thread.
+  out.main_tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  out.main_offset = new Date().getTimezoneOffset();
+
+  // Timezone — Web Worker (separate JS global; page-world spoof cannot reach it).
+  out.worker_tz = await new Promise((res) => {
+    try {
+      const code = "self.onmessage=function(){try{postMessage(Intl.DateTimeFormat().resolvedOptions().timeZone)}catch(e){postMessage('ERR:'+e)}}";
+      const w = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
+      const t = setTimeout(() => res("TIMEOUT"), 2500);
+      w.onmessage = (ev) => { clearTimeout(t); res(ev.data); try { w.terminate(); } catch (_) {} };
+      w.postMessage(1);
+    } catch (e) { res("ERR:" + e); }
+  });
+
+  // WebGL unmasked vendor/renderer (honest-Mac => Apple/ANGLE).
+  try {
+    const gl = document.createElement("canvas").getContext("webgl")
+            || document.createElement("canvas").getContext("experimental-webgl");
+    const dbg = gl.getExtension("WEBGL_debug_renderer_info");
+    out.webgl_vendor = dbg ? gl.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR);
+    out.webgl_renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+  } catch (e) { out.webgl_vendor = out.webgl_renderer = "ERR:" + e; }
+
+  // Canvas hash — varies with the per-account --fingerprint seed.
+  try {
+    const c = document.createElement("canvas"); c.width = 220; c.height = 50;
+    const ctx = c.getContext("2d");
+    ctx.textBaseline = "top"; ctx.font = "14px Arial";
+    ctx.fillStyle = "#069"; ctx.fillText("Cloak self-test 0123!@#", 2, 2);
+    ctx.fillStyle = "rgba(102,200,0,0.55)"; ctx.fillRect(10, 12, 120, 22);
+    const data = c.toDataURL();
+    let h = 0; for (let i = 0; i < data.length; i++) h = (h * 31 + data.charCodeAt(i)) >>> 0;
+    out.canvas_hash = h.toString(16);
+  } catch (e) { out.canvas_hash = "ERR:" + e; }
+
+  // WebRTC — collect ICE candidate IPs; any RFC1918/host IP here is a leak.
+  out.webrtc_ips = await new Promise((res) => {
+    const ips = new Set();
+    try {
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+      pc.createDataChannel("x");
+      pc.onicecandidate = (e) => {
+        if (!e || !e.candidate || !e.candidate.candidate) return;
+        const m = /([0-9]{1,3}(?:\.[0-9]{1,3}){3})|([a-f0-9]{1,4}(?::[a-f0-9]{1,4}){2,7})/i.exec(e.candidate.candidate);
+        if (m) ips.add(m[0]);
+      };
+      pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => {});
+      setTimeout(() => { res([...ips]); try { pc.close(); } catch (_) {} }, 2500);
+    } catch (e) { res(["ERR:" + e]); }
+  });
+
+  window.__PROBE = out;
+  try { document.getElementById("out").textContent = JSON.stringify(out, null, 2); } catch (_) {}
+  return out;
+};
+</script>
