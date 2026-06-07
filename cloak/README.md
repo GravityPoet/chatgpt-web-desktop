@@ -11,7 +11,7 @@ The shipping UX is a **Chromium "installed app" (PWA)**, not a custom launcher:
 - A single green Dock tile that opens the ChatGPT singleton (Chromium app-mode window) on the cloaked profile.
 - One tile only — opening the singleton never spawns a second raw-browser tile.
 - "Open the full browser" is reached from inside the singleton window: window **⋮ menu → 在 Chromium 中打开 (Open in Chromium)** — opens the plain Chromium browser (blue icon) on the same profile.
-- Multiple identities: Chromium's native profile picker (**添加 / Add**) creates an isolated profile (separate cookie jar). The CloakBrowser binary also randomizes the fingerprint seed per launch, so profiles are not linkable by fingerprint.
+- Multiple identities: Chromium's native profile picker (**添加 / Add**) creates an isolated profile (separate cookie jar), but `--fingerprint` is a **process** flag — profiles opened inside the same running Chromium share one fingerprint, IP and timezone, so they stay linkable by *device* even though cookies are separate. For un-linkable identities use the **multi-account picker** (see below): a separate process per account with a stable per-account seed.
 
 ### Runtime paths
 
@@ -100,10 +100,61 @@ Chrome version. (2)/(3) are launch-flag knobs and remain out of reach on the PWA
   translate extension as **unpacked** (no Web Store) into the `main` profile; the app window inherits it.
 - **Flag-gated stealth knobs don't reach the PWA.** `--fingerprint-webrtc-ip`, `--fingerprint-*`, `--proxy-server`, and `TZ` env are launch-time and the PWA shim does not accept them. The compiled-in binary patches (canvas / WebGL / audio / `navigator.webdriver` / CDP / TLS) still apply, and timezone is now covered by the companion extension. Remaining GPU / client-hint masking would require launching the engine ourselves (see `Sources/`), not the PWA.
 
+## Multi-account identities (picker)
+
+For more than one ChatGPT account, the strong path is **not** the native profile
+switcher (those profiles share one process → one fingerprint/IP/timezone, so they
+stay linkable by device). Instead `packaging/launch-account.sh <name>` launches a
+**separate** CloakBrowser process per account, and `packaging/pick-account.sh` is
+a clickable osascript list over it (also wired to a double-clickable
+`~/Desktop/Cloak 账号.app`, Chromium icon, detached — no Terminal window). The list
+also manages accounts in place with no terminal — new, rename (keeps the
+fingerprint), delete, region label, and the locale / proxy toggles below.
+
+Each account gets:
+
+- **Stable per-account fingerprint** — `--fingerprint=<seed>`, seed derived from
+  the name (`sha256(name) → 10000–99999`), so one account always rebuilds the same
+  device and different accounts differ. Honest-Mac platform/GPU
+  (`--fingerprint-platform=macos`); faking Windows-on-Mac creates detectable
+  contradictions.
+- **Own login/storage** — `--user-data-dir` under
+  `~/Library/Application Support/ChatGPT Cloak/Accounts/<name>`, never the daily
+  `main` PWA profile.
+- **Timezone follows the VPN exit** — the zone is read from the current IP and
+  exported via `TZ`, so ICU reports it in **both** the main thread and Web Workers
+  (a page-world spoof cannot reach workers).
+- **Optional locale** — a per-account toggle (picker → ⚙︎ Toggle locale, or
+  `LOCALE=1`) sets `--accept-lang` so `navigator.languages` and the Accept-Language
+  header follow the VPN region. Off by default (plain en-US is the least-surprising
+  signal, and lookup failure omits the flag rather than creating a mismatch).
+- **Optional per-account proxy** — set/clear from the picker (🌐) or by writing a
+  URL to `Accounts/<name>/.cloak-proxy` (chmod 600). A no-auth proxy is handed to
+  `--proxy-server` directly; an **authenticated** one (`scheme://user:pass@host:port`)
+  is bridged through a local no-auth SOCKS5 relay (`packaging/proxy-relay.py`),
+  because Chromium has no SOCKS5 auth of its own. Remote DNS is preserved through the
+  proxy (no OS-resolver leak), and the relay is torn down when the browser quits.
+
+Accounts that rely on the **system VPN** (no per-account proxy) are **sequential** —
+switch the VPN to the account's region before launching, one at a time. Accounts that
+carry **their own proxy** can run **concurrently**, each pinned to its own exit.
+
+> This whole layer is **orchestration on the stock CloakBrowser binary** — it adds
+> no binary patches, only per-account launch flags + env. All anti-fingerprint
+> strength is CloakBrowser's compiled-in C++ patches; remove these scripts and the
+> stealth is unchanged, remove CloakBrowser and the scripts do nothing.
+
 ## In-repo launcher (not installed)
 
 `Sources/ChatGPTCloakLauncher/` and `packaging/make-app.sh` build a Swift launcher that spawns the cloaked Chromium with custom flags/env. It is **not** the shipping UX (the PWA is), but it is retained as the path for env/flag-based stealth launching (timezone, proxy, WebRTC). `cloakChromiumRelativePath` currently hardcodes the Chromium version and should be made to resolve the newest `~/.cloakbrowser/chromium-*` instead.
 
 ## Scope
 
-First version supports the `main` profile. Future: profile management UI, per-profile proxy, GeoIP/manual timezone, auto-update of the CloakBrowser binary.
+The daily PWA covers the `main` profile; the picker above covers multi-account.
+Done since the first version: clickable profile picker with in-place management,
+GeoIP timezone (companion + `TZ`, main thread *and* workers), per-account locale,
+**per-account proxy** (no-auth direct, authenticated via the local SOCKS5 relay,
+concurrent multi-region), and hands-off CloakBrowser auto-update
+(`packaging/update-chromium.sh` + launchd, SHA256-verified, self-test gated with
+rollback). Still out of reach on the PWA path: GPU / client-hint masking — that
+needs the flag-capable launcher, not the Dock shim.

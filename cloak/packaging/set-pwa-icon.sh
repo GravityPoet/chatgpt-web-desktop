@@ -22,12 +22,26 @@ PWA_APP="${PWA_APP:-$HOME/Applications/Chromium Apps.localized/ChatGPT Cloak.app
 [[ -f "$ICON" ]] || { printf 'error: icon not found: %s\n' "$ICON" >&2; exit 1; }
 [[ -d "$PWA_APP" ]] || { printf 'error: PWA bundle not found: %s\n' "$PWA_APP" >&2; exit 1; }
 
-# Quit the shim so the Dock re-reads the icon on next launch.
+# Quit the shim so it can't rewrite app.icns mid-edit, AND so the Dock re-reads the
+# icon on next launch. The AppleScript quit only lands if the shim is registered
+# under its display name; a Chrome shim *rebuild* (install-as-app, Chromium upgrade,
+# or a web-app icon/title/start_url change) respawns the loader and rewrites app.icns
+# back to the teal shim icon. So also kill the loader by its exact path — surgical,
+# this never matches the main browser or any other PWA.
 /usr/bin/osascript -e 'tell application "ChatGPT Cloak" to quit' >/dev/null 2>&1 || true
+/usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
 
-# 1) Overwrite the Dock-read shim icon with the full-bleed green icns.
-/bin/cp "$ICON" "$PWA_APP/Contents/Resources/app.icns"
-printf 'app.icns -> %s\n' "$ICON"
+# 1) Overwrite the Dock-read shim icon with the full-bleed green icns, then verify it
+# stuck. If a shim rebuild raced us and rewrote it teal, re-kill the loader and retry —
+# without this check the script prints "done" even when Chrome silently won the race.
+copied=""
+for _try in 1 2 3 4 5; do
+  /bin/cp "$ICON" "$PWA_APP/Contents/Resources/app.icns"
+  if /usr/bin/cmp -s "$ICON" "$PWA_APP/Contents/Resources/app.icns"; then copied=1; break; fi
+  /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
+done
+[[ -n "$copied" ]] || { printf 'error: app.icns keeps reverting to the teal shim icon — fully quit the ChatGPT Cloak PWA, then re-run\n' >&2; exit 1; }
+printf 'app.icns -> %s (verified green)\n' "$ICON"
 
 # 2) Set the Finder custom icon (Finder / Launchpad / Get-Info).
 ok=$(/usr/bin/osascript <<OSA
