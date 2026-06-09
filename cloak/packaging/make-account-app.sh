@@ -55,6 +55,7 @@ trap '/bin/rm -rf "$TMP"' EXIT
 # python3 (often under Homebrew) resolves even from the GUI launch context.
 cat >"$TMP/app.applescript" <<OSA
 on run
+	display notification "不要用 Chromium 原生 Profile 切换账号；隔离入口是这个账号 App / 账号选择器。" with title "ChatGPT Cloak"
 	do shell script "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; " & quoted form of "$LAUNCH" & " " & quoted form of "$name" & " > /dev/null 2>&1 &"
 end run
 OSA
@@ -94,4 +95,4 @@ seed=$(( 16#$hex % 90000 + 10000 ))
 printf 'created : %s\n' "$APP"
 printf 'account : %s  (seed %s, isolated via launch-account.sh)\n' "$name" "$seed"
 printf 'icon    : %s  (baked into applet.icns)\n' "$ICON"
-printf 'tip     : double-click the tile; switch VPN to this account region first if it has no own proxy\n'
+printf 'tip     : double-click the tile; do not switch accounts through Chromium native profiles\n'

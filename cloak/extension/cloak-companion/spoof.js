@@ -3,13 +3,17 @@
 // with a different zone just retargets the shared holder (st.tz), so switching
 // zones never stacks Proxies. Used by both apply.js (content script) and the
 // service worker's executeScript fallback — single source of truth.
-window.__cloakSpoof = function (tz) {
+window.__cloakSpoof = function (tz, fpSeed) {
   try {
-    if (!tz) return;
-    if (window.__cloakState) { window.__cloakState.tz = tz; window.__cloakTZ = tz; return; }
+    if (!tz && !fpSeed) return;
+    if (window.__cloakState) {
+      if (tz) { window.__cloakState.tz = tz; window.__cloakTZ = tz; }
+      if (fpSeed) { window.__cloakState.fpSeed = String(fpSeed); installFingerprintSpoof(window.__cloakState); }
+      return;
+    }
 
-    var st = (window.__cloakState = { tz: tz });
-    window.__cloakTZ = tz;
+    var st = (window.__cloakState = { tz: tz || null, fpSeed: fpSeed ? String(fpSeed) : "" });
+    if (tz) window.__cloakTZ = tz;
 
     var RealDTF = Intl.DateTimeFormat;
     var WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -43,44 +47,229 @@ window.__cloakSpoof = function (tz) {
       return "GMT" + s + pad(Math.floor(a / 60)) + pad(a % 60);
     }
 
-    // getTimezoneOffset returns minutes BEHIND UTC (positive when west).
-    Date.prototype.getTimezoneOffset = function () {
-      return isNaN(this) ? NaN : -eastMinutes(this);
-    };
-
-    // Default Intl.DateTimeFormat to the target zone when the caller omits timeZone.
-    var handler = {
-      construct: function (T, a) { var o = a[1] ? Object.assign({}, a[1]) : {}; if (!o.timeZone) o.timeZone = st.tz; return new T(a[0], o); },
-      apply: function (T, _t, a) { var o = a[1] ? Object.assign({}, a[1]) : {}; if (!o.timeZone) o.timeZone = st.tz; return T(a[0], o); },
-    };
-    Intl.DateTimeFormat = new Proxy(RealDTF, handler);
-
-    // toLocale* default to the target zone too.
-    ["toLocaleString", "toLocaleDateString", "toLocaleTimeString"].forEach(function (name) {
-      var orig = Date.prototype[name];
-      Date.prototype[name] = function (l, o) {
-        o = o ? Object.assign({}, o) : {}; if (!o.timeZone) o.timeZone = st.tz;
-        return orig.call(this, l, o);
+    if (tz) {
+      // getTimezoneOffset returns minutes BEHIND UTC (positive when west).
+      Date.prototype.getTimezoneOffset = function () {
+        return isNaN(this) ? NaN : -eastMinutes(this);
       };
-    });
 
-    // String forms reflect the target zone and offset.
-    Date.prototype.toString = function () {
-      if (isNaN(this)) return "Invalid Date";
-      var p = partsIn(this);
-      var dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
-      return WD[dow] + " " + MO[+p.month - 1] + " " + p.day + " " + p.year + " " + p.hour + ":" + p.minute + ":" + p.second + " " + gmt(this) + " (" + abbr(this) + ")";
-    };
-    Date.prototype.toTimeString = function () {
-      if (isNaN(this)) return "Invalid Date";
-      var p = partsIn(this);
-      return p.hour + ":" + p.minute + ":" + p.second + " " + gmt(this) + " (" + abbr(this) + ")";
-    };
-    Date.prototype.toDateString = function () {
-      if (isNaN(this)) return "Invalid Date";
-      var p = partsIn(this);
-      var dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
-      return WD[dow] + " " + MO[+p.month - 1] + " " + p.day + " " + p.year;
-    };
+      // Default Intl.DateTimeFormat to the target zone when the caller omits timeZone.
+      var handler = {
+        construct: function (T, a) { var o = a[1] ? Object.assign({}, a[1]) : {}; if (!o.timeZone) o.timeZone = st.tz; return new T(a[0], o); },
+        apply: function (T, _t, a) { var o = a[1] ? Object.assign({}, a[1]) : {}; if (!o.timeZone) o.timeZone = st.tz; return T(a[0], o); },
+      };
+      Intl.DateTimeFormat = new Proxy(RealDTF, handler);
+
+      // toLocale* default to the target zone too.
+      ["toLocaleString", "toLocaleDateString", "toLocaleTimeString"].forEach(function (name) {
+        var orig = Date.prototype[name];
+        Date.prototype[name] = function (l, o) {
+          o = o ? Object.assign({}, o) : {}; if (!o.timeZone) o.timeZone = st.tz;
+          return orig.call(this, l, o);
+        };
+      });
+
+      // String forms reflect the target zone and offset.
+      Date.prototype.toString = function () {
+        if (isNaN(this)) return "Invalid Date";
+        var p = partsIn(this);
+        var dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
+        return WD[dow] + " " + MO[+p.month - 1] + " " + p.day + " " + p.year + " " + p.hour + ":" + p.minute + ":" + p.second + " " + gmt(this) + " (" + abbr(this) + ")";
+      };
+      Date.prototype.toTimeString = function () {
+        if (isNaN(this)) return "Invalid Date";
+        var p = partsIn(this);
+        return p.hour + ":" + p.minute + ":" + p.second + " " + gmt(this) + " (" + abbr(this) + ")";
+      };
+      Date.prototype.toDateString = function () {
+        if (isNaN(this)) return "Invalid Date";
+        var p = partsIn(this);
+        var dow = new Date(Date.UTC(+p.year, +p.month - 1, +p.day)).getUTCDay();
+        return WD[dow] + " " + MO[+p.month - 1] + " " + p.day + " " + p.year;
+      };
+    }
+    installFingerprintSpoof(st);
   } catch (_) { /* fail open: never break the page */ }
 };
+
+function installFingerprintSpoof(st) {
+  try {
+    if (!st || !st.fpSeed || window.__cloakFingerprintInstalled) return;
+    window.__cloakFingerprintInstalled = true;
+
+    var seed = hashString(st.fpSeed);
+    var originals = [];
+
+    function hashString(s) {
+      var h = 2166136261 >>> 0;
+      for (var i = 0; i < String(s).length; i++) {
+        h ^= String(s).charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h >>> 0;
+    }
+    function noiseFor(label, modulo) {
+      if (modulo <= 0) return 0;
+      var h = seed ^ hashString(label);
+      h = Math.imul(h ^ (h >>> 16), 2246822519) >>> 0;
+      h = Math.imul(h ^ (h >>> 13), 3266489917) >>> 0;
+      return ((h ^ (h >>> 16)) >>> 0) % modulo;
+    }
+    function wrap(obj, name, fn) {
+      if (!obj || !obj[name] || obj[name].__cloakWrapped) return;
+      var orig = obj[name];
+      var wrapped = fn(orig);
+      try { Object.defineProperty(wrapped, "name", { value: orig.name || name }); } catch (_) {}
+      try { Object.defineProperty(wrapped, "__cloakWrapped", { value: true }); } catch (_) {}
+      originals.push([wrapped, orig]);
+      obj[name] = wrapped;
+    }
+    var nativeGetImageData = window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype.getImageData;
+    var nativePutImageData = window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype.putImageData;
+    function restoreCanvasNoise(ctx, originals) {
+      for (var i = originals.length - 1; i >= 0; i--) {
+        try { nativePutImageData.call(ctx, originals[i][2], originals[i][0], originals[i][1]); } catch (_) {}
+      }
+    }
+    function applyCanvasNoise(canvas, label) {
+      var ctx, originals;
+      try {
+        if (!canvas || !canvas.width || !canvas.height) return null;
+        ctx = canvas.getContext && canvas.getContext("2d");
+        if (!ctx || !nativeGetImageData || !nativePutImageData) return null;
+        originals = [];
+        for (var i = 0; i < 8; i++) {
+          var base = label + ":" + i;
+          var x = noiseFor(base + ":x:" + canvas.width, canvas.width);
+          var y = noiseFor(base + ":y:" + canvas.height, canvas.height);
+          var original = nativeGetImageData.call(ctx, x, y, 1, 1);
+          var changed = nativeGetImageData.call(ctx, x, y, 1, 1);
+          var data = changed.data;
+          data[0] = (data[0] + 1 + noiseFor(base + ":r", 7)) & 255;
+          data[1] = (data[1] + 1 + noiseFor(base + ":g", 7)) & 255;
+          data[2] = (data[2] + 1 + noiseFor(base + ":b", 7)) & 255;
+          data[3] = 255;
+          originals.push([x, y, original]);
+          nativePutImageData.call(ctx, changed, x, y);
+        }
+        return function () { restoreCanvasNoise(ctx, originals); };
+      } catch (_) {
+        if (ctx && originals) restoreCanvasNoise(ctx, originals);
+        return null;
+      }
+    }
+    function perturbCanvas(canvas, label, cb) {
+      var restore = applyCanvasNoise(canvas, label);
+      try {
+        return cb();
+      } finally {
+        if (restore) restore();
+      }
+    }
+
+    wrap(HTMLCanvasElement.prototype, "toDataURL", function (orig) {
+      return function () {
+        var self = this, args = arguments;
+        return perturbCanvas(self, "toDataURL", function () { return orig.apply(self, args); });
+      };
+    });
+    wrap(HTMLCanvasElement.prototype, "toBlob", function (orig) {
+      return function () {
+        var self = this, args = arguments;
+        var restore = applyCanvasNoise(self, "toBlob");
+        if (!restore) return orig.apply(self, args);
+        if (typeof args[0] === "function") {
+          var cb = args[0];
+          var next = Array.prototype.slice.call(args);
+          next[0] = function () {
+            restore();
+            return cb.apply(this, arguments);
+          };
+          try {
+            return orig.apply(self, next);
+          } catch (e) {
+            restore();
+            throw e;
+          }
+        }
+        try {
+          var result = orig.apply(self, args);
+          setTimeout(function () { restore(); }, 0);
+          return result;
+        } catch (e2) {
+          restore();
+          throw e2;
+        }
+      };
+    });
+    if (window.CanvasRenderingContext2D && CanvasRenderingContext2D.prototype) {
+      wrap(CanvasRenderingContext2D.prototype, "getImageData", function (orig) {
+        return function () {
+          var image = orig.apply(this, arguments);
+          try {
+            var w = Math.max(1, image.width || arguments[2] || 1);
+            var h = Math.max(1, image.height || arguments[3] || 1);
+            for (var i = 0; i < 8; i++) {
+              var base = "getImageData:" + i;
+              var px = noiseFor(base + ":x:" + w, w);
+              var py = noiseFor(base + ":y:" + h, h);
+              var idx = (py * w + px) * 4;
+              if (idx + 3 < image.data.length) {
+                image.data[idx] = (image.data[idx] + 1 + noiseFor(base + ":r", 7)) & 255;
+                image.data[idx + 1] = (image.data[idx + 1] + 1 + noiseFor(base + ":g", 7)) & 255;
+                image.data[idx + 2] = (image.data[idx + 2] + 1 + noiseFor(base + ":b", 7)) & 255;
+                image.data[idx + 3] = 255;
+              }
+            }
+            for (var j = 0; j < 8 && image.data.length; j++) {
+              var sample = (j * 113) % image.data.length;
+              image.data[sample] = (image.data[sample] + 1 + noiseFor("getImageData:sample:" + j, 251)) & 255;
+            }
+          } catch (_) {}
+          return image;
+        };
+      });
+    }
+    if (window.OffscreenCanvas && OffscreenCanvas.prototype) {
+      wrap(OffscreenCanvas.prototype, "convertToBlob", function (orig) {
+        return function () {
+          return orig.apply(this, arguments);
+        };
+      });
+    }
+
+    var AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (AC && AC.prototype) {
+      wrap(AC.prototype, "startRendering", function (orig) {
+        return function () {
+          var result = orig.apply(this, arguments);
+          return Promise.resolve(result).then(function (buffer) {
+            try {
+              for (var ch = 0; ch < buffer.numberOfChannels; ch++) {
+                var data = buffer.getChannelData(ch);
+                var step = 97 + noiseFor("audio:step:" + ch, 29);
+                var delta = (noiseFor("audio:delta:" + ch, 2001) - 1000) / 10000000;
+                if (data.length) data[0] = data[0] + delta;
+                for (var i = noiseFor("audio:start:" + ch, step); i < data.length; i += step) {
+                  data[i] = data[i] + delta;
+                }
+              }
+            } catch (_) {}
+            return buffer;
+          });
+        };
+      });
+    }
+
+    var realToString = Function.prototype.toString;
+    if (!realToString.__cloakWrapped) {
+      Function.prototype.toString = function () {
+        for (var i = 0; i < originals.length; i++) {
+          if (this === originals[i][0]) return realToString.call(originals[i][1]);
+        }
+        return realToString.call(this);
+      };
+      try { Object.defineProperty(Function.prototype.toString, "__cloakWrapped", { value: true }); } catch (_) {}
+    }
+  } catch (_) {}
+}

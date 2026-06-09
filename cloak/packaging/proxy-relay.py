@@ -26,6 +26,7 @@ import argparse
 import base64
 import select
 import socket
+import ssl
 import sys
 import threading
 from typing import Optional, TypedDict
@@ -35,7 +36,7 @@ CONNECT_TIMEOUT = 20.0
 
 
 class Upstream(TypedDict, total=False):
-    kind: str            # "direct" | "socks5" | "http"
+    kind: str            # "direct" | "socks5" | "http" | "https"
     host: str
     port: int
     user: Optional[str]
@@ -67,7 +68,7 @@ def parse_upstream(url: str) -> Upstream:
     if not p.hostname or not p.port:
         raise ValueError("upstream needs host:port")
     return {
-        "kind": "socks5" if scheme == "socks5" else "http",
+        "kind": scheme,
         "host": p.hostname,
         "port": int(p.port),
         "user": unquote(p.username) if p.username else None,
@@ -123,6 +124,9 @@ def dial_socks5(up: Upstream, host: str, port: int) -> socket.socket:
 
 def dial_http(up: Upstream, host: str, port: int) -> socket.socket:
     s = socket.create_connection((up["host"], up["port"]), timeout=CONNECT_TIMEOUT)
+    if up["kind"] == "https":
+        ctx = ssl.create_default_context()
+        s = ctx.wrap_socket(s, server_hostname=up["host"])
     try:
         req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
         if up.get("user"):
@@ -153,7 +157,9 @@ def dial_upstream(up: Upstream, host: str, port: int) -> socket.socket:
         return dial_direct(host, port)
     if kind == "socks5":
         return dial_socks5(up, host, port)
-    return dial_http(up, host, port)
+    if kind in ("http", "https"):
+        return dial_http(up, host, port)
+    raise ConnectionError(f"unsupported upstream kind: {kind}")
 
 
 def pipe(a: socket.socket, b: socket.socket) -> None:

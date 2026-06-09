@@ -3,8 +3,10 @@ set -euo pipefail
 
 # Clickable account picker for the multi-account ChatGPT identities.
 #
-# Native macOS list (osascript, zero deps): shows each existing identity with its
-# stable fingerprint seed, region label, locale state and proxy, then launches the
+# Native macOS account picker: prefers the Rust/Tauri day-mode picker, then
+# falls back to the AppKit UI target ChatGPTCloakAccountPicker, then this
+# zero-dependency osascript list if Swift is unavailable. It shows each existing identity with its stable
+# fingerprint seed, region label, locale state and proxy, then launches the
 # chosen one THROUGH launch-account.sh so seed / timezone / proxy / VPN rules all
 # stay in one place. It also manages identities without touching a terminal:
 #   ➕ new · 🌐 set/clear per-account proxy · 🏷 region label · ⚙︎ locale toggle
@@ -28,13 +30,50 @@ set -euo pipefail
 #   the daily `main` PWA profile is never touched.
 #
 # Usage:  pick-account.sh        # opens the picker
-#   Tip: a double-clickable ~/Desktop/Cloak 账号.app already wraps this.
+#         CLOAK_PICKER_TAURI=0 pick-account.sh    # force legacy Swift/osascript
+#   Tip: a double-clickable ~/Desktop/Cloak Picker.app already wraps this.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/packaging/launch-account.sh"
 ACCT_BASE="$HOME/Library/Application Support/ChatGPT Cloak/Accounts"
 [[ -x "$LAUNCH" ]] || { printf 'error: launcher not found: %s\n' "$LAUNCH" >&2; exit 1; }
 mkdir -p "$ACCT_BASE"
+chmod 700 "$ACCT_BASE" 2>/dev/null || true
+
+if [[ "${CLOAK_PICKER_LEGACY:-0}" != "1" ]]; then
+  export CLOAK_REPO_ROOT="$ROOT"
+  export CLOAK_LAUNCH_SCRIPT="$LAUNCH"
+  export CLOAK_ACCOUNT_BASE="$ACCT_BASE"
+
+  if [[ "${CLOAK_PICKER_TAURI:-1}" != "0" ]]; then
+    TAURI_APP="$ROOT/target/release/bundle/macos/Cloak Picker.app"
+    TAURI_APP_BIN="$TAURI_APP/Contents/MacOS/cloak-picker"
+    if [[ -x "$TAURI_APP_BIN" ]]; then
+      exec "$TAURI_APP_BIN"
+    fi
+
+    # Raw cargo binaries can open a blank WebView when the frontend assets were
+    # not embedded by `tauri build`; keep them as an explicit developer fallback.
+    if [[ "${CLOAK_PICKER_RAW:-0}" == "1" ]]; then
+      if [[ -x "$ROOT/target/release/cloak-picker" ]]; then
+        exec "$ROOT/target/release/cloak-picker"
+      fi
+      if [[ -x "$ROOT/target/debug/cloak-picker" ]]; then
+        exec "$ROOT/target/debug/cloak-picker"
+      fi
+    fi
+    printf '%s\n' "warning: no Tauri picker app bundle was found; falling back." >&2
+  fi
+
+  if [[ -x "$ROOT/.build/release/ChatGPTCloakAccountPicker" ]]; then
+    exec "$ROOT/.build/release/ChatGPTCloakAccountPicker"
+  fi
+
+  if command -v swift >/dev/null 2>&1; then
+    cd "$ROOT"
+    exec swift run -c release ChatGPTCloakAccountPicker
+  fi
+fi
 
 NEW="➕  新建账号…"
 PRX="🌐  设置 / 清除代理…"
@@ -71,7 +110,7 @@ choose() {
   items="${items%,}"
   osascript <<OSA 2>/dev/null || true
 set theList to {$items}
-set theChoice to choose from list theList with prompt "$prompt" with title "ChatGPT Cloak" OK button name "选择" cancel button name "取消"
+set theChoice to choose from list theList with prompt "$prompt" with title "Cloak Picker" OK button name "选择" cancel button name "取消"
 if theChoice is false then
   return ""
 else
@@ -83,7 +122,7 @@ OSA
 # osascript text prompt. $1=prompt. Echoes entered text, empty on cancel/blank.
 ask() {
   osascript <<OSA 2>/dev/null || true
-set r to display dialog "$(osa_esc "$1")" default answer "" with title "ChatGPT Cloak" buttons {"取消", "确定"} default button "确定"
+set r to display dialog "$(osa_esc "$1")" default answer "" with title "Cloak Picker" buttons {"取消", "确定"} default button "确定"
 if button returned of r is "确定" then
   return text returned of r
 end if
@@ -97,7 +136,7 @@ ask2_state=""; ask2_val=""
 ask2() {
   local out tab; tab="$(printf '\t')"
   out="$(osascript <<OSA 2>/dev/null || printf 'CANCEL'
-set r to display dialog "$(osa_esc "$1")" default answer "$(osa_esc "$2")" with title "ChatGPT Cloak" buttons {"取消", "确定"} default button "确定"
+set r to display dialog "$(osa_esc "$1")" default answer "$(osa_esc "$2")" with title "Cloak Picker" buttons {"取消", "确定"} default button "确定"
 if button returned of r is "确定" then
   return "OK" & tab & (text returned of r)
 end if
@@ -111,12 +150,38 @@ OSA
 # Destructive yes/no with a caution icon. Echoes "yes" only on the Delete button.
 confirm() {
   osascript <<OSA 2>/dev/null || printf 'no'
-set r to display dialog "$(osa_esc "$1")" with title "ChatGPT Cloak" buttons {"取消", "删除"} default button "取消" with icon caution
+set r to display dialog "$(osa_esc "$1")" with title "Cloak Picker" buttons {"取消", "删除"} default button "取消" with icon caution
 if button returned of r is "删除" then
   return "yes"
 end if
 return "no"
 OSA
+}
+
+random_seed() {
+  local n
+  n="$(/usr/bin/od -An -N4 -tu4 /dev/urandom | /usr/bin/tr -d ' ')"
+  printf '%s' "$(( n % 90000 + 10000 ))"
+}
+
+secure_account_dir() {
+  local d="$1"
+  mkdir -p "$d"
+  chmod 700 "$d" 2>/dev/null || true
+  [[ -f "$d/.cloak-seed" ]] && chmod 600 "$d/.cloak-seed" 2>/dev/null || true
+  [[ -f "$d/.cloak-proxy" ]] && chmod 600 "$d/.cloak-proxy" 2>/dev/null || true
+  [[ -f "$d/.cloak-locale" ]] && chmod 600 "$d/.cloak-locale" 2>/dev/null || true
+  [[ -f "$d/.cloak-region" ]] && chmod 600 "$d/.cloak-region" 2>/dev/null || true
+}
+
+create_account() {
+  local n="$1" d="$ACCT_BASE/$1" s
+  [[ -e "$d" ]] && { choose "「$n」已存在。" "好" >/dev/null; return 1; }
+  secure_account_dir "$d"
+  s="$(random_seed)"
+  ( umask 077; printf '%s\n' "$s" > "$d/.cloak-seed" )
+  chmod 600 "$d/.cloak-seed" 2>/dev/null || true
+  return 0
 }
 
 names=(); labels=()
@@ -125,6 +190,7 @@ build_labels() {
   local d n s pin loc reg prx
   for d in "$ACCT_BASE"/*/; do
     [[ -d "$d" ]] || continue
+    secure_account_dir "${d%/}"
     n="$(basename "$d")"
     [[ "$n" == "main" ]] && continue
     s="$(seed_of "$n")"
@@ -161,7 +227,7 @@ toggle_menu() {
   [[ -z "$n" ]] && return 0
   d="$ACCT_BASE/$n"
   if [[ -f "$d/.cloak-locale" ]]; then rm -f "$d/.cloak-locale"
-  else mkdir -p "$d"; : > "$d/.cloak-locale"; fi
+  else secure_account_dir "$d"; : > "$d/.cloak-locale"; chmod 600 "$d/.cloak-locale" 2>/dev/null || true; fi
   return 0
 }
 
@@ -180,8 +246,9 @@ do_proxy() {
       socks5://*|http://*|https://*) ;;
       *) choose "代理须以 socks5:// 或 http:// 开头。" "好" >/dev/null; return 0;;
     esac
-    mkdir -p "$d"
+    secure_account_dir "$d"
     ( umask 177; printf '%s\n' "$ask2_val" > "$d/.cloak-proxy" )   # creds: owner-only
+    chmod 600 "$d/.cloak-proxy" 2>/dev/null || true
   fi
   return 0
 }
@@ -194,8 +261,8 @@ do_region() {
   cur=""; [[ -f "$d/.cloak-region" ]] && cur="$(head -1 "$d/.cloak-region" 2>/dev/null || true)"
   ask2 "「$n」的区域标签（留空 = 清除）。例：JP-Tokyo 或 东京" "$cur"
   [[ "$ask2_state" == "OK" ]] || return 0
-  if [[ -z "$ask2_val" ]]; then mkdir -p "$d"; rm -f "$d/.cloak-region"
-  else mkdir -p "$d"; printf '%s\n' "$ask2_val" > "$d/.cloak-region"; fi
+  if [[ -z "$ask2_val" ]]; then secure_account_dir "$d"; rm -f "$d/.cloak-region"
+  else secure_account_dir "$d"; printf '%s\n' "$ask2_val" > "$d/.cloak-region"; chmod 600 "$d/.cloak-region" 2>/dev/null || true; fi
   return 0
 }
 
@@ -216,8 +283,9 @@ do_rename() {
     local p; p="$(head -1 "$d/.cloak-seed" 2>/dev/null || true)"
     [[ "$p" =~ ^[0-9]{4,5}$ ]] && s="$p"
   fi
-  mkdir -p "$d"; printf '%s\n' "$s" > "$d/.cloak-seed"
+  secure_account_dir "$d"; printf '%s\n' "$s" > "$d/.cloak-seed"; chmod 600 "$d/.cloak-seed" 2>/dev/null || true
   mv "$d" "$ACCT_BASE/$new"
+  secure_account_dir "$ACCT_BASE/$new"
   return 0
 }
 
@@ -233,7 +301,7 @@ do_delete() {
 main_menu() {
   build_labels
   local choice i n
-  choice="$(choose "选择要启动的账号：" ${labels[@]+"${labels[@]}"} "$NEW" "$PRX" "$REG" "$TOG" "$REN" "$DEL")"
+  choice="$(choose "选择要启动的账号：提醒，不要用 Chromium 原生 Profile 切换账号；隔离入口是这里。" ${labels[@]+"${labels[@]}"} "$NEW" "$PRX" "$REG" "$TOG" "$REN" "$DEL")"
   [[ -z "$choice" ]] && exit 0
   case "$choice" in
     "$NEW")
@@ -242,6 +310,7 @@ main_menu() {
       case "$n" in
         main|*/*|*..*|.*|*[!A-Za-z0-9_-]*) choose "名字无效（只能用字母、数字、- 或 _；且不能叫「main」）。" "好" >/dev/null; main_menu; return;;
       esac
+      create_account "$n" || { main_menu; return; }
       launch_named "$n" ;;
     "$PRX") do_proxy;   main_menu ;;
     "$REG") do_region;  main_menu ;;

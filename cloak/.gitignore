@@ -1,6 +1,10 @@
 .DS_Store
 .build/
 .swiftpm/
+target/
+node_modules/
+cloak-picker/node_modules/
+cloak-picker/src-tauri/target/
 dist/
 *.app/
 *.dmg
