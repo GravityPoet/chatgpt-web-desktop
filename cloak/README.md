@@ -12,6 +12,7 @@ The shipping UX is a **Chromium "installed app" (PWA)**, not a custom launcher:
 - One tile only — opening the singleton never spawns a second raw-browser tile.
 - "Open the full browser" is reached from inside the singleton window: window **⋮ menu → 在 Chromium 中打开 (Open in Chromium)** — opens the plain Chromium browser (blue icon) on the same profile.
 - Multiple identities: Chromium's native profile picker (**添加 / Add**) creates an isolated profile (separate cookie jar), but `--fingerprint` is a **process** flag — profiles opened inside the same running Chromium share one fingerprint, IP and timezone, so they stay linkable by *device* even though cookies are separate. For un-linkable identities use the **multi-account picker** (see below): a separate process per account with a stable per-account seed.
+- New accounts created by the multi-account picker get a pinned random fingerprint seed in `.cloak-seed`; different accounts therefore do not share the same device fingerprint.
 
 ### Runtime paths
 
@@ -105,17 +106,39 @@ Chrome version. (2)/(3) are launch-flag knobs and remain out of reach on the PWA
 For more than one ChatGPT account, the strong path is **not** the native profile
 switcher (those profiles share one process → one fingerprint/IP/timezone, so they
 stay linkable by device). Instead `packaging/launch-account.sh <name>` launches a
-**separate** CloakBrowser process per account, and `packaging/pick-account.sh` is
-a clickable osascript list over it (also wired to a double-clickable
-`~/Desktop/Cloak 账号.app`, Chromium icon, detached — no Terminal window). The list
-also manages accounts in place with no terminal — new, rename (keeps the
-fingerprint), delete, region label, and the locale / proxy toggles below.
+**separate** CloakBrowser process per account, and `packaging/pick-account.sh`
+opens a native AppKit account picker over it (also wired to a double-clickable
+`~/Desktop/Cloak Picker.app`, detached — no Terminal window). The picker
+falls back to the older osascript list if Swift is unavailable, and manages
+accounts in place with no terminal — new, rename (keeps the fingerprint), delete,
+region label, and the locale / proxy toggles below.
+
+Experimental cross-platform path: `cloak-cli` now provides the Rust behavior-equivalent
+account API and launch dry-run, and `cloak-picker/` contains the Tauri day-mode picker.
+Build the picker app with `cd cloak-picker && npm run tauri -- build`; the resulting
+`target/release/bundle/macos/Cloak Picker.app` is preferred by
+`packaging/pick-account.sh`. Raw `target/{release,debug}/cloak-picker` binaries are
+only used when `CLOAK_PICKER_RAW=1`, because they can open a blank WebView if frontend
+assets were not embedded by a Tauri build. Set
+`CLOAK_PICKER_TAURI=0` or `CLOAK_PICKER_LEGACY=1` to force the older Swift/osascript
+fallback.
+
+The Rust path keeps the current extension contract: `--load-extension` includes the
+per-account `.cloak-companion`, every unpacked extension under
+`CLOAK_EXTRA_EXTENSIONS_DIR` (default:
+`~/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件`),
+and every root-level `.crx` unpacked into
+`Accounts/<name>/.cloak-extra-extensions/<slug>`. `沉浸式翻译` is intentionally not
+auto-loaded as a default plugin. Real browser launches load the remaining default
+plugins; the background selftest intentionally excludes the headless-incompatible
+`Chromium Web Store 插件` while keeping the compatible cookie helpers.
 
 Each account gets:
 
-- **Stable per-account fingerprint** — `--fingerprint=<seed>`, seed derived from
-  the name (`sha256(name) → 10000–99999`), so one account always rebuilds the same
-  device and different accounts differ. Honest-Mac platform/GPU
+- **Stable per-account fingerprint** — `--fingerprint=<seed>`. Accounts created
+  by the picker get a random pinned `.cloak-seed`, so every new account becomes a
+  different stable device. Legacy/direct-launched accounts fall back to
+  `sha256(name) → 10000–99999`. Honest-Mac platform/GPU
   (`--fingerprint-platform=macos`); faking Windows-on-Mac creates detectable
   contradictions.
 - **Own login/storage** — `--user-data-dir` under
@@ -151,6 +174,11 @@ carry **their own proxy** can run **concurrently**, each pinned to its own exit.
 ## Scope
 
 The daily PWA covers the `main` profile; the picker above covers multi-account.
+Do not rely on Chromium's native **Install as app** for isolation: `chatgpt.com`
+has one fixed installed-app id, so native PWA shims can overwrite each other and
+may not preserve process-level fingerprint flags. The isolation boundary is the
+account launch itself: `Accounts/<name>` profile + `.cloak-seed` + launch flags.
+
 Done since the first version: clickable profile picker with in-place management,
 GeoIP timezone (companion + `TZ`, main thread *and* workers), per-account locale,
 **per-account proxy** (no-auth direct, authenticated via the local SOCKS5 relay,

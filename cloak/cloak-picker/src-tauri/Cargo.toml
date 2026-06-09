@@ -1,0 +1,23 @@
+[package]
+name = "cloak-picker"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+name = "cloak_picker_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "cloak-picker"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.0.0", features = [] }
+
+[dependencies]
+cloak-core = { path = "../../crates/cloak-core" }
+serde.workspace = true
+serde_json.workspace = true
+tauri = { version = "2.0.0", features = [] }
+

@@ -9,10 +9,17 @@ let package = Package(
     ],
     products: [
         .executable(name: "ChatGPTCloakLauncher", targets: ["ChatGPTCloakLauncher"]),
+        .executable(name: "ChatGPTCloakAccountPicker", targets: ["ChatGPTCloakAccountPicker"]),
     ],
     targets: [
         .executableTarget(
             name: "ChatGPTCloakLauncher",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+            ]
+        ),
+        .executableTarget(
+            name: "ChatGPTCloakAccountPicker",
             linkerSettings: [
                 .linkedFramework("AppKit"),
             ]

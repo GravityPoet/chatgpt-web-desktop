@@ -1,0 +1,16 @@
+[package]
+name = "cloak-cli"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "cloak"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+cloak-core = { path = "../cloak-core" }
+serde.workspace = true
+serde_json.workspace = true

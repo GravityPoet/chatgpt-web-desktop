@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>Cloak Picker reads the configured default extension folder when it is stored in iCloud Drive.</string>
+  <key>NSDesktopFolderUsageDescription</key>
+  <string>Cloak Picker can be launched from Desktop and may read local picker resources.</string>
+  <key>NSDownloadsFolderUsageDescription</key>
+  <string>Cloak Picker may inspect local extension files selected for account isolation.</string>
+</dict>
+</plist>

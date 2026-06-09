@@ -10,9 +10,17 @@
 -->
 <pre id="out">running…</pre>
 <script>
-window.__runProbe = async function () {
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(label + " timeout")), ms))
+  ]);
+}
+
+window.__runProbe = function () {
   const out = { ts: Date.now() };
   const nav = navigator;
+  return withTimeout((async function () {
 
   out.webdriver = nav.webdriver === true;              // true == BAD
   out.userAgent = nav.userAgent;
@@ -20,12 +28,50 @@ window.__runProbe = async function () {
   out.languages = nav.languages;
   out.hardwareConcurrency = nav.hardwareConcurrency;
   out.deviceMemory = (typeof nav.deviceMemory !== "undefined") ? nav.deviceMemory : null;
+  out.screen = {
+    width: screen.width,
+    height: screen.height,
+    availWidth: screen.availWidth,
+    availHeight: screen.availHeight,
+    colorDepth: screen.colorDepth,
+    pixelDepth: screen.pixelDepth,
+    devicePixelRatio: window.devicePixelRatio
+  };
+  try {
+    out.fonts = {
+      menlo: !!(document.fonts && document.fonts.check('12px "Menlo"')),
+      helveticaNeue: !!(document.fonts && document.fonts.check('12px "Helvetica Neue"')),
+      sfPro: !!(document.fonts && document.fonts.check('12px "SF Pro Text"'))
+    };
+  } catch (e) { out.fonts = { error: String(e) }; }
+  out.plugins = Array.from(nav.plugins || []).map((p) => p.name);
+  out.cloak = {
+    accountSeed: window.__cloakAccountSeed || "",
+    fingerprintInstalled: window.__cloakFingerprintInstalled === true,
+    spoofType: typeof window.__cloakSpoof
+  };
+
+  // Browser-visible public IP. When --proxy-server is active, this must match
+  // the account proxy's preflight IP; otherwise the browser is not using the
+  // same network path as the launcher checks.
+  try {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), 5000);
+    const r = await withTimeout(
+      fetch("https://api.ipify.org?format=json", { cache: "no-store", signal: ac.signal }),
+      5000,
+      "fetch ip"
+    );
+    clearTimeout(timer);
+    const j = await r.json();
+    out.fetch_ip = j && j.ip ? j.ip : "";
+  } catch (e) { out.fetch_ip = "ERR:" + e; }
 
   // High-entropy client hints (the UA-CH side; honest-Mac should read macOS).
   try {
     out.uaData = nav.userAgentData
-      ? await nav.userAgentData.getHighEntropyValues(
-          ["platform", "platformVersion", "architecture", "bitness", "model", "uaFullVersion"])
+      ? await withTimeout(nav.userAgentData.getHighEntropyValues(
+          ["platform", "platformVersion", "architecture", "bitness", "model", "uaFullVersion"]), 5000, "uaData")
       : null;
   } catch (e) { out.uaData = { error: String(e) }; }
 
@@ -34,7 +80,7 @@ window.__runProbe = async function () {
   out.main_offset = new Date().getTimezoneOffset();
 
   // Timezone — Web Worker (separate JS global; page-world spoof cannot reach it).
-  out.worker_tz = await new Promise((res) => {
+  out.worker_tz = await withTimeout(new Promise((res) => {
     try {
       const code = "self.onmessage=function(){try{postMessage(Intl.DateTimeFormat().resolvedOptions().timeZone)}catch(e){postMessage('ERR:'+e)}}";
       const w = new Worker(URL.createObjectURL(new Blob([code], { type: "text/javascript" })));
@@ -42,7 +88,7 @@ window.__runProbe = async function () {
       w.onmessage = (ev) => { clearTimeout(t); res(ev.data); try { w.terminate(); } catch (_) {} };
       w.postMessage(1);
     } catch (e) { res("ERR:" + e); }
-  });
+  }), 4000, "worker timezone").catch((e) => "ERR:" + e);
 
   // WebGL unmasked vendor/renderer (honest-Mac => Apple/ANGLE).
   try {
@@ -60,13 +106,41 @@ window.__runProbe = async function () {
     ctx.textBaseline = "top"; ctx.font = "14px Arial";
     ctx.fillStyle = "#069"; ctx.fillText("Cloak self-test 0123!@#", 2, 2);
     ctx.fillStyle = "rgba(102,200,0,0.55)"; ctx.fillRect(10, 12, 120, 22);
+    const pixels = ctx.getImageData(0, 0, c.width, c.height).data;
+    let ph = 0; for (let i = 0; i < pixels.length; i += 113) ph = (ph * 33 + pixels[i]) >>> 0;
+    out.image_data_hash = ph.toString(16);
     const data = c.toDataURL();
     let h = 0; for (let i = 0; i < data.length; i++) h = (h * 31 + data.charCodeAt(i)) >>> 0;
     out.canvas_hash = h.toString(16);
   } catch (e) { out.canvas_hash = "ERR:" + e; }
 
+  // Audio hash — catches whether the per-seed audio surface changes too.
+  try {
+    const AC = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    const ac = new AC(1, 5000, 44100);
+    const osc = ac.createOscillator();
+    const comp = ac.createDynamicsCompressor();
+    osc.type = "triangle";
+    osc.frequency.value = 1000;
+    comp.threshold.value = -50;
+    comp.knee.value = 40;
+    comp.ratio.value = 12;
+    comp.attack.value = 0;
+    comp.release.value = 0.25;
+    osc.connect(comp);
+    comp.connect(ac.destination);
+    osc.start(0);
+    const buf = await withTimeout(ac.startRendering(), 5000, "audio");
+    const data = buf.getChannelData(0);
+    let h = 0;
+    for (let i = 0; i < data.length; i += 97) {
+      h = (h * 131 + Math.floor((data[i] + 1) * 1000000)) >>> 0;
+    }
+    out.audio_hash = h.toString(16);
+  } catch (e) { out.audio_hash = "ERR:" + e; }
+
   // WebRTC — collect ICE candidate IPs; any RFC1918/host IP here is a leak.
-  out.webrtc_ips = await new Promise((res) => {
+  out.webrtc_ips = await withTimeout(new Promise((res) => {
     const ips = new Set();
     try {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
@@ -79,10 +153,18 @@ window.__runProbe = async function () {
       pc.createOffer().then((o) => pc.setLocalDescription(o)).catch(() => {});
       setTimeout(() => { res([...ips]); try { pc.close(); } catch (_) {} }, 2500);
     } catch (e) { res(["ERR:" + e]); }
-  });
+  }), 4000, "webrtc").catch((e) => ["ERR:" + e]);
 
   window.__PROBE = out;
+  out.probe_done = true;
   try { document.getElementById("out").textContent = JSON.stringify(out, null, 2); } catch (_) {}
   return out;
+  })(), 15000, "probe").catch((e) => {
+    out.probe_error = String(e);
+    out.probe_done = true;
+    window.__PROBE = out;
+    try { document.getElementById("out").textContent = JSON.stringify(out, null, 2); } catch (_) {}
+    return out;
+  });
 };
 </script>

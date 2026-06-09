@@ -104,17 +104,24 @@ ln -sfn "$dest" "$CB/current"; log "current -> $dest"
 [[ -x "$LSREG" ]] && { "$LSREG" -f "$app" >>"$LOG" 2>&1 || log "warn: lsregister failed"; }
 "$ROOT/packaging/set-pwa-icon.sh" >>"$LOG" 2>&1 || log "warn: set-pwa-icon failed"
 
-# 6.5) regression gate: verify stealth on the new binary; roll back on hard fail.
-if [[ "${SELFTEST:-1}" != "0" ]] && command -v node >/dev/null 2>&1; then
-  if node "$ROOT/selftest/run-selftest.mjs" >>"$LOG" 2>&1; then
-    log "self-test PASS on $latest"
-  else
-    log "self-test FAIL on $latest; rolling back current -> $installed"
-    ln -sfn "$CB/chromium-$installed" "$CB/current"
-    [[ -x "$LSREG" ]] && "$LSREG" -f "$CB/chromium-$installed/Chromium.app" >>"$LOG" 2>&1
-    "$ROOT/packaging/set-pwa-icon.sh" >>"$LOG" 2>&1 || true
-    die "update $latest failed self-test; rolled back to $installed (new build kept at $dest for inspection)"
-  fi
+# 6.5) regression gate: verify stealth on the new binary; roll back on any hard
+# fail. This is intentionally mandatory because the binary carries the actual
+# privacy/isolation behavior.
+command -v node >/dev/null 2>&1 || {
+  log "self-test cannot run: node not found; rolling back current -> $installed"
+  ln -sfn "$CB/chromium-$installed" "$CB/current"
+  [[ -x "$LSREG" ]] && "$LSREG" -f "$CB/chromium-$installed/Chromium.app" >>"$LOG" 2>&1
+  "$ROOT/packaging/set-pwa-icon.sh" >>"$LOG" 2>&1 || true
+  die "update $latest blocked because mandatory self-test could not run"
+}
+if node "$ROOT/selftest/run-selftest.mjs" --pair --headless --quiet --no-result-file >>"$LOG" 2>&1; then
+  log "self-test PASS on $latest"
+else
+  log "self-test FAIL on $latest; rolling back current -> $installed"
+  ln -sfn "$CB/chromium-$installed" "$CB/current"
+  [[ -x "$LSREG" ]] && "$LSREG" -f "$CB/chromium-$installed/Chromium.app" >>"$LOG" 2>&1
+  "$ROOT/packaging/set-pwa-icon.sh" >>"$LOG" 2>&1 || true
+  die "update $latest failed mandatory self-test; rolled back to $installed (new build kept at $dest for inspection)"
 fi
 
 # 7) keep new + previous (rollback); prune older
