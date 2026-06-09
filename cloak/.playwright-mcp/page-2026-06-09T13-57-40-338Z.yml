@@ -1,0 +1,25 @@
+- main [ref=e3]:
+  - generic [ref=e4]:
+    - generic [ref=e7]:
+      - strong [ref=e8]: Cloak Picker
+      - generic [ref=e9]: 0 accounts
+    - generic [ref=e10]:
+      - button "刷新" [disabled] [ref=e11]:
+        - img [ref=e12]
+      - button "新建" [disabled] [ref=e17]:
+        - img [ref=e18]
+        - text: 新建
+  - generic [ref=e19]:
+    - complementary [ref=e20]:
+      - generic [ref=e21]:
+        - generic [ref=e22]: Accounts
+        - img [ref=e23]
+      - generic [ref=e26]:
+        - img [ref=e27]
+        - strong [ref=e30]: 暂无账号
+        - button "新建账号" [ref=e31] [cursor=pointer]:
+          - img [ref=e32]
+          - text: 新建账号
+    - generic [ref=e34]:
+      - img [ref=e35]
+      - strong [ref=e38]: 选择账号

@@ -249,8 +249,14 @@ final class AccountStore {
     }
 
     private func validateAccountName(_ name: String) throws {
-        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
-        guard !name.isEmpty, name != "main", !name.hasPrefix("."), !name.contains("/"), !name.contains("..") else {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789.@+-_")
+        guard !name.isEmpty,
+              name != "main",
+              !name.hasPrefix("."),
+              !name.hasSuffix("."),
+              !name.contains("/"),
+              !name.contains("\\"),
+              !name.contains("..") else {
             throw PickerError.invalidName
         }
         guard name.unicodeScalars.allSatisfy({ allowed.contains($0) }) else {
@@ -607,7 +613,7 @@ final class AccountPickerViewController: NSViewController {
     }
 
     @objc private func newAccount() {
-        guard let name = promptForText(title: "新建账号", message: "名字只能包含字母、数字、- 或 _。")?
+        guard let name = promptForText(title: "新建账号", message: "可用字母、数字、.、@、+、-、_；不能叫 main。")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
             !name.isEmpty else {
             return
@@ -1108,7 +1114,7 @@ enum PickerError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .invalidName:
-            return "名字无效：只能用字母、数字、- 或 _；不能叫 main，也不能以 . 开头。"
+            return "名字无效：可用字母、数字、.、@、+、-、_；不能叫 main，不能以 . 开头/结尾，不能含 /、\\ 或连续 ..。"
         case .duplicateAccount(let name):
             return "「\(name)」已存在。"
         case .invalidProxy:

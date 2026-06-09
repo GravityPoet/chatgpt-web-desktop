@@ -22,21 +22,26 @@ export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
 name="${1:-}"
 [[ -n "$name" ]] || { printf 'usage: %s <account-name>\n' "$(basename "$0")" >&2; exit 1; }
 [[ "$name" == "main" ]] && { printf "refuse: 'main' is reserved for the daily PWA profile\n" >&2; exit 1; }
-case "$name" in */*|*..*|.*) printf 'bad account name: %s\n' "$name" >&2; exit 1;; esac
+case "$name" in
+  */*|*\\*|*..*|.*|*.|*[!A-Za-z0-9._@+-]*)
+    printf 'bad account name: %s (use letters, digits, ., @, +, - or _)\n' "$name" >&2
+    exit 1;;
+esac
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXT_SRC="$ROOT/extension/cloak-companion"
 [[ -d "$EXT_SRC" ]] || { printf 'error: companion extension not found: %s\n' "$EXT_SRC" >&2; exit 1; }
 
 # Resolve the stealth Chromium: prefer the auto-update symlink, else newest pin.
-CB="$HOME/.cloakbrowser"
-BIN="$CB/current/Chromium.app/Contents/MacOS/Chromium"
+CB="${CLOAK_BROWSER_ROOT:-$HOME/.cloakbrowser}"
+BIN="${CLOAK_BROWSER_BIN:-$CB/current/Chromium.app/Contents/MacOS/Chromium}"
 if [[ ! -x "$BIN" ]]; then
   BIN="$(/bin/ls -d "$CB"/chromium-*/Chromium.app/Contents/MacOS/Chromium 2>/dev/null | sort -V | tail -1 || true)"
 fi
 [[ -n "$BIN" && -x "$BIN" ]] || { printf 'error: CloakBrowser binary not found under %s\n' "$CB" >&2; exit 1; }
 
-UDD="$HOME/Library/Application Support/ChatGPT Cloak/Accounts/$name"
+ACCOUNT_BASE="${CLOAK_ACCOUNT_BASE:-$HOME/Library/Application Support/ChatGPT Cloak/Accounts}"
+UDD="$ACCOUNT_BASE/$name"
 if [[ -z "${DRY_RUN:-}" ]]; then
   mkdir -p "$UDD"
   chmod 700 "$UDD" 2>/dev/null || true
@@ -48,6 +53,22 @@ strip() {
 
 truthy() {
   case "${1:-}" in 1|on|true|yes|YES|TRUE|ON) return 0;; *) return 1;; esac
+}
+
+falsy() {
+  case "${1:-}" in 0|off|false|no|NO|FALSE|OFF) return 0;; *) return 1;; esac
+}
+
+companion_page_spoof_enabled() {
+  if [[ -n "${CLOAK_COMPANION_PAGE_SPOOF+x}" ]]; then
+    ! falsy "$CLOAK_COMPANION_PAGE_SPOOF"
+    return
+  fi
+  if [[ -n "${CLOAK_JS_FINGERPRINT+x}" ]]; then
+    ! falsy "$CLOAK_JS_FINGERPRINT"
+    return
+  fi
+  return 0
 }
 
 osa_esc() {
@@ -150,14 +171,56 @@ prepare_account_extension() {
   rm -rf "$EXT_RUNTIME"
   /usr/bin/ditto "$EXT_SRC" "$EXT_RUNTIME"
   chmod -R go-rwx "$EXT_RUNTIME" 2>/dev/null || true
-  printf 'window.__cloakAccountSeed = "%s";\n' "$seed" > "$EXT_RUNTIME/account-seed-main.js"
+  if companion_page_spoof_enabled; then
+    printf 'window.__cloakAccountSeed = "%s";\n' "$seed" > "$EXT_RUNTIME/account-seed-main.js"
+  else
+    printf 'window.__cloakAccountSeed = "";\n' > "$EXT_RUNTIME/account-seed-main.js"
+    strip_companion_page_scripts "$EXT_RUNTIME/manifest.json"
+  fi
   chmod 600 "$EXT_RUNTIME/account-seed-main.js" 2>/dev/null || true
+}
+
+strip_companion_page_scripts() {
+  local manifest="$1"
+  [[ -f "$manifest" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  python3 - "$manifest" <<'PY'
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+with open(path, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+data.pop("content_scripts", None)
+data.pop("host_permissions", None)
+data.pop("background", None)
+data["permissions"] = [p for p in data.get("permissions", []) if p == "storage"]
+
+directory = os.path.dirname(path) or "."
+fd, tmp = tempfile.mkstemp(prefix=".manifest.", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
+finally:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+PY
 }
 if [[ -z "${DRY_RUN:-}" ]]; then
   prepare_account_extension
 fi
 
-DEFAULT_EXTRA_EXT_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"
+LOCAL_EXTRA_EXT_ROOT="$HOME/Library/Application Support/ChatGPT Cloak/Default Extensions"
+ICLOUD_EXTRA_EXT_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"
+DEFAULT_EXTRA_EXT_ROOT="$ICLOUD_EXTRA_EXT_ROOT"
+[[ -d "$LOCAL_EXTRA_EXT_ROOT" ]] && DEFAULT_EXTRA_EXT_ROOT="$LOCAL_EXTRA_EXT_ROOT"
 EXTRA_EXT_RUNTIME="$UDD/.cloak-extra-extensions"
 extra_ext_root="${CLOAK_EXTRA_EXTENSIONS_DIR:-$DEFAULT_EXTRA_EXT_ROOT}"
 load_extension_dirs=("$EXT_RUNTIME")
@@ -469,16 +532,20 @@ elif [[ -f "$UDD/.cloak-locale" ]]; then
 fi
 accept_lang=""
 if [[ "$locale_on" == "1" ]]; then
-  primary="$(language_for_country "$country")"
-  if [[ "$primary" =~ ^[A-Za-z]{2,3}(-[A-Za-z0-9]+)?$ ]]; then
-    base="${primary%%-*}"
-    if [[ "$base" == "en" ]]; then
-      accept_lang="$primary,en;q=0.9"
-    else
-      accept_lang="$primary,$base;q=0.9,en-US;q=0.8,en;q=0.7"
-    fi
+  if [[ -z "$country" ]]; then
+    add_privacy_failure "语言跟随已开启，但无法由账号出口国家码解析 Accept-Language（country=unknown）。"
   else
-    add_privacy_failure "语言跟随已开启，但无法由账号出口国家码解析 Accept-Language（country=${country:-unknown}）。"
+    primary="$(language_for_country "$country")"
+    if [[ "$primary" =~ ^[A-Za-z]{2,3}(-[A-Za-z0-9]+)?$ ]]; then
+      base="${primary%%-*}"
+      if [[ "$base" == "en" ]]; then
+        accept_lang="$primary,en;q=0.9"
+      else
+        accept_lang="$primary,$base;q=0.9,en-US;q=0.8,en;q=0.7"
+      fi
+    else
+      add_privacy_failure "语言跟随已开启，但无法由账号出口国家码解析 Accept-Language（country=${country:-unknown}）。"
+    fi
   fi
 fi
 
@@ -487,10 +554,16 @@ args=(
   "--fingerprint=$seed"
   "--fingerprint-platform=macos"
   "--load-extension=$load_extensions"
+  "--disable-extensions-except=$load_extensions"
   "--no-first-run"
   "--no-default-browser-check"
 )
-[[ -n "$accept_lang" ]] && args+=("--accept-lang=$accept_lang")
+[[ -n "${TZ:-}" ]] && args+=("--fingerprint-timezone=$TZ")
+if [[ -n "$accept_lang" ]]; then
+  primary_locale="${accept_lang%%,*}"
+  args+=("--lang=$primary_locale" "--fingerprint-locale=$primary_locale" "--accept-lang=$accept_lang")
+fi
+[[ -n "$exit_ip" ]] && args+=("--fingerprint-webrtc-ip=$exit_ip")
 
 proxy_server_arg=""
 if [[ "$proxy_mode" == "direct" ]]; then

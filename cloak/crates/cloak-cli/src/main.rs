@@ -85,6 +85,10 @@ struct LaunchArgs {
 }
 
 fn main() -> Result<()> {
+    if cloak_core::maybe_run_relay_supervisor()? {
+        return Ok(());
+    }
+
     let cli = Cli::parse();
     let config = CloakConfig::from_env().context("load Cloak config")?;
 

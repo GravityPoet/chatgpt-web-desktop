@@ -5,6 +5,7 @@ use cloak_core::{
     set_proxy as core_set_proxy, set_region as core_set_region,
     toggle_locale as core_toggle_locale, Account, CloakConfig, LaunchOptions, LaunchPlan,
 };
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
 fn config() -> Result<CloakConfig, String> {
     CloakConfig::from_env().map_err(|err| err.to_string())
@@ -49,6 +50,7 @@ fn toggle_locale(name: String) -> Result<Account, String> {
 fn launch_dry_run(name: String) -> Result<LaunchPlan, String> {
     let mut options = LaunchOptions::from_env(true);
     options.dry_run = true;
+    options.skip_geo = true;
     build_launch_plan(&config()?, &name, &options).map_err(|err| err.to_string())
 }
 
@@ -60,6 +62,28 @@ fn launch_account(name: String) -> Result<(), String> {
 
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(tauri::ActivationPolicy::Regular);
+
+            let window = if let Some(window) = app.get_webview_window("main") {
+                window
+            } else {
+                WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
+                    .title("Cloak Picker")
+                    .inner_size(920.0, 620.0)
+                    .min_inner_size(760.0, 540.0)
+                    .visible(true)
+                    .center()
+                    .build()?
+            };
+            let _ = window.unminimize();
+            let _ = window.center();
+            window.show()?;
+            window.set_focus()?;
+            focus_main_window_after_launch(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             create_account,
@@ -75,3 +99,21 @@ pub fn run() {
         .expect("error while running Cloak picker");
 }
 
+#[cfg(target_os = "macos")]
+fn focus_main_window_after_launch(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        let app_for_main_thread = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            let _ = app_for_main_thread.show();
+            if let Some(window) = app_for_main_thread.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        });
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn focus_main_window_after_launch(_: tauri::AppHandle) {}
