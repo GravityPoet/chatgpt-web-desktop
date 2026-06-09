@@ -464,6 +464,7 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
         format!("--disable-extensions-except={load_extensions}"),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
+        "--ignore-gpu-blocklist".to_string(),
     ];
     append_native_fingerprint_args(&mut argv, &geo, locale.as_deref());
     if let Some(proxy_arg) = &proxy_config.browser_arg {
@@ -1736,6 +1737,7 @@ mod tests {
             .argv
             .iter()
             .any(|arg| arg.starts_with("--disable-extensions-except=")));
+        assert!(plan.argv.iter().any(|arg| arg == "--ignore-gpu-blocklist"));
         assert!(!plan
             .argv
             .iter()
