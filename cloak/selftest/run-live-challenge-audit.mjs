@@ -74,12 +74,145 @@ const SITE_DEFS = {
     evaluate: `(() => {
       const text = document.body.innerText || "";
       const hasFlights = text.includes("Price per adult") || /\\$\\s*\\d/.test(text);
-      const isBlocked = text.includes("request was blocked") || text.includes("bot visit detected");
+      const isBlocked = /malicious bot detected/i.test(text)
+        || /access denied/i.test(text)
+        || /request was blocked/i.test(text)
+        || /bot visit detected/i.test(text);
       return {
         passed: hasFlights && !isBlocked,
         isBlocked,
         hasFlights,
         sample: text.slice(0, 800),
+      };
+    })()`,
+  },
+  "browserleaks-webrtc": {
+    url: "https://browserleaks.com/webrtc",
+    waitMs: 8000,
+    evaluate: `((expectedIp) => new Promise((resolve) => {
+      const text = document.body.innerText || "";
+      const candidates = [];
+      let pc = null;
+      try {
+        pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+        pc.createDataChannel("cloak-audit");
+        pc.onicecandidate = (event) => {
+          if (event.candidate?.candidate) candidates.push(event.candidate.candidate);
+        };
+        pc.createOffer().then((offer) => pc.setLocalDescription(offer)).catch(() => {});
+      } catch (error) {
+        candidates.push(String(error?.message || error));
+      }
+      setTimeout(() => {
+        try { pc?.close(); } catch {}
+        const all = [text, ...candidates].join("\\n");
+        const ips = Array.from(new Set(all.match(/\\b(?:\\d{1,3}\\.){3}\\d{1,3}\\b/g) || []));
+        const privateIps = ips.filter((ip) => /^(10\\.|127\\.|169\\.254\\.|192\\.168\\.|172\\.(1[6-9]|2\\d|3[01])\\.)/.test(ip));
+        const hasExpectedIp = expectedIp ? all.includes(expectedIp) : null;
+        resolve({
+          expectedIp,
+          pageLoaded: /WebRTC|Local IP|Public IP|Leak/i.test(text),
+          ips,
+          privateIps,
+          hasExpectedIp,
+          candidates: candidates.slice(0, 10),
+          passed: privateIps.length === 0 && (expectedIp ? hasExpectedIp === true : true),
+          sample: text.slice(0, 800),
+        });
+      }, 5000);
+    }))(__EXPECTED_IP__)`,
+  },
+  creepjs: {
+    url: "https://abrahamjuliot.github.io/creepjs",
+    waitMs: 18000,
+    evaluate: `(() => {
+      const text = document.body.innerText || "";
+      const likeMatch = text.match(/(\\d+)%\\s*like headless/i);
+      const headlessMatch = text.match(/(\\d+)%\\s*headless:/i);
+      const stealthMatch = text.match(/(\\d+)%\\s*stealth:/i);
+      const scores = {
+        likeHeadlessPct: likeMatch ? Number(likeMatch[1]) : null,
+        headlessPct: headlessMatch ? Number(headlessMatch[1]) : null,
+        stealthPct: stealthMatch ? Number(stealthMatch[1]) : null,
+      };
+      const signals = (() => {
+        try {
+          const headless = window.Fingerprint?.headless;
+          if (!headless) return null;
+          return {
+            likeHeadless: headless.likeHeadless || null,
+            headless: headless.headless || null,
+            stealth: headless.stealth || null,
+          };
+        } catch {
+          return null;
+        }
+      })();
+      const badBot = /you are a bad bot/i.test(text);
+      const trustMatch = text.match(/trust score[^0-9]*(\\d+(?:\\.\\d+)?)/i);
+      return {
+        pageLoaded: /creepjs|trust score|fingerprint|FP ID|Headless/i.test(text),
+        trustScore: trustMatch ? Number(trustMatch[1]) : null,
+        scores,
+        signals,
+        badBot,
+        passed: text.length > 500
+          && !badBot
+          && scores.headlessPct !== null
+          && scores.stealthPct !== null
+          && scores.headlessPct <= 30
+          && scores.stealthPct <= 30,
+        sample: text.slice(0, 1000),
+      };
+    })()`,
+  },
+  "fingerprint-pro": {
+    url: "https://fingerprint.com/products/bot-detection",
+    waitMs: 12000,
+    beforeEvaluate: `(() => {
+      const buttons = Array.from(document.querySelectorAll("button, a"));
+      const target = buttons.find((button) => {
+        const text = (button.innerText || button.textContent || "").trim();
+        return /test|try|detect|demo|playground/i.test(text) && !/contact sales|get started/i.test(text);
+      });
+      if (target) target.click();
+      return target ? (target.innerText || target.textContent || "").trim() : "";
+    })()`,
+    afterActionWaitMs: 5000,
+    evaluate: `(async () => {
+      const text = document.body.innerText || "";
+      const isBlocked = /malicious bot detected|access denied|request was blocked|bad bot|bot visit detected/i.test(text);
+      const hasVerdict = /you are|not a bot|human|bot detected|automation|visitor/i.test(text);
+      const browserMismatch = /browser not available on mac os x/i.test(text);
+      const uaData = navigator.userAgentData
+        ? await navigator.userAgentData.getHighEntropyValues([
+            "architecture",
+            "bitness",
+            "brands",
+            "fullVersionList",
+            "mobile",
+            "model",
+            "platform",
+            "platformVersion",
+            "uaFullVersion",
+          ]).catch((error) => ({ error: String(error?.message || error) }))
+        : null;
+      return {
+        pageLoaded: /fingerprint|bot detection/i.test(text),
+        hasVerdict,
+        isBlocked,
+        browserMismatch,
+        navigator: {
+          userAgent: navigator.userAgent,
+          platform: navigator.platform,
+          language: navigator.language,
+          languages: Array.from(navigator.languages || []),
+          hardwareConcurrency: navigator.hardwareConcurrency,
+          deviceMemory: navigator.deviceMemory ?? null,
+          uaData,
+        },
+        passed: hasVerdict ? !isBlocked && !browserMismatch : false,
+        sample: text.slice(0, 1000),
       };
     })()`,
   },
@@ -248,26 +381,54 @@ async function sleep(ms) {
 async function cdp(wsUrl) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
-    ws.onopen = resolve;
-    ws.onerror = reject;
+    const timer = setTimeout(() => reject(new Error("CDP websocket open timeout")), 10000);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = (error) => {
+      clearTimeout(timer);
+      reject(error);
+    };
   });
   let id = 0;
   const pending = new Map();
+  const failAll = (error) => {
+    for (const [current, entry] of pending) {
+      clearTimeout(entry.timer);
+      pending.delete(current);
+      entry.reject(error);
+    }
+  };
   ws.onmessage = (event) => {
     const message = JSON.parse(event.data);
     if (message.id && pending.has(message.id)) {
-      const { resolve } = pending.get(message.id);
+      const { resolve, reject, timer } = pending.get(message.id);
+      clearTimeout(timer);
       pending.delete(message.id);
-      resolve(message);
+      if (message.error) {
+        reject(new Error(`CDP ${message.error.code}: ${message.error.message}`));
+      } else {
+        resolve(message);
+      }
     }
   };
-  const send = (method, params = {}) => new Promise((resolve, reject) => {
+  ws.onerror = () => failAll(new Error("CDP websocket error"));
+  ws.onclose = () => failAll(new Error("CDP websocket closed"));
+  const send = (method, params = {}, timeoutMs = 15000) => new Promise((resolve, reject) => {
     const current = ++id;
-    pending.set(current, { resolve, reject });
+    const timer = setTimeout(() => {
+      pending.delete(current);
+      reject(new Error(`${method} timeout`));
+    }, timeoutMs);
+    pending.set(current, { resolve, reject, timer });
     ws.send(JSON.stringify({ id: current, method, params }));
   });
   const close = () => new Promise((resolve) => {
     try {
+      ws.onmessage = null;
+      ws.onerror = null;
+      failAll(new Error("CDP websocket closing"));
       ws.onclose = resolve;
       ws.close();
       setTimeout(resolve, 500);
@@ -283,7 +444,7 @@ async function evaluate(client, expression, timeoutMs) {
     expression,
     awaitPromise: true,
     returnByValue: true,
-  });
+  }, timeoutMs + 1000);
   const response = await Promise.race([
     request,
     new Promise((_, reject) => setTimeout(() => reject(new Error("Runtime.evaluate timeout")), timeoutMs)),
@@ -295,9 +456,13 @@ async function evaluate(client, expression, timeoutMs) {
 }
 
 async function evaluateJson(client, expression, timeoutMs) {
-  const raw = await evaluate(client, `JSON.stringify(${expression})`, timeoutMs);
+  const raw = await evaluate(client, `(async () => JSON.stringify(await (${expression})))()`, timeoutMs);
   if (typeof raw !== "string") return null;
   return JSON.parse(raw);
+}
+
+function siteEvaluateExpression(site, plan) {
+  return site.evaluate.replaceAll("__EXPECTED_IP__", JSON.stringify(plan.geo?.exit_ip || ""));
 }
 
 async function waitForDevTools(profilePath, timeoutMs) {
@@ -330,7 +495,7 @@ async function captureScreenshot(client, path) {
   const result = await client.send("Page.captureScreenshot", {
     format: "png",
     captureBeyondViewport: true,
-  });
+  }, 20000);
   if (result.result?.data) {
     writeFileSync(path, Buffer.from(result.result.data, "base64"));
   }
@@ -391,23 +556,34 @@ async function run() {
   };
 
   try {
-    const devtools = await waitForDevTools(plan.profile_path, opts.timeoutMs);
-    client = await cdp(devtools.wsUrl);
+    const reconnect = async () => {
+      if (client) {
+        try { await client.close(); } catch {}
+        client = null;
+      }
+      const devtools = await waitForDevTools(plan.profile_path, opts.timeoutMs);
+      client = await cdp(devtools.wsUrl);
+    };
 
     for (const siteName of opts.sites) {
       const site = SITE_DEFS[siteName];
       const item = { name: siteName, url: site.url, passed: false };
       try {
+        await reconnect();
         await navigate(client, site.url, site.waitMs, opts.timeoutMs);
         if (site.beforeEvaluate) {
           item.action = await evaluate(client, site.beforeEvaluate, 5000);
           await sleep(site.afterActionWaitMs || 3000);
         }
-        item.details = await evaluateJson(client, site.evaluate, 10000);
+        item.details = await evaluateJson(client, siteEvaluateExpression(site, plan), 12000);
         item.passed = Boolean(item.details?.passed);
         if (opts.screenshots) {
           item.screenshot = join(resultDir, `${siteName}.png`);
-          await captureScreenshot(client, item.screenshot);
+          try {
+            await captureScreenshot(client, item.screenshot);
+          } catch (error) {
+            item.screenshot_error = String(error?.message || error);
+          }
         }
       } catch (error) {
         item.error = String(error?.message || error);
@@ -422,11 +598,16 @@ async function run() {
       const name = `manual-${manualIndex}`;
       const item = { name, url, passed: null, manual: true };
       try {
+        await reconnect();
         await navigate(client, url, 12000, opts.timeoutMs);
         item.sample = await evaluate(client, "document.body.innerText.slice(0, 1200)", 10000);
         if (opts.screenshots) {
           item.screenshot = join(resultDir, `${name}.png`);
-          await captureScreenshot(client, item.screenshot);
+          try {
+            await captureScreenshot(client, item.screenshot);
+          } catch (error) {
+            item.screenshot_error = String(error?.message || error);
+          }
         }
       } catch (error) {
         item.error = String(error?.message || error);

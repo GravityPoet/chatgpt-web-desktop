@@ -557,6 +557,7 @@ args=(
   "--disable-extensions-except=$load_extensions"
   "--no-first-run"
   "--no-default-browser-check"
+  "--ignore-gpu-blocklist"
 )
 [[ -n "${TZ:-}" ]] && args+=("--fingerprint-timezone=$TZ")
 if [[ -n "$accept_lang" ]]; then

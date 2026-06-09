@@ -60,6 +60,7 @@ assert(argv.some((arg) => arg.startsWith("--fingerprint=")), "missing --fingerpr
 assert(argv.includes("--fingerprint-platform=macos"), "missing --fingerprint-platform=macos");
 assert(argv.some((arg) => arg.startsWith("--load-extension=")), "missing --load-extension");
 assert(argv.some((arg) => arg.startsWith("--disable-extensions-except=")), "missing --disable-extensions-except");
+assert(argv.includes("--ignore-gpu-blocklist"), "missing --ignore-gpu-blocklist");
 assert(argv.some((arg) => arg.startsWith("--fingerprint-timezone=")), "missing --fingerprint-timezone");
 assert(argv.some((arg) => arg.startsWith("--lang=")), "missing --lang");
 assert(argv.some((arg) => arg.startsWith("--fingerprint-locale=")), "missing --fingerprint-locale");
@@ -71,6 +72,7 @@ assert((plan.selftest_extension_paths || []).every((path) => !path.includes("沉
 NODE
 
 LC_ALL=C grep -aq -- "--disable-extensions-except=" "$tmpdir/bash-dry-run.txt" || fail "Bash dry-run missing --disable-extensions-except"
+LC_ALL=C grep -aq -- "--ignore-gpu-blocklist" "$tmpdir/bash-dry-run.txt" || fail "Bash dry-run missing --ignore-gpu-blocklist"
 LC_ALL=C grep -aq -- "--fingerprint-timezone=" "$tmpdir/bash-dry-run.txt" || fail "Bash dry-run missing --fingerprint-timezone"
 LC_ALL=C grep -aq -- "--fingerprint-webrtc-ip=" "$tmpdir/bash-dry-run.txt" || fail "Bash dry-run missing --fingerprint-webrtc-ip"
 if LC_ALL=C grep -aq "沉浸式翻译" "$tmpdir/bash-dry-run.txt"; then
