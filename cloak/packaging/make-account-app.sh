@@ -35,8 +35,8 @@ name="${1:-}"
 [[ "$name" == "main" ]] && { printf "refuse: 'main' is the daily PWA profile, not a picker account\n" >&2; exit 1; }
 # Same charset the picker enforces, so the name is safe to embed in AppleScript.
 case "$name" in
-  */*|*..*|.*|*[!A-Za-z0-9_-]*)
-    printf 'bad account name: %s (letters, digits, - or _ only)\n' "$name" >&2; exit 1;;
+  */*|*\\*|*..*|.*|*.|*[!A-Za-z0-9._@+-]*)
+    printf 'bad account name: %s (use letters, digits, ., @, +, - or _)\n' "$name" >&2; exit 1;;
 esac
 [[ -x "$LAUNCH" ]] || { printf 'error: launcher not found: %s\n' "$LAUNCH" >&2; exit 1; }
 [[ -f "$ICON" ]]   || { printf 'error: icon not found: %s\n' "$ICON" >&2; exit 1; }

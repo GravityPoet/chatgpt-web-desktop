@@ -4,7 +4,6 @@ use rustls_pki_types::ServerName;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::thread;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -13,53 +12,36 @@ use tokio::time;
 use tokio_rustls::{client::TlsStream, TlsConnector};
 use url::Url;
 
-#[derive(Debug)]
-pub struct RelayGuard {
-    port: u16,
-}
-
-impl RelayGuard {
-    pub fn port(&self) -> u16 {
-        self.port
-    }
-}
-
-pub fn start(upstream_url: &str) -> Result<RelayGuard, String> {
+pub fn serve_forever<F>(upstream_url: &str, on_ready: F) -> Result<(), String>
+where
+    F: FnOnce(u16) -> Result<(), String>,
+{
     let upstream = Upstream::parse(upstream_url)?;
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).map_err(|err| err.to_string())?;
     listener.set_nonblocking(true).map_err(|err| err.to_string())?;
     let port = listener.local_addr().map_err(|err| err.to_string())?.port();
+    on_ready(port)?;
+    run_listener(listener, upstream)
+}
 
-    thread::Builder::new()
-        .name("cloak-proxy-relay".to_string())
-        .spawn(move || {
-            let Ok(runtime) = Builder::new_multi_thread()
-                .enable_all()
-                .worker_threads(2)
-                .thread_name("cloak-relay-io")
-                .build()
-            else {
-                return;
-            };
-
-            runtime.block_on(async move {
-                let Ok(listener) = TcpListener::from_std(listener) else {
-                    return;
-                };
-                loop {
-                    let Ok((client, _)) = listener.accept().await else {
-                        break;
-                    };
-                    let upstream = upstream.clone();
-                    tokio::spawn(async move {
-                        let _ = handle_client(client, &upstream).await;
-                    });
-                }
-            });
-        })
+fn run_listener(listener: std::net::TcpListener, upstream: Upstream) -> Result<(), String> {
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .worker_threads(2)
+        .thread_name("cloak-relay-io")
+        .build()
         .map_err(|err| err.to_string())?;
 
-    Ok(RelayGuard { port })
+    runtime.block_on(async move {
+        let listener = TcpListener::from_std(listener).map_err(|err| err.to_string())?;
+        loop {
+            let (client, _) = listener.accept().await.map_err(|err| err.to_string())?;
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let _ = handle_client(client, &upstream).await;
+            });
+        }
+    })
 }
 
 #[derive(Clone, Debug)]

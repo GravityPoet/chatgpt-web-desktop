@@ -123,8 +123,9 @@ assets were not embedded by a Tauri build. Set
 `CLOAK_PICKER_TAURI=0` or `CLOAK_PICKER_LEGACY=1` to force the older Swift/osascript
 fallback.
 
-The Rust path keeps the current extension contract: `--load-extension` includes the
-per-account `.cloak-companion`, every unpacked extension under
+The Rust path keeps the current extension contract: `--load-extension` and
+`--disable-extensions-except` include the per-account `.cloak-companion`, every
+unpacked extension under
 `CLOAK_EXTRA_EXTENSIONS_DIR` (default:
 `~/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件`),
 and every root-level `.crx` unpacked into
@@ -132,6 +133,35 @@ and every root-level `.crx` unpacked into
 auto-loaded as a default plugin. Real browser launches load the remaining default
 plugins; the background selftest intentionally excludes the headless-incompatible
 `Chromium Web Store 插件` while keeping the compatible cookie helpers.
+
+Account launches pass CloakBrowser's native fingerprint flags and keep the
+companion seed hook enabled for the current local binary, because the regression
+selftest proves canvas/getImageData/audio only vary by account seed with that hook
+installed. `CLOAK_COMPANION_PAGE_SPOOF=0` (or legacy `CLOAK_JS_FINGERPRINT=0`) can
+disable the page-world hook for experiments, but it should not become the default
+until this exact patched Chromium binary proves native-only per-seed parity.
+
+Before changing launcher, picker, extension loading, or selftest behavior, run:
+
+```bash
+packaging/verify-challenge-contract.sh
+```
+
+That contract check uses a temporary account directory, verifies the current
+CloakBrowser binary hash, asserts Rust and Bash dry-run challenge flags/default
+extensions, confirms `沉浸式翻译` is not default-loaded, and runs the pair-mode
+headless privacy selftest.
+
+For headed/live detection-site audits, use:
+
+```bash
+node selftest/run-live-challenge-audit.mjs --headed --site browserscan --site fingerprintjs
+```
+
+The live audit also uses a temporary account directory and the current Rust
+launch plan. It records JSON reports under `selftest/live-results/`. Cloudflare
+or Turnstile URLs should be passed as `--manual-url <url>` for observation and
+screenshots; the audit harness does not auto-click or solve challenges.
 
 Each account gets:
 
@@ -145,12 +175,13 @@ Each account gets:
   `~/Library/Application Support/ChatGPT Cloak/Accounts/<name>`, never the daily
   `main` PWA profile.
 - **Timezone follows the VPN exit** — the zone is read from the current IP and
-  exported via `TZ`, so ICU reports it in **both** the main thread and Web Workers
-  (a page-world spoof cannot reach workers).
+  passed as `--fingerprint-timezone` plus `TZ`, so ICU reports it in **both** the
+  main thread and Web Workers (a page-world spoof cannot reach workers).
 - **Optional locale** — a per-account toggle (picker → ⚙︎ Toggle locale, or
-  `LOCALE=1`) sets `--accept-lang` so `navigator.languages` and the Accept-Language
-  header follow the VPN region. Off by default (plain en-US is the least-surprising
-  signal, and lookup failure omits the flag rather than creating a mismatch).
+  `LOCALE=1`) sets `--lang`, `--fingerprint-locale`, and `--accept-lang` so
+  `navigator.languages` and the Accept-Language header follow the VPN region. Off
+  by default (plain en-US is the least-surprising signal, and lookup failure omits
+  the flag rather than creating a mismatch).
 - **Optional per-account proxy** — set/clear from the picker (🌐) or by writing a
   URL to `Accounts/<name>/.cloak-proxy` (chmod 600). A no-auth proxy is handed to
   `--proxy-server` directly; an **authenticated** one (`scheme://user:pass@host:port`)

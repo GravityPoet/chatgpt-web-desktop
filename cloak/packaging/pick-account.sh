@@ -164,6 +164,15 @@ random_seed() {
   printf '%s' "$(( n % 90000 + 10000 ))"
 }
 
+valid_account_name() {
+  case "${1:-}" in
+    ""|main|*/*|*\\*|*..*|.*|*.|*[!A-Za-z0-9._@+-]*) return 1;;
+    *) return 0;;
+  esac
+}
+
+invalid_name_message="名字无效：可用字母、数字、.、@、+、-、_；不能叫「main」，不能以 . 开头，不能含 /、\\ 或连续 ..。"
+
 secure_account_dir() {
   local d="$1"
   mkdir -p "$d"
@@ -270,11 +279,9 @@ do_rename() {
   local n new d s
   n="$(pick_account "重命名哪个账号：")"
   [[ -z "$n" ]] && return 0
-  new="$(ask "「$n」的新名字（字母、数字、- 或 _）：")"
+  new="$(ask "「$n」的新名字（可用邮箱格式，如 poet-quench-9i@icloud.com）：")"
   [[ -z "$new" ]] && return 0
-  case "$new" in
-    main|*/*|*..*|.*|*[!A-Za-z0-9_-]*) choose "名字无效（只能用字母、数字、- 或 _；且不能叫「main」）。" "好" >/dev/null; return 0;;
-  esac
+  valid_account_name "$new" || { choose "$invalid_name_message" "好" >/dev/null; return 0; }
   d="$ACCT_BASE/$n"
   [[ -e "$ACCT_BASE/$new" ]] && { choose "「$new」已存在。" "好" >/dev/null; return 0; }
   # Pin the ORIGINAL seed so the device fingerprint survives the new name.
@@ -305,11 +312,9 @@ main_menu() {
   [[ -z "$choice" ]] && exit 0
   case "$choice" in
     "$NEW")
-      n="$(ask "新账号名字（字母、数字、- 或 _）：")"
+      n="$(ask "新账号名字（可用邮箱格式，如 poet-quench-9i@icloud.com）：")"
       [[ -z "$n" ]] && exit 0
-      case "$n" in
-        main|*/*|*..*|.*|*[!A-Za-z0-9_-]*) choose "名字无效（只能用字母、数字、- 或 _；且不能叫「main」）。" "好" >/dev/null; main_menu; return;;
-      esac
+      valid_account_name "$n" || { choose "$invalid_name_message" "好" >/dev/null; main_menu; return; }
       create_account "$n" || { main_menu; return; }
       launch_named "$n" ;;
     "$PRX") do_proxy;   main_menu ;;

@@ -83,6 +83,26 @@ const isPrivateV4 = (ip) =>
   /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
 const isLinkLocalV6 = (ip) => /^(fe80|fc|fd)/i.test(ip);
 const isErr = (v) => typeof v !== "string" || v === "" || v.startsWith("ERR:");
+const falsy = (value) => /^(0|off|false|no)$/i.test(String(value ?? ""));
+
+function companionPageSpoofEnabled() {
+  if (Object.prototype.hasOwnProperty.call(process.env, "CLOAK_COMPANION_PAGE_SPOOF")) {
+    return !falsy(process.env.CLOAK_COMPANION_PAGE_SPOOF);
+  }
+  if (Object.prototype.hasOwnProperty.call(process.env, "CLOAK_JS_FINGERPRINT")) {
+    return !falsy(process.env.CLOAK_JS_FINGERPRINT);
+  }
+  return true;
+}
+
+function stripCompanionPageScripts(manifestPath) {
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  delete manifest.content_scripts;
+  delete manifest.host_permissions;
+  delete manifest.background;
+  manifest.permissions = ["storage"];
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+}
 
 async function startProbeServer() {
   const html = readFileSync(PROBE_PATH);
@@ -122,7 +142,29 @@ async function cdp(wsUrl) {
       pending.set(i, res);
       ws.send(JSON.stringify({ id: i, method, params }));
     });
-  return { send, close: () => ws.close() };
+  const close = () => new Promise((resolve) => {
+    const finish = () => {
+      pending.clear();
+      resolve();
+    };
+    try {
+      ws.onmessage = null;
+      ws.onerror = null;
+      if (ws.readyState === WebSocket.CLOSED) {
+        finish();
+        return;
+      }
+      const timer = setTimeout(finish, 500);
+      ws.onclose = () => {
+        clearTimeout(timer);
+        finish();
+      };
+      ws.close();
+    } catch (_) {
+      finish();
+    }
+  });
+  return { send, close };
 }
 
 async function evaluate(send, expression, awaitPromise = true, timeoutMs = 20000) {
@@ -191,14 +233,21 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
   const dir = mkdtempSync(join(tmpdir(), "cloak-selftest-"));
   const extDir = join(dir, "cloak-companion");
   cpSync(EXT_SOURCE, extDir, { recursive: true });
-  writeFileSync(extDir + "/account-seed-main.js", `window.__cloakAccountSeed = ${JSON.stringify(String(seed))};\n`);
+  if (companionPageSpoofEnabled()) {
+    writeFileSync(extDir + "/account-seed-main.js", `window.__cloakAccountSeed = ${JSON.stringify(String(seed))};\n`);
+  } else {
+    writeFileSync(extDir + "/account-seed-main.js", "window.__cloakAccountSeed = \"\";\n");
+    stripCompanionPageScripts(join(extDir, "manifest.json"));
+  }
   const loadExtensionDirs = [extDir, ...opts.extraExtensions];
   const args = [
     `--user-data-dir=${dir}`,
     `--load-extension=${loadExtensionDirs.join(",")}`,
+    `--disable-extensions-except=${loadExtensionDirs.join(",")}`,
     "--remote-debugging-port=0",
     `--fingerprint=${seed}`,
     "--fingerprint-platform=macos",
+    `--fingerprint-timezone=${opts.tz}`,
     "--no-first-run",
     "--no-default-browser-check",
     "--remote-allow-origins=*",
@@ -209,7 +258,11 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
   if (opts.proxyServer) {
     args.push(`--proxy-server=${opts.proxyServer}`);
   }
-  if (opts.acceptLang) args.push(`--accept-lang=${opts.acceptLang}`);
+  if (opts.acceptLang) {
+    const primaryLocale = opts.acceptLang.split(",", 1)[0].trim();
+    args.push(`--lang=${primaryLocale}`, `--fingerprint-locale=${primaryLocale}`, `--accept-lang=${opts.acceptLang}`);
+  }
+  if (opts.expectIp) args.push(`--fingerprint-webrtc-ip=${opts.expectIp}`);
   args.push("about:blank");
 
   const child = spawn(BIN, args, {
@@ -253,16 +306,18 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
       await sleep(100);
     }
     if (!ready) throw new Error("probe script did not load");
-    const expectedSeed = JSON.stringify(String(seed));
-    for (let i = 0; i < 60; i += 1) {
-      const installed = await evaluate(
-        client.send,
-        `window.__cloakFingerprintInstalled === true && String(window.__cloakAccountSeed || "") === ${expectedSeed}`,
-        false,
-        5000
-      );
-      if (installed === true) break;
-      await sleep(100);
+    if (companionPageSpoofEnabled()) {
+      const expectedSeed = JSON.stringify(String(seed));
+      for (let i = 0; i < 60; i += 1) {
+        const installed = await evaluate(
+          client.send,
+          `window.__cloakFingerprintInstalled === true && String(window.__cloakAccountSeed || "") === ${expectedSeed}`,
+          false,
+          5000
+        );
+        if (installed === true) break;
+        await sleep(100);
+      }
     }
     await evaluate(client.send, "window.__runProbe()", false, 5000);
     let probe = null;
@@ -276,12 +331,36 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
     if (writeStorage) await evaluate(client.send, storageWriteExpression);
     return { seed, probe, storageBefore, dir };
   } finally {
-    try { client?.close(); } catch (_) {}
+    try { await client?.close(); } catch (_) {}
     if (!opts.keep) {
       try { child.kill("SIGKILL"); } catch (_) {}
+      await Promise.race([
+        new Promise((resolve) => child.once("exit", resolve)),
+        sleep(1000),
+      ]);
       try { rmSync(dir, { recursive: true, force: true }); } catch (_) {}
     }
   }
+}
+
+async function runProbeWithRetry(label, serverUrl, opts, seed, writeStorage) {
+  const maxAttempts = opts.keep ? 1 : 2;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      return await runProbe(serverUrl, opts, seed, writeStorage);
+    } catch (error) {
+      lastError = error;
+      if (!String(error?.message || error).includes("DevToolsActivePort never appeared") || attempt === maxAttempts) {
+        break;
+      }
+      if (!opts.quiet) {
+        console.error(`warn: ${label} browser debug port did not appear; retrying cold launch`);
+      }
+      await sleep(500);
+    }
+  }
+  throw new Error(`${label}: ${lastError?.message || lastError}`);
 }
 
 function storageHasMarker(s) {
@@ -294,7 +373,11 @@ function addProbeChecks(checks, label, probe, opts) {
 
   hard("probe completed without timeout", !probe.probe_error, probe.probe_error || "ok");
   hard("navigator.webdriver is false", probe.webdriver === false, String(probe.webdriver));
-  hard("companion seed hook is installed", probe.cloak?.fingerprintInstalled === true, JSON.stringify(probe.cloak || {}));
+  if (companionPageSpoofEnabled()) {
+    hard("companion seed hook is installed", probe.cloak?.fingerprintInstalled === true, JSON.stringify(probe.cloak || {}));
+  } else {
+    hard("companion page spoof is disabled", probe.cloak?.fingerprintInstalled !== true, JSON.stringify(probe.cloak || {}));
+  }
   const macUA = /Mac OS X/.test(probe.userAgent || "");
   const macPlatform = probe.platform === "MacIntel";
   const macCH = !probe.uaData || probe.uaData.platform === "macOS";
@@ -384,29 +467,31 @@ async function main() {
     let pair = null;
 
     if (opts.pair) {
-      const a = await runProbe(server.url, opts, opts.seed, true);
-      const b = await runProbe(server.url, opts, opts.seedB, false);
+      const a = await runProbeWithRetry("A", server.url, opts, opts.seed, true);
+      const b = await runProbeWithRetry("B", server.url, opts, opts.seedB, false);
       pair = { a, b };
       addProbeChecks(checks, "A", a.probe, opts);
       addProbeChecks(checks, "B", b.probe, opts);
-      checks.push({
-        name: "pair: canvas hashes differ by seed",
-        level: "hard",
-        pass: a.probe.canvas_hash !== b.probe.canvas_hash,
-        got: `${a.probe.canvas_hash} vs ${b.probe.canvas_hash}`,
-      });
-      checks.push({
-        name: "pair: getImageData hashes differ by seed",
-        level: "hard",
-        pass: a.probe.image_data_hash !== b.probe.image_data_hash,
-        got: `${a.probe.image_data_hash} vs ${b.probe.image_data_hash}`,
-      });
-      checks.push({
-        name: "pair: audio hashes differ by seed",
-        level: "hard",
-        pass: a.probe.audio_hash !== b.probe.audio_hash,
-        got: `${a.probe.audio_hash} vs ${b.probe.audio_hash}`,
-      });
+      if (companionPageSpoofEnabled()) {
+        checks.push({
+          name: "pair: canvas hashes differ by seed",
+          level: "hard",
+          pass: a.probe.canvas_hash !== b.probe.canvas_hash,
+          got: `${a.probe.canvas_hash} vs ${b.probe.canvas_hash}`,
+        });
+        checks.push({
+          name: "pair: getImageData hashes differ by seed",
+          level: "hard",
+          pass: a.probe.image_data_hash !== b.probe.image_data_hash,
+          got: `${a.probe.image_data_hash} vs ${b.probe.image_data_hash}`,
+        });
+        checks.push({
+          name: "pair: audio hashes differ by seed",
+          level: "hard",
+          pass: a.probe.audio_hash !== b.probe.audio_hash,
+          got: `${a.probe.audio_hash} vs ${b.probe.audio_hash}`,
+        });
+      }
       checks.push({
         name: "pair: localStorage/cookie/IndexedDB are isolated",
         level: "hard",
@@ -414,7 +499,7 @@ async function main() {
         got: JSON.stringify(b.storageBefore),
       });
     } else {
-      single = await runProbe(server.url, opts, opts.seed, false);
+      single = await runProbeWithRetry("single", server.url, opts, opts.seed, false);
       addProbeChecks(checks, "single", single.probe, opts);
     }
 

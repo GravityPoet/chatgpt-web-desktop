@@ -94,7 +94,9 @@ export default function App() {
     try {
       return await operation();
     } catch (caught) {
-      setError(errorMessage(caught));
+      const message = errorMessage(caught);
+      setError(message);
+      setDialogError(message);
       return null;
     } finally {
       setBusy(false);
@@ -104,6 +106,12 @@ export default function App() {
   useEffect(() => {
     void run(() => refresh());
   }, []);
+
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(""), 5000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
   useEffect(() => {
     if (!selected) {
@@ -145,8 +153,10 @@ export default function App() {
     if (dialog.kind === "create") {
       if (!value) return;
       const account = await run(() => call<Account>("create_account", { name: value }));
-      setDialog(null);
-      if (account) await refresh(account.name);
+      if (account) {
+        setDialog(null);
+        await refresh(account.name);
+      }
       return;
     }
 
@@ -158,8 +168,10 @@ export default function App() {
       const renamed = await run(() =>
         call<Account>("rename_account", { oldName: dialog.account.name, newName: value }),
       );
-      setDialog(null);
-      if (renamed) await refresh(renamed.name);
+      if (renamed) {
+        setDialog(null);
+        await refresh(renamed.name);
+      }
       return;
     }
 
@@ -170,8 +182,10 @@ export default function App() {
           value: value || null,
         }),
       );
-      setDialog(null);
-      if (updated) await refresh(updated.name);
+      if (updated) {
+        setDialog(null);
+        await refresh(updated.name);
+      }
       return;
     }
 
@@ -181,8 +195,16 @@ export default function App() {
         value: value || null,
       }),
     );
-    setDialog(null);
-    if (updated) await refresh(updated.name);
+    if (updated) {
+      setDialog(null);
+      await refresh(updated.name);
+    }
+  }
+
+  function openCreateDialog() {
+    setError("");
+    setDialogError("");
+    setDialog({ kind: "create", value: "" });
   }
 
   async function toggleLocale(account: Account) {
@@ -214,6 +236,16 @@ export default function App() {
 
   const accountCountLabel = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
   const proxyLabel = selected ? middleTruncate(selected.proxy_display, 48) : "";
+  const planHasGeo = Boolean(plan?.geo.exit_ip && plan.geo.timezone);
+  const planStatusLabel = planLoading
+    ? "检查中"
+    : plan?.privacy_failures.length
+      ? "隐私门禁有警告"
+      : plan
+        ? planHasGeo
+          ? "启动参数已就绪"
+          : "快速参数已就绪"
+        : "启动参数未解析";
 
   return (
     <main className="shell">
@@ -229,7 +261,7 @@ export default function App() {
           <IconButton label="刷新" disabled={busy} onClick={() => void run(() => refresh())}>
             <RefreshCw size={15} />
           </IconButton>
-          <button className="primaryButton" disabled={busy} onClick={() => setDialog({ kind: "create", value: "" })}>
+          <button className="primaryButton" disabled={busy} onClick={openCreateDialog}>
             <Plus size={15} />
             新建
           </button>
@@ -248,7 +280,7 @@ export default function App() {
               <div className="emptyState">
                 <ShieldCheck size={24} />
                 <strong>暂无账号</strong>
-                <button className="subtleButton" onClick={() => setDialog({ kind: "create", value: "" })}>
+                <button className="subtleButton" onClick={openCreateDialog}>
                   <Plus size={14} />
                   新建账号
                 </button>
@@ -294,52 +326,56 @@ export default function App() {
                 </button>
               </header>
 
-              <div className={`statusStrip ${plan?.privacy_failures.length ? "warn" : "ok"}`}>
-                {planLoading ? <Loader2 className="spin" size={15} /> : plan?.privacy_failures.length ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
-                <span>{planLoading ? "检查中" : plan?.privacy_failures.length ? "隐私门禁有警告" : "启动参数已就绪"}</span>
-              </div>
-
-              <section className="inspector">
-                <InspectorGroup title="Identity">
-                  <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
-                  <InfoRow label="Profile" value={selected.profile_path} mono />
-                </InspectorGroup>
-
-                <InspectorGroup title="Network">
-                  <InfoRow icon={<Tag size={15} />} label="区域" value={selected.region ?? "未设置"} />
-                  <InfoRow icon={<Globe2 size={15} />} label="语言" value={selected.locale_enabled ? "跟随出口" : "关"} />
-                  <InfoRow icon={<Network size={15} />} label="代理" value={proxyLabel} />
-                  <InfoRow label="出口 IP" value={plan?.geo.exit_ip ?? "未解析"} />
-                  <InfoRow label="时区" value={plan?.geo.timezone ?? "未解析"} />
-                </InspectorGroup>
-
-                <InspectorGroup title="Runtime">
-                  <InfoRow label="真实插件" value={`${plan?.extra_extension_paths.length ?? 0}`} />
-                  <InfoRow label="自测插件" value={`${plan?.selftest_extension_paths.length ?? 0}`} />
-                  <InfoRow label="Browser" value={plan?.browser_binary ?? "未解析"} mono />
-                </InspectorGroup>
-              </section>
-
-              {plan?.privacy_failures.length ? (
-                <div className="warningBox">
-                  {plan.privacy_failures.map((failure) => (
-                    <p key={failure}>{failure}</p>
-                  ))}
+              <div className="detailScroll">
+                <div className={`statusStrip ${plan?.privacy_failures.length || !plan ? "warn" : "ok"}`}>
+                  {planLoading ? <Loader2 className="spin" size={15} /> : plan?.privacy_failures.length || !plan ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
+                  <span>{planStatusLabel}</span>
                 </div>
-              ) : null}
 
-              <div className="actionBar">
-                <ActionButton icon={<Network size={15} />} label="代理" onClick={() => setDialog({ kind: "proxy", account: selected, value: "" })} />
-                <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
-                <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
-                <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
-                <ActionButton danger icon={<Trash2 size={15} />} label="删除" onClick={() => setDialog({ kind: "delete", account: selected })} />
+                <section className="inspector">
+                  <InspectorGroup title="Identity">
+                    <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
+                    <InfoRow label="Profile" value={selected.profile_path} mono />
+                  </InspectorGroup>
+
+                  <InspectorGroup title="Network">
+                    <InfoRow icon={<Tag size={15} />} label="区域" value={selected.region ?? "未设置"} />
+                    <InfoRow icon={<Globe2 size={15} />} label="语言" value={selected.locale_enabled ? "跟随出口" : "关"} />
+                    <InfoRow icon={<Network size={15} />} label="代理" value={proxyLabel} />
+                    <InfoRow label="出口 IP" value={plan?.geo.exit_ip ?? "启动时解析"} />
+                    <InfoRow label="时区" value={plan?.geo.timezone ?? "启动时解析"} />
+                  </InspectorGroup>
+
+                  <InspectorGroup title="Runtime">
+                    <InfoRow label="真实插件" value={plan ? extensionSummary(plan.extra_extension_paths) : "未解析"} />
+                    <InfoRow label="自测插件" value={plan ? extensionSummary(plan.selftest_extension_paths) : "未解析"} />
+                    <InfoRow label="Browser" value={plan?.browser_binary ?? "未解析"} mono />
+                  </InspectorGroup>
+                </section>
+
+                {plan?.privacy_failures.length ? (
+                  <div className="warningBox">
+                    {plan.privacy_failures.map((failure) => (
+                      <p key={failure}>{failure}</p>
+                    ))}
+                  </div>
+                ) : null}
+
+                <details className="argv">
+                  <summary>argv</summary>
+                  <code>{[plan?.browser_binary, ...(plan?.argv ?? [])].filter(Boolean).join(" ")}</code>
+                </details>
               </div>
 
-              <details className="argv">
-                <summary>argv</summary>
-                <code>{[plan?.browser_binary, ...(plan?.argv ?? [])].filter(Boolean).join(" ")}</code>
-              </details>
+              <footer className="detailFooter">
+                <div className="actionBar">
+                  <ActionButton icon={<Network size={15} />} label="代理" onClick={() => setDialog({ kind: "proxy", account: selected, value: "" })} />
+                  <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
+                  <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
+                  <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
+                  <ActionButton danger icon={<Trash2 size={15} />} label="删除" onClick={() => setDialog({ kind: "delete", account: selected })} />
+                </div>
+              </footer>
             </>
           ) : (
             <div className="emptyState detailEmpty">
@@ -350,7 +386,7 @@ export default function App() {
         </section>
       </section>
 
-      {error ? <div className="toast">{error}</div> : null}
+      {error && !dialog ? <div className="toast">{error}</div> : null}
       {dialog ? (
         <EditorDialog
           dialog={dialog}
@@ -429,6 +465,7 @@ function EditorDialog({
             onChange={(event) => onChange({ ...dialog, value: event.currentTarget.value })}
           />
         </label>
+        {error ? <p className="modalError">{error}</p> : null}
         <div className="modalActions">
           <button className="secondaryButton" type="button" onClick={onClose}>
             取消
@@ -619,6 +656,34 @@ function middleTruncate(value: string, max: number) {
   return `${value.slice(0, keep)}…${value.slice(-keep)}`;
 }
 
+function extensionSummary(paths: string[]) {
+  if (paths.length === 0) return "无";
+  return paths.map(pathBaseName).join(" / ");
+}
+
+function pathBaseName(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
 function errorMessage(caught: unknown) {
-  return caught instanceof Error ? caught.message : String(caught);
+  const raw = caught instanceof Error ? caught.message : String(caught);
+  const alreadyExistsPrefix = "account already exists: ";
+  const doesNotExistPrefix = "account does not exist: ";
+  const runningPrefix = "account is running: ";
+  if (raw.startsWith(alreadyExistsPrefix)) {
+    return `账号已存在：${raw.slice(alreadyExistsPrefix.length)}`;
+  }
+  if (raw.startsWith(doesNotExistPrefix)) {
+    return `账号不存在：${raw.slice(doesNotExistPrefix.length)}`;
+  }
+  if (raw.startsWith(runningPrefix)) {
+    return `账号正在运行：${raw.slice(runningPrefix.length)}。请先关闭这个浏览器窗口，再删除。`;
+  }
+  if (raw.includes("account name is invalid")) {
+    return "名字无效：可用字母、数字、.、@、+、-、_；不能叫 main，不能以 . 开头/结尾，不能含 /、\\ 或连续 ..。";
+  }
+  if (raw.includes("unsupported proxy URL")) {
+    return "代理须以 socks5://、http:// 或 https:// 开头。";
+  }
+  return raw;
 }

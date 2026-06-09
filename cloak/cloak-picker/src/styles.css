@@ -239,9 +239,11 @@ button {
 }
 
 .detail {
+  display: grid;
+  grid-template-rows: 72px minmax(0, 1fr) auto;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   background: var(--panel);
 }
 
@@ -255,6 +257,20 @@ button {
   padding: 0 18px;
   border-bottom: 1px solid var(--border);
   background: var(--panel);
+}
+
+.detailScroll {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--panel);
+}
+
+.detailFooter {
+  min-width: 0;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  padding: 10px 18px;
 }
 
 .titleBlock {
@@ -396,7 +412,7 @@ h2 {
 
 .actionBar {
   flex-wrap: wrap;
-  margin: 14px 18px 0;
+  margin: 0;
 }
 
 .argv {

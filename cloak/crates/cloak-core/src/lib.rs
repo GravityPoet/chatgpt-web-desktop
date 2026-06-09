@@ -11,9 +11,11 @@ use std::ffi::OsStr;
 use std::fs;
 use std::io;
 use std::io::Cursor;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use url::Url;
 use walkdir::WalkDir;
@@ -23,12 +25,14 @@ const RELAY_PLACEHOLDER: &str = "socks5://127.0.0.1:<relay-port>";
 
 #[derive(Debug, Error)]
 pub enum CloakError {
-    #[error("account name is invalid; use letters, digits, - or _, and do not use main")]
+    #[error("account name is invalid; use letters, digits, ., @, +, - or _, and do not use main")]
     InvalidAccountName,
     #[error("account already exists: {0}")]
     AccountExists(String),
     #[error("account does not exist: {0}")]
     AccountMissing(String),
+    #[error("account is running: {0}")]
+    AccountRunning(String),
     #[error("unsupported proxy URL; use socks5://, http://, or https://")]
     InvalidProxy,
     #[error("CloakBrowser binary not found")]
@@ -200,6 +204,18 @@ struct ExtraExtensionItem {
     kind: ExtraExtensionKind,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct RelayRequest {
+    upstream_url: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RelayState {
+    upstream_hash: String,
+    port: u16,
+    pid: u32,
+}
+
 #[derive(PartialEq, Eq)]
 enum ExtraExtensionKind {
     Directory,
@@ -210,11 +226,13 @@ pub fn validate_account_name(name: &str) -> Result<()> {
     if name.is_empty()
         || name == "main"
         || name.starts_with('.')
+        || name.ends_with('.')
         || name.contains('/')
+        || name.contains('\\')
         || name.contains("..")
         || !name
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'@' | b'+' | b'-' | b'_'))
     {
         return Err(CloakError::InvalidAccountName);
     }
@@ -310,6 +328,9 @@ pub fn delete_account(config: &CloakConfig, name: &str) -> Result<()> {
     validate_account_name(name)?;
     let path = config.profile_dir(name);
     if path.exists() {
+        if account_profile_is_running(&path)? {
+            return Err(CloakError::AccountRunning(name.to_string()));
+        }
         fs::remove_dir_all(path)?;
     }
     Ok(())
@@ -418,26 +439,33 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
         .locale_override
         .unwrap_or_else(|| profile_path.join(".cloak-locale").exists());
     let locale = if locale_enabled {
-        let primary = language_for_country(geo.country.as_deref().unwrap_or(""));
-        Some(accept_language(&primary))
+        if let Some(country) = geo.country.as_deref().filter(|value| !value.is_empty()) {
+            let primary = language_for_country(country);
+            Some(accept_language(&primary))
+        } else {
+            if !options.skip_geo {
+                privacy_failures.push(
+                    "语言跟随已开启，但无法由账号出口国家码解析 Accept-Language（country=unknown）。"
+                        .to_string(),
+                );
+            }
+            None
+        }
     } else {
         None
     };
 
+    let load_extensions = join_extension_paths(&extension_plan.load_extension_paths);
     let mut argv = vec![
         format!("--user-data-dir={}", profile_path.display()),
         format!("--fingerprint={seed}"),
         format!("--fingerprint-platform={}", fingerprint_platform()),
-        format!(
-            "--load-extension={}",
-            join_extension_paths(&extension_plan.load_extension_paths)
-        ),
+        format!("--load-extension={load_extensions}"),
+        format!("--disable-extensions-except={load_extensions}"),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
     ];
-    if let Some(locale) = &locale {
-        argv.push(format!("--accept-lang={locale}"));
-    }
+    append_native_fingerprint_args(&mut argv, &geo, locale.as_deref());
     if let Some(proxy_arg) = &proxy_config.browser_arg {
         argv.push(format!("--proxy-server={proxy_arg}"));
     }
@@ -476,18 +504,16 @@ pub fn launch_account(config: &CloakConfig, name: &str, options: &LaunchOptions)
     secure_account_dir(&plan.profile_path)?;
     prepare_account_extension(config, &plan)?;
 
-    let mut relay_guard = None;
     let mut argv = plan.argv.clone();
     if plan.proxy.relay_needed {
         let raw = plan.proxy.raw_url.as_deref().ok_or_else(|| CloakError::Relay("missing relay upstream".to_string()))?;
-        let guard = relay::start(raw).map_err(CloakError::Relay)?;
-        let relay_arg = format!("socks5://127.0.0.1:{}", guard.port());
+        let relay_port = ensure_supervised_relay(&plan.profile_path, raw)?;
+        let relay_arg = format!("socks5://127.0.0.1:{relay_port}");
         for arg in &mut argv {
             if arg == &format!("--proxy-server={RELAY_PLACEHOLDER}") {
                 *arg = format!("--proxy-server={relay_arg}");
             }
         }
-        relay_guard = Some(guard);
     }
 
     if options.preflight == PreflightMode::Strict {
@@ -499,28 +525,233 @@ pub fn launch_account(config: &CloakConfig, name: &str, options: &LaunchOptions)
     if let Some(tz) = plan.geo.timezone.as_deref() {
         command.env("TZ", tz);
     }
-    let mut child = command.spawn()?;
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::null());
+    command.stderr(Stdio::null());
+    command.spawn()?;
 
     if options.preflight == PreflightMode::Async {
         let _ = run_selftest(config, &plan, &argv, false);
     }
 
-    let _status = child.wait()?;
-    drop(relay_guard);
     Ok(())
 }
 
+pub fn maybe_run_relay_supervisor() -> Result<bool> {
+    let mut args = env::args_os();
+    let _program = args.next();
+    let Some(mode) = args.next() else {
+        return Ok(false);
+    };
+    if mode.as_os_str() != OsStr::new("--cloak-relay-supervisor") {
+        return Ok(false);
+    }
+    let request_path = args
+        .next()
+        .ok_or_else(|| CloakError::Relay("missing relay request path".to_string()))?;
+    let state_path = args
+        .next()
+        .ok_or_else(|| CloakError::Relay("missing relay state path".to_string()))?;
+    if args.next().is_some() {
+        return Err(CloakError::Relay("unexpected relay supervisor arguments".to_string()));
+    }
+    run_relay_supervisor(&PathBuf::from(request_path), &PathBuf::from(state_path))?;
+    Ok(true)
+}
+
+fn ensure_supervised_relay(profile_path: &Path, upstream_url: &str) -> Result<u16> {
+    let relay_dir = profile_path.join(".cloak-relay");
+    fs::create_dir_all(&relay_dir)?;
+    secure_dir(&relay_dir)?;
+
+    let upstream_hash = relay_hash(upstream_url);
+    let request_path = relay_dir.join(format!("{upstream_hash}.request.json"));
+    let state_path = relay_dir.join(format!("{upstream_hash}.state.json"));
+
+    if let Some(port) = live_supervised_relay_port(&state_path, &upstream_hash)? {
+        return Ok(port);
+    }
+
+    let request = RelayRequest {
+        upstream_url: upstream_url.to_string(),
+    };
+    write_secret_atomic(&request_path, &serde_json::to_string(&request)?)?;
+
+    let supervisor_bin = env::var_os("CLOAK_RELAY_SUPERVISOR_BIN")
+        .map(PathBuf::from)
+        .unwrap_or(env::current_exe()?);
+    let mut command = Command::new(supervisor_bin);
+    command
+        .arg("--cloak-relay-supervisor")
+        .arg(&request_path)
+        .arg(&state_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn()?;
+
+    let started_at = Instant::now();
+    while started_at.elapsed() < Duration::from_secs(5) {
+        if let Some(port) = live_supervised_relay_port(&state_path, &upstream_hash)? {
+            return Ok(port);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    Err(CloakError::Relay(
+        "background relay supervisor did not become ready".to_string(),
+    ))
+}
+
+fn run_relay_supervisor(request_path: &Path, state_path: &Path) -> Result<()> {
+    let body = fs::read_to_string(request_path)?;
+    let request: RelayRequest = serde_json::from_str(&body)?;
+    let upstream_hash = relay_hash(&request.upstream_url);
+    if let Some(parent) = state_path.parent() {
+        fs::create_dir_all(parent)?;
+        secure_dir(parent)?;
+    }
+
+    relay::serve_forever(&request.upstream_url, |port| {
+        let state = RelayState {
+            upstream_hash,
+            port,
+            pid: std::process::id(),
+        };
+        let encoded = serde_json::to_string(&state).map_err(|err| err.to_string())?;
+        write_secret_atomic(state_path, &encoded).map_err(|err| err.to_string())?;
+        let _ = fs::remove_file(request_path);
+        Ok(())
+    })
+    .map_err(CloakError::Relay)
+}
+
+fn live_supervised_relay_port(state_path: &Path, expected_hash: &str) -> Result<Option<u16>> {
+    if !state_path.exists() {
+        return Ok(None);
+    }
+
+    let Ok(body) = fs::read_to_string(state_path) else {
+        return Ok(None);
+    };
+    let Ok(state) = serde_json::from_str::<RelayState>(&body) else {
+        let _ = fs::remove_file(state_path);
+        return Ok(None);
+    };
+    if state.upstream_hash != expected_hash || state.port == 0 {
+        return Ok(None);
+    }
+    if local_socks5_ready(state.port) {
+        Ok(Some(state.port))
+    } else {
+        let _ = fs::remove_file(state_path);
+        Ok(None)
+    }
+}
+
+fn local_socks5_ready(port: u16) -> bool {
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut stream) = StdTcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
+    if stream.write_all(&[0x05, 0x01, 0x00]).is_err() {
+        return false;
+    }
+    let mut response = [0u8; 2];
+    stream.read_exact(&mut response).is_ok() && response == [0x05, 0x00]
+}
+
+fn relay_hash(upstream_url: &str) -> String {
+    let digest = Sha256::digest(upstream_url.as_bytes());
+    hex_digest(&digest)
+}
+
+fn account_profile_is_running(profile_path: &Path) -> Result<bool> {
+    let needle = user_data_dir_needle(profile_path);
+    running_process_command_lines().map(|commands| {
+        commands
+            .lines()
+            .any(|command| command_line_mentions_user_data_dir(command, &needle))
+    })
+}
+
+fn user_data_dir_needle(profile_path: &Path) -> String {
+    format!("--user-data-dir={}", profile_path.display())
+}
+
+fn command_line_mentions_user_data_dir(command: &str, needle: &str) -> bool {
+    let Some(index) = command.find(needle) else {
+        return false;
+    };
+    let rest = &command[index + needle.len()..];
+    rest.is_empty()
+        || rest
+            .chars()
+            .next()
+            .map(|ch| ch.is_whitespace() || matches!(ch, '"' | '\''))
+            .unwrap_or(true)
+}
+
+#[cfg(target_os = "windows")]
+fn running_process_command_lines() -> Result<String> {
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Process | ForEach-Object { $_.CommandLine }",
+        ])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn running_process_command_lines() -> Result<String> {
+    let output = Command::new("ps")
+        .args(["axww", "-o", "command="])
+        .output()?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
 pub fn prepare_account_extension(config: &CloakConfig, plan: &LaunchPlan) -> Result<()> {
+    prepare_companion_extension(config, plan, companion_page_spoof_enabled())?;
+    prepare_crx_extensions(config, &plan.profile_path)?;
+    Ok(())
+}
+
+fn prepare_companion_extension(
+    config: &CloakConfig,
+    plan: &LaunchPlan,
+    page_spoof_enabled: bool,
+) -> Result<()> {
     if plan.extension_runtime_path.exists() {
         fs::remove_dir_all(&plan.extension_runtime_path)?;
     }
     copy_dir(&config.extension_source, &plan.extension_runtime_path)?;
     secure_dir_recursive(&plan.extension_runtime_path)?;
+    let seed_script = if page_spoof_enabled {
+        format!("window.__cloakAccountSeed = \"{}\";\n", plan.seed)
+    } else {
+        "window.__cloakAccountSeed = \"\";\n".to_string()
+    };
     write_secret_atomic(
         &plan.extension_runtime_path.join("account-seed-main.js"),
-        &format!("window.__cloakAccountSeed = \"{}\";", plan.seed),
+        &seed_script,
     )?;
-    prepare_crx_extensions(config, &plan.profile_path)?;
+    if !page_spoof_enabled {
+        strip_companion_page_scripts(&plan.extension_runtime_path.join("manifest.json"))?;
+    }
     Ok(())
 }
 
@@ -837,7 +1068,12 @@ fn extra_extensions_root() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CLOAK_EXTRA_EXTENSIONS_DIR") {
         return Ok(PathBuf::from(path));
     }
-    Ok(home_dir()?.join("Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"))
+    let home = home_dir()?;
+    let local_cache = home.join("Library/Application Support/ChatGPT Cloak/Default Extensions");
+    if local_cache.is_dir() {
+        return Ok(local_cache);
+    }
+    Ok(home.join("Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"))
 }
 
 fn slug_for_path(path: &Path) -> String {
@@ -1128,6 +1364,29 @@ fn accept_language(primary: &str) -> String {
     }
 }
 
+fn primary_locale_from_accept_language(accept_language: &str) -> &str {
+    accept_language
+        .split(',')
+        .next()
+        .unwrap_or(accept_language)
+        .trim()
+}
+
+fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale: Option<&str>) {
+    if let Some(tz) = geo.timezone.as_deref().filter(|value| !value.is_empty()) {
+        argv.push(format!("--fingerprint-timezone={tz}"));
+    }
+    if let Some(locale) = locale {
+        let primary_locale = primary_locale_from_accept_language(locale);
+        argv.push(format!("--lang={primary_locale}"));
+        argv.push(format!("--fingerprint-locale={primary_locale}"));
+        argv.push(format!("--accept-lang={locale}"));
+    }
+    if let Some(exit_ip) = geo.exit_ip.as_deref().filter(|value| !value.is_empty()) {
+        argv.push(format!("--fingerprint-webrtc-ip={exit_ip}"));
+    }
+}
+
 fn valid_tz(tz: &str) -> bool {
     Regex::new(r"^[A-Za-z]+/[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)?$")
         .expect("timezone regex")
@@ -1176,6 +1435,29 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
             fs::copy(entry.path(), target)?;
         }
     }
+    Ok(())
+}
+
+fn strip_companion_page_scripts(manifest_path: &Path) -> Result<()> {
+    if !manifest_path.exists() {
+        return Ok(());
+    }
+
+    let body = fs::read_to_string(manifest_path)?;
+    let mut manifest: Value = serde_json::from_str(&body)?;
+    if let Some(object) = manifest.as_object_mut() {
+        object.remove("content_scripts");
+        object.remove("host_permissions");
+        object.remove("background");
+        object.insert(
+            "permissions".to_string(),
+            Value::Array(vec![Value::String("storage".to_string())]),
+        );
+    }
+    write_secret_atomic(
+        manifest_path,
+        &format!("{}\n", serde_json::to_string_pretty(&manifest)?),
+    )?;
     Ok(())
 }
 
@@ -1310,6 +1592,27 @@ fn truthy(value: &str) -> bool {
     matches!(value, "1" | "on" | "true" | "yes" | "YES" | "TRUE" | "ON")
 }
 
+fn falsy(value: &str) -> bool {
+    matches!(value, "0" | "off" | "false" | "no" | "NO" | "FALSE" | "OFF")
+}
+
+fn companion_page_spoof_enabled() -> bool {
+    companion_page_spoof_enabled_from(
+        env::var("CLOAK_COMPANION_PAGE_SPOOF").ok().as_deref(),
+        env::var("CLOAK_JS_FINGERPRINT").ok().as_deref(),
+    )
+}
+
+fn companion_page_spoof_enabled_from(primary: Option<&str>, legacy: Option<&str>) -> bool {
+    if let Some(value) = primary {
+        return !falsy(value);
+    }
+    if let Some(value) = legacy {
+        return !falsy(value);
+    }
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1323,8 +1626,13 @@ mod tests {
     #[test]
     fn account_name_validation_matches_picker_rules() {
         assert!(validate_account_name("work_01").is_ok());
+        assert!(validate_account_name("poet-quench-9i@icloud.com").is_ok());
+        assert!(validate_account_name("poet+quench@icloud.com").is_ok());
         assert!(validate_account_name("main").is_err());
         assert!(validate_account_name("../x").is_err());
+        assert!(validate_account_name("x\\y").is_err());
+        assert!(validate_account_name("name.").is_err());
+        assert!(validate_account_name("has space").is_err());
         assert!(validate_account_name(".hidden").is_err());
         assert!(validate_account_name("中文").is_err());
     }
@@ -1365,12 +1673,195 @@ mod tests {
     }
 
     #[test]
+    fn native_fingerprint_args_follow_cloakbrowser_wrapper_contract() {
+        let mut argv = Vec::new();
+        append_native_fingerprint_args(
+            &mut argv,
+            &GeoPlan {
+                exit_ip: Some("203.0.113.24".to_string()),
+                country: Some("JP".to_string()),
+                timezone: Some("Asia/Tokyo".to_string()),
+            },
+            Some("ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"),
+        );
+
+        assert_eq!(
+            argv,
+            vec![
+                "--fingerprint-timezone=Asia/Tokyo",
+                "--lang=ja-JP",
+                "--fingerprint-locale=ja-JP",
+                "--accept-lang=ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+                "--fingerprint-webrtc-ip=203.0.113.24",
+            ]
+        );
+    }
+
+    #[test]
+    fn skip_geo_locale_does_not_invent_accept_language() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+        let browser = config
+            .cloakbrowser_root
+            .join(current_browser_relative_path());
+        fs::create_dir_all(browser.parent().unwrap()).unwrap();
+        fs::write(&browser, "").unwrap();
+        let profile = config.profile_dir("work");
+        fs::create_dir_all(&profile).unwrap();
+        fs::write(profile.join(".cloak-locale"), "").unwrap();
+
+        let plan = build_launch_plan(
+            &config,
+            "work",
+            &LaunchOptions {
+                dry_run: true,
+                skip_geo: true,
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(plan.locale, None);
+        assert!(plan
+            .argv
+            .iter()
+            .any(|arg| arg.starts_with("--load-extension=")));
+        assert!(plan
+            .argv
+            .iter()
+            .any(|arg| arg.starts_with("--disable-extensions-except=")));
+        assert!(!plan
+            .argv
+            .iter()
+            .any(|arg| arg.starts_with("--accept-lang=")));
+        assert!(plan.privacy_failures.is_empty());
+    }
+
+    #[test]
+    fn running_profile_detection_uses_exact_user_data_dir_arg() {
+        let profile = Path::new("/tmp/Cloak Accounts/work");
+        let needle = user_data_dir_needle(profile);
+        assert!(command_line_mentions_user_data_dir(
+            "/Applications/Chromium --user-data-dir=/tmp/Cloak Accounts/work --fingerprint=12345",
+            &needle,
+        ));
+        assert!(!command_line_mentions_user_data_dir(
+            "/Applications/Chromium --user-data-dir=/tmp/Cloak Accounts/work2 --fingerprint=12345",
+            &needle,
+        ));
+    }
+
+    #[test]
     fn extra_extension_slug_matches_bash_contract() {
         assert_eq!(slug_for_path(Path::new("删除Cookies.crx")), "Cookies.crx");
         assert_eq!(
             slug_for_path(Path::new("沉浸式翻译 - AI 双语网页翻译 _ PDF翻译 _ 视频翻译 _ 漫画翻译 1.30.1.crx")),
             "-_AI_PDF_1.30.1.crx"
         );
+    }
+
+    #[test]
+    fn companion_page_spoof_is_enabled_by_default_for_current_binary() {
+        assert!(companion_page_spoof_enabled_from(None, None));
+        assert!(companion_page_spoof_enabled_from(Some("1"), None));
+        assert!(companion_page_spoof_enabled_from(None, Some("1")));
+        assert!(!companion_page_spoof_enabled_from(Some("0"), None));
+        assert!(!companion_page_spoof_enabled_from(None, Some("false")));
+        assert!(!companion_page_spoof_enabled_from(Some("OFF"), Some("1")));
+    }
+
+    #[test]
+    fn companion_prepare_writes_seed_and_keeps_page_scripts_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let extension_source = dir.path().join("extension");
+        fs::create_dir_all(&extension_source).unwrap();
+        fs::write(
+            extension_source.join("manifest.json"),
+            r#"{
+              "manifest_version": 3,
+              "permissions": ["storage", "scripting", "tabs"],
+              "host_permissions": ["<all_urls>"],
+              "background": { "service_worker": "background.js" },
+              "content_scripts": [{ "matches": ["https://*/*"], "js": ["account-seed-main.js", "spoof.js"] }]
+            }"#,
+        )
+        .unwrap();
+
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source,
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        let profile_path = config.profile_dir("work");
+        let plan = LaunchPlan {
+            account: "work".to_string(),
+            seed: "28041".to_string(),
+            profile_path: profile_path.clone(),
+            extension_runtime_path: profile_path.join(".cloak-companion"),
+            load_extension_paths: Vec::new(),
+            extra_extension_paths: Vec::new(),
+            selftest_extension_paths: Vec::new(),
+            browser_binary: dir.path().join("browser/Chromium"),
+            proxy: ProxyPlan {
+                mode: ProxyMode::None,
+                display: "off".to_string(),
+                browser_arg: None,
+                relay_needed: false,
+                raw_url: None,
+            },
+            geo: GeoPlan {
+                exit_ip: None,
+                country: None,
+                timezone: None,
+            },
+            locale: None,
+            argv: Vec::new(),
+            privacy_failures: Vec::new(),
+        };
+
+        prepare_companion_extension(&config, &plan, true).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(plan.extension_runtime_path.join("account-seed-main.js")).unwrap(),
+            "window.__cloakAccountSeed = \"28041\";\n"
+        );
+        let manifest: Value =
+            serde_json::from_str(&fs::read_to_string(plan.extension_runtime_path.join("manifest.json")).unwrap())
+                .unwrap();
+        assert!(manifest.get("content_scripts").is_some());
+        assert!(manifest.get("host_permissions").is_some());
+        assert!(manifest.get("background").is_some());
+    }
+
+    #[test]
+    fn companion_manifest_strips_page_scripts_when_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            r#"{
+              "manifest_version": 3,
+              "permissions": ["storage", "scripting", "tabs"],
+              "host_permissions": ["<all_urls>"],
+              "background": { "service_worker": "background.js" },
+              "content_scripts": [{ "matches": ["https://*/*"], "js": ["spoof.js"] }]
+            }"#,
+        )
+        .unwrap();
+
+        strip_companion_page_scripts(&manifest).unwrap();
+        let stripped: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        assert!(stripped.get("content_scripts").is_none());
+        assert!(stripped.get("host_permissions").is_none());
+        assert!(stripped.get("background").is_none());
+        assert_eq!(stripped.get("permissions").unwrap(), &Value::Array(vec![Value::String("storage".to_string())]));
     }
 
     #[test]
