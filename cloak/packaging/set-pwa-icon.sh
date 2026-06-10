@@ -20,6 +20,35 @@ ICON="${ICON:-$ROOT/packaging/icon-green.icns}"
 PWA_APP="${PWA_APP:-$HOME/Applications/Chromium Apps.localized/ChatGPT Cloak.app}"
 
 [[ -f "$ICON" ]] || { printf 'error: icon not found: %s\n' "$ICON" >&2; exit 1; }
+
+# If a stale dead shim was still holding the canonical name when the PWA was
+# reinstalled, Chromium saves the new shim as "ChatGPT Cloak 1.app" (2, 3, ...).
+# The numbered bundle is the freshly installed working one; the unnumbered one is
+# the dead leftover. Converge before touching icons: drop the stale bundle and move
+# the numbered one onto the canonical path — the Dock tile references the canonical
+# path, so this also revives the Dock icon. Shims hold no user data (loader + plist
+# + icon only; Chromium can rebuild them anytime), so removal is safe.
+PWA_DIR="$(dirname "$PWA_APP")"
+PWA_NAME="$(basename "$PWA_APP" .app)"
+variants=("$PWA_DIR/$PWA_NAME "[0-9]*.app)
+if [[ ${#variants[@]} -gt 1 ]]; then
+  printf 'error: multiple numbered shim variants — cannot tell which is live, resolve manually:\n' >&2
+  printf '  %s\n' "${variants[@]}" >&2
+  exit 1
+fi
+if [[ -d "${variants[0]}" ]]; then
+  variant="${variants[0]}"
+  if [[ -d "$PWA_APP" ]] && [[ "$(/usr/bin/stat -f %m "$variant")" -le "$(/usr/bin/stat -f %m "$PWA_APP")" ]]; then
+    printf 'error: %s is not newer than %s — cannot tell which shim is live, resolve manually\n' "$variant" "$PWA_APP" >&2
+    exit 1
+  fi
+  /usr/bin/pkill -f "$variant/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
+  /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
+  [[ -d "$PWA_APP" ]] && /bin/rm -rf "$PWA_APP"
+  /bin/mv "$variant" "$PWA_APP"
+  printf 'converged: stale shim removed, "%s" -> "%s"\n' "$variant" "$PWA_APP"
+fi
+
 [[ -d "$PWA_APP" ]] || { printf 'error: PWA bundle not found: %s\n' "$PWA_APP" >&2; exit 1; }
 
 # Quit the shim so it can't rewrite app.icns mid-edit, AND so the Dock re-reads the
