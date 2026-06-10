@@ -36,3 +36,7 @@ tauri/src-tauri/target/
 
 # OpenCode memory (not part of the project)
 .opencode/
+
+# Audit process artifacts
+REPORT.md
+ground-truth.txt
