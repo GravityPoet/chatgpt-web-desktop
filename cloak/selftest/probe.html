@@ -28,6 +28,19 @@ window.__runProbe = function () {
   out.languages = nav.languages;
   out.hardwareConcurrency = nav.hardwareConcurrency;
   out.deviceMemory = (typeof nav.deviceMemory !== "undefined") ? nav.deviceMemory : null;
+  out.headless_apis = {
+    contentIndex: typeof window.ContentIndex !== "undefined",
+    contacts: "contacts" in nav,
+    downlinkMax: !!(nav.connection && "downlinkMax" in nav.connection),
+    webdriverDescriptor: (() => {
+      try {
+        const d = Object.getOwnPropertyDescriptor(Navigator.prototype, "webdriver");
+        return d && typeof d.get === "function" ? d.get.call(nav) : nav.webdriver;
+      } catch (e) {
+        return "ERR:" + e;
+      }
+    })()
+  };
   out.screen = {
     width: screen.width,
     height: screen.height,

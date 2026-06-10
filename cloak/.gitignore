@@ -10,6 +10,15 @@ dist/
 *.dmg
 *.log
 *.tmp
+.opencode/
+
+# Runtime-generated extension files (written by prepare_companion_extension)
+extension/cloak-companion/browser-identity-main.js
+extension/cloak-companion/browser-identity-worker.js
+extension/cloak-companion/rules/
+
+# Test artifacts
+selftest/live-results/
 
 .env
 .env.*

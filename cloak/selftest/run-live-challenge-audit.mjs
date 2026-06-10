@@ -24,9 +24,57 @@ const ROOT = dirname(__dir);
 const CLOAK = join(ROOT, "target", "debug", "cloak");
 const EXT_SOURCE = join(ROOT, "extension", "cloak-companion");
 const DEFAULT_BIN = `${process.env.HOME}/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium`;
-const SHA_FILE = join(ROOT, "packaging", "cloakbrowser-current.sha256");
+const RUNTIME_SHA_FILE = `${process.env.HOME}/.cloakbrowser/current.sha256`;
+const SHA_FILE = process.env.CLOAK_BROWSER_SHA_FILE
+  || (existsSync(RUNTIME_SHA_FILE) ? RUNTIME_SHA_FILE : join(ROOT, "packaging", "cloakbrowser-current.sha256"));
 
 const SITE_DEFS = {
+  "version-consistency": {
+    url: "about:blank",
+    waitMs: 1000,
+    evaluate: `(async () => {
+      const ua = navigator.userAgent || "";
+      const uaMatch = ua.match(/Chrome\\/(\\d+)/);
+      const uaMajor = uaMatch ? uaMatch[1] : null;
+      const platform = navigator.platform;
+      const hwConcurrency = navigator.hardwareConcurrency;
+      const deviceMemory = navigator.deviceMemory ?? null;
+      let uaDataResult = null;
+      if (navigator.userAgentData) {
+        try {
+          uaDataResult = await navigator.userAgentData.getHighEntropyValues([
+            "architecture", "bitness", "brands", "fullVersionList",
+            "mobile", "model", "platform", "platformVersion", "uaFullVersion",
+          ]);
+        } catch (error) {
+          uaDataResult = { error: String(error?.message || error) };
+        }
+      }
+      const chMajor = uaDataResult?.brands?.[0]?.version || null;
+      const fvlMajor = uaDataResult?.fullVersionList?.[0]?.version?.split(".")?.[0] || null;
+      const issues = [];
+      if (!uaMajor) issues.push("UA missing Chrome version");
+      if (!uaDataResult) issues.push("userAgentData missing");
+      if (uaMajor && chMajor && uaMajor !== chMajor) issues.push("UA major != brands major");
+      if (uaMajor && fvlMajor && uaMajor !== fvlMajor) issues.push("UA major != fullVersionList major");
+      if (uaDataResult && !uaDataResult.platformVersion) issues.push("platformVersion missing");
+      if (uaDataResult && !uaDataResult.architecture) issues.push("architecture missing");
+      if (uaDataResult && !uaDataResult.bitness) issues.push("bitness missing");
+      if (uaDataResult && !Array.isArray(uaDataResult.fullVersionList)) issues.push("fullVersionList missing");
+      return {
+        ua,
+        uaMajor,
+        chMajor,
+        fvlMajor,
+        platform,
+        hwConcurrency,
+        deviceMemory,
+        uaData: uaDataResult,
+        issues,
+        passed: issues.length === 0,
+      };
+    })()`,
+  },
   sannysoft: {
     url: "https://bot.sannysoft.com",
     waitMs: 6000,
@@ -148,6 +196,37 @@ const SITE_DEFS = {
           return null;
         }
       })();
+      const diagnostics = (() => {
+        try {
+          const nav = navigator;
+          const navProto = Navigator.prototype;
+          const webdriverDescriptor = Object.getOwnPropertyDescriptor(navProto, "webdriver");
+          const contactsDescriptor = Object.getOwnPropertyDescriptor(navProto, "contacts");
+          const contacts = nav.contacts;
+          return {
+            webdriver: nav.webdriver,
+            webdriverDescriptor: webdriverDescriptor ? {
+              hasGetter: typeof webdriverDescriptor.get === "function",
+              getterString: webdriverDescriptor.get ? Function.prototype.toString.call(webdriverDescriptor.get) : null,
+              value: webdriverDescriptor.value,
+            } : null,
+            contactsInNavigator: "contacts" in nav,
+            contactsType: typeof contacts,
+            contactsString: contacts ? Object.prototype.toString.call(contacts) : null,
+            contactsConstructor: contacts?.constructor?.name || null,
+            contactsOwnKeys: contacts ? Reflect.ownKeys(contacts).map(String) : [],
+            contactsDescriptor: contactsDescriptor ? {
+              hasGetter: typeof contactsDescriptor.get === "function",
+              getterString: contactsDescriptor.get ? Function.prototype.toString.call(contactsDescriptor.get) : null,
+            } : null,
+            contentIndex: typeof window.ContentIndex,
+            connectionDownlinkMax: nav.connection ? ("downlinkMax" in nav.connection) : null,
+            functionToString: Function.prototype.toString.toString(),
+          };
+        } catch (error) {
+          return { error: String(error?.message || error) };
+        }
+      })();
       const badBot = /you are a bad bot/i.test(text);
       const trustMatch = text.match(/trust score[^0-9]*(\\d+(?:\\.\\d+)?)/i);
       return {
@@ -155,6 +234,7 @@ const SITE_DEFS = {
         trustScore: trustMatch ? Number(trustMatch[1]) : null,
         scores,
         signals,
+        diagnostics,
         badBot,
         passed: text.length > 500
           && !badBot
@@ -326,13 +406,22 @@ function ensureCli() {
 function verifyBrowserHash() {
   const bin = process.env.CLOAK_BROWSER_BIN || DEFAULT_BIN;
   if (!existsSync(bin)) throw new Error(`CloakBrowser binary not found: ${bin}`);
-  if (!existsSync(SHA_FILE)) return { bin, checked: false };
-  const expected = readFileSync(SHA_FILE, "utf8").trim().split(/\s+/)[0];
+  const envExpected = process.env.CLOAK_BROWSER_EXPECTED_SHA256;
+  if (!envExpected && !existsSync(SHA_FILE)) return { bin, checked: false };
+  const expected = (envExpected || readFileSync(SHA_FILE, "utf8").trim().split(/\s+/)[0]).toLowerCase();
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    throw new Error("CLOAK_BROWSER expected hash must be a 64-character SHA256");
+  }
   const got = runChecked("shasum", ["-a", "256", bin]).trim().split(/\s+/)[0];
   if (got !== expected) {
     throw new Error(`CloakBrowser hash changed: got ${got}, expected ${expected}`);
   }
-  return { bin, checked: true, sha256: got };
+  return {
+    bin,
+    checked: true,
+    sha256: got,
+    hash_source: envExpected ? "CLOAK_BROWSER_EXPECTED_SHA256" : SHA_FILE,
+  };
 }
 
 function truthy(value) {
@@ -358,6 +447,7 @@ function stripCompanionPageScripts(manifestPath) {
   delete manifest.content_scripts;
   delete manifest.host_permissions;
   delete manifest.background;
+  delete manifest.declarative_net_request;
   manifest.permissions = ["storage"];
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -366,12 +456,78 @@ function prepareCompanion(plan) {
   const dest = plan.extension_runtime_path;
   rmSync(dest, { recursive: true, force: true });
   cpSync(EXT_SOURCE, dest, { recursive: true });
+  const identity = plan.browser_identity || null;
+  writeFileSync(join(dest, "browser-identity-main.js"), `window.__cloakBrowserIdentity = ${JSON.stringify(identity)};\n`);
+  writeFileSync(join(dest, "browser-identity-worker.js"), `self.__cloakBrowserIdentity = ${JSON.stringify(identity)};\n`);
+  writeBrowserIdentityHeaderRules(dest, identity);
   if (companionPageSpoofEnabled()) {
     writeFileSync(join(dest, "account-seed-main.js"), `window.__cloakAccountSeed = ${JSON.stringify(String(plan.seed))};\n`);
   } else {
     writeFileSync(join(dest, "account-seed-main.js"), "window.__cloakAccountSeed = \"\";\n");
     stripCompanionPageScripts(join(dest, "manifest.json"));
   }
+}
+
+function applyBrowserIdentityOverride(plan) {
+  if (!process.env.CLOAK_AUDIT_BROWSER_IDENTITY_JSON) return null;
+  const identity = JSON.parse(process.env.CLOAK_AUDIT_BROWSER_IDENTITY_JSON);
+  if (!identity || typeof identity.userAgent !== "string") {
+    throw new Error("CLOAK_AUDIT_BROWSER_IDENTITY_JSON must include string userAgent");
+  }
+  plan.browser_identity = identity;
+  plan.argv = plan.argv.map((arg) => (
+    arg.startsWith("--user-agent=") ? `--user-agent=${identity.userAgent}` : arg
+  ));
+  return identity;
+}
+
+function writeBrowserIdentityHeaderRules(dest, identity) {
+  const rulesDir = join(dest, "rules");
+  mkdirSync(rulesDir, { recursive: true });
+  writeFileSync(
+    join(rulesDir, "browser-identity-headers.json"),
+    `${JSON.stringify(browserIdentityHeaderRules(identity), null, 2)}\n`,
+  );
+}
+
+function browserIdentityHeaderRules(identity) {
+  if (!identity?.userAgent) return [];
+  const uaData = identity.uaData || {};
+  const headers = [
+    { header: "User-Agent", operation: "set", value: identity.userAgent },
+  ];
+  const brands = formatHeaderBrands(uaData.brands);
+  const fullVersionList = formatHeaderBrands(uaData.fullVersionList);
+  if (brands) headers.push({ header: "Sec-CH-UA", operation: "set", value: brands });
+  headers.push({ header: "Sec-CH-UA-Mobile", operation: "set", value: uaData.mobile ? "?1" : "?0" });
+  if (uaData.platform) headers.push({ header: "Sec-CH-UA-Platform", operation: "set", value: quoteHeader(uaData.platform) });
+  if (fullVersionList) headers.push({ header: "Sec-CH-UA-Full-Version-List", operation: "set", value: fullVersionList });
+  if (uaData.uaFullVersion) headers.push({ header: "Sec-CH-UA-Full-Version", operation: "set", value: quoteHeader(uaData.uaFullVersion) });
+  if (uaData.platformVersion) headers.push({ header: "Sec-CH-UA-Platform-Version", operation: "set", value: quoteHeader(uaData.platformVersion) });
+  if (uaData.architecture) headers.push({ header: "Sec-CH-UA-Arch", operation: "set", value: quoteHeader(uaData.architecture) });
+  if (uaData.bitness) headers.push({ header: "Sec-CH-UA-Bitness", operation: "set", value: quoteHeader(uaData.bitness) });
+  if (typeof uaData.model === "string") headers.push({ header: "Sec-CH-UA-Model", operation: "set", value: quoteHeader(uaData.model) });
+  return [{
+    id: 91001,
+    priority: 1,
+    action: { type: "modifyHeaders", requestHeaders: headers },
+    condition: {
+      regexFilter: "^https?://",
+      resourceTypes: ["main_frame", "sub_frame", "stylesheet", "script", "image", "font", "xmlhttprequest", "media", "other"],
+    },
+  }];
+}
+
+function quoteHeader(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function formatHeaderBrands(brands) {
+  if (!Array.isArray(brands)) return "";
+  return brands
+    .filter((item) => item && typeof item.brand === "string" && typeof item.version === "string")
+    .map((item) => `${quoteHeader(item.brand)};v=${quoteHeader(item.version)}`)
+    .join(", ");
 }
 
 async function sleep(ms) {
@@ -504,6 +660,13 @@ async function captureScreenshot(client, path) {
 function launchArgsFromPlan(plan, opts) {
   const args = plan.argv.filter((arg) => arg !== "--new-window" && !/^https:\/\/chatgpt\.com\/?$/i.test(arg));
   args.push("--remote-debugging-port=0", "--remote-allow-origins=*");
+  if (process.env.CLOAK_AUDIT_EXTRA_ARGS) {
+    const extraArgs = JSON.parse(process.env.CLOAK_AUDIT_EXTRA_ARGS);
+    if (!Array.isArray(extraArgs) || extraArgs.some((arg) => typeof arg !== "string")) {
+      throw new Error("CLOAK_AUDIT_EXTRA_ARGS must be a JSON string array");
+    }
+    args.push(...extraArgs);
+  }
   if (opts.headless) {
     args.push("--headless=new", "--window-size=1440,900", "--force-device-scale-factor=2");
   }
@@ -530,6 +693,7 @@ async function run() {
 
   runChecked(CLOAK, ["account", "create", opts.accountName, "--json"], { env, cwd: ROOT });
   const plan = JSON.parse(runChecked(CLOAK, ["launch", opts.accountName, "--dry-run", "--json"], { env, cwd: ROOT }));
+  const browserIdentityOverride = applyBrowserIdentityOverride(plan);
   if (plan.privacy_failures?.length) {
     throw new Error(`privacy gate inputs failed:\n${plan.privacy_failures.join("\n")}`);
   }
@@ -552,6 +716,7 @@ async function run() {
     locale: plan.locale,
     companion_page_spoof: companionPageSpoofEnabled(),
     extra_extensions: env.CLOAK_EXTRA_EXTENSIONS,
+    browser_identity_override: browserIdentityOverride,
     results: [],
   };
 

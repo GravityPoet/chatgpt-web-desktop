@@ -40,6 +40,39 @@ if [[ ! -x "$BIN" ]]; then
 fi
 [[ -n "$BIN" && -x "$BIN" ]] || { printf 'error: CloakBrowser binary not found under %s\n' "$CB" >&2; exit 1; }
 
+CLOAK_MAC_UA_VERSION="10_15_7"
+CLOAK_MAC_PLATFORM_VERSION="15.5.0"
+
+# Detect engine version from actual binary (matches Rust detect_engine_version)
+CLOAK_CHROME_MAJOR=""
+CLOAK_CHROME_FULL=""
+if chrome_version_output="$("$BIN" --version 2>/dev/null)"; then
+  if [[ "$chrome_version_output" =~ ([0-9]+)\.([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    CLOAK_CHROME_MAJOR="${BASH_REMATCH[1]}"
+    CLOAK_CHROME_FULL="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]}.${BASH_REMATCH[4]}"
+  fi
+fi
+if [[ -z "$CLOAK_CHROME_MAJOR" ]]; then
+  CLOAK_CHROME_MAJOR="145"
+  CLOAK_CHROME_FULL="145.0.0.0"
+fi
+
+CLOAK_USER_AGENT="Mozilla/5.0 (Macintosh; Intel Mac OS X $CLOAK_MAC_UA_VERSION) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/$CLOAK_CHROME_MAJOR.0.0.0 Safari/537.36"
+
+# Deterministic GPU renderer selection from seed (matches Rust gpu_renderer_for_seed)
+gpu_renderer_for_seed() {
+  local seed="$1"
+  local hash
+  hash="$(printf 'gpu:%s' "$seed" | /usr/bin/shasum -a 256 | cut -c1-8)"
+  local idx=$(( 16#$hash % 4 ))
+  case "$idx" in
+    0) printf 'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)' ;;
+    1) printf 'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)' ;;
+    2) printf 'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)' ;;
+    3) printf 'ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)' ;;
+  esac
+}
+
 ACCOUNT_BASE="${CLOAK_ACCOUNT_BASE:-$HOME/Library/Application Support/ChatGPT Cloak/Accounts}"
 UDD="$ACCOUNT_BASE/$name"
 if [[ -z "${DRY_RUN:-}" ]]; then
@@ -171,13 +204,67 @@ prepare_account_extension() {
   rm -rf "$EXT_RUNTIME"
   /usr/bin/ditto "$EXT_SRC" "$EXT_RUNTIME"
   chmod -R go-rwx "$EXT_RUNTIME" 2>/dev/null || true
+  cat > "$EXT_RUNTIME/browser-identity-main.js" <<EOF
+window.__cloakBrowserIdentity = {
+  "userAgent": "$CLOAK_USER_AGENT",
+  "platform": "MacIntel",
+  "uaData": {
+    "brands": [
+      { "brand": "Google Chrome", "version": "$CLOAK_CHROME_MAJOR" },
+      { "brand": "Chromium", "version": "$CLOAK_CHROME_MAJOR" },
+      { "brand": "Not)A;Brand", "version": "24" }
+    ],
+    "mobile": false,
+    "platform": "macOS",
+    "fullVersionList": [
+      { "brand": "Google Chrome", "version": "$CLOAK_CHROME_FULL" },
+      { "brand": "Chromium", "version": "$CLOAK_CHROME_FULL" },
+      { "brand": "Not)A;Brand", "version": "24.0.0.0" }
+    ],
+    "uaFullVersion": "$CLOAK_CHROME_FULL",
+    "platformVersion": "$CLOAK_MAC_PLATFORM_VERSION",
+    "architecture": "arm",
+    "bitness": "64",
+    "model": ""
+  }
+};
+EOF
+  sed 's/^window\./self./' "$EXT_RUNTIME/browser-identity-main.js" > "$EXT_RUNTIME/browser-identity-worker.js"
+  mkdir -p "$EXT_RUNTIME/rules"
+  cat > "$EXT_RUNTIME/rules/browser-identity-headers.json" <<EOF
+[
+  {
+    "id": 91001,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "User-Agent", "operation": "set", "value": "$CLOAK_USER_AGENT" },
+        { "header": "Sec-CH-UA", "operation": "set", "value": "\"Google Chrome\";v=\"$CLOAK_CHROME_MAJOR\", \"Chromium\";v=\"$CLOAK_CHROME_MAJOR\", \"Not)A;Brand\";v=\"24\"" },
+        { "header": "Sec-CH-UA-Mobile", "operation": "set", "value": "?0" },
+        { "header": "Sec-CH-UA-Platform", "operation": "set", "value": "\"macOS\"" },
+        { "header": "Sec-CH-UA-Full-Version-List", "operation": "set", "value": "\"Google Chrome\";v=\"$CLOAK_CHROME_FULL\", \"Chromium\";v=\"$CLOAK_CHROME_FULL\", \"Not)A;Brand\";v=\"24.0.0.0\"" },
+        { "header": "Sec-CH-UA-Full-Version", "operation": "set", "value": \"$CLOAK_CHROME_FULL\" },
+        { "header": "Sec-CH-UA-Platform-Version", "operation": "set", "value": \"$CLOAK_MAC_PLATFORM_VERSION\" },
+        { "header": "Sec-CH-UA-Arch", "operation": "set", "value": \"arm\" },
+        { "header": "Sec-CH-UA-Bitness", "operation": "set", "value": \"64\" },
+        { "header": "Sec-CH-UA-Model", "operation": "set", "value": \"\" }
+      ]
+    },
+    "condition": {
+      "regexFilter": "^https?://",
+      "resourceTypes": ["main_frame", "sub_frame", "stylesheet", "script", "image", "font", "xmlhttprequest", "media", "other"]
+    }
+  }
+]
+EOF
   if companion_page_spoof_enabled; then
     printf 'window.__cloakAccountSeed = "%s";\n' "$seed" > "$EXT_RUNTIME/account-seed-main.js"
   else
     printf 'window.__cloakAccountSeed = "";\n' > "$EXT_RUNTIME/account-seed-main.js"
     strip_companion_page_scripts "$EXT_RUNTIME/manifest.json"
   fi
-  chmod 600 "$EXT_RUNTIME/account-seed-main.js" 2>/dev/null || true
+  chmod 600 "$EXT_RUNTIME/account-seed-main.js" "$EXT_RUNTIME/browser-identity-main.js" "$EXT_RUNTIME/browser-identity-worker.js" "$EXT_RUNTIME/rules/browser-identity-headers.json" 2>/dev/null || true
 }
 
 strip_companion_page_scripts() {
@@ -197,6 +284,7 @@ with open(path, "r", encoding="utf-8") as f:
 data.pop("content_scripts", None)
 data.pop("host_permissions", None)
 data.pop("background", None)
+data.pop("declarative_net_request", None)
 data["permissions"] = [p for p in data.get("permissions", []) if p == "storage"]
 
 directory = os.path.dirname(path) or "."
@@ -553,11 +641,17 @@ args=(
   "--user-data-dir=$UDD"
   "--fingerprint=$seed"
   "--fingerprint-platform=macos"
+  "--user-agent=$CLOAK_USER_AGENT"
   "--load-extension=$load_extensions"
   "--disable-extensions-except=$load_extensions"
   "--no-first-run"
   "--no-default-browser-check"
   "--ignore-gpu-blocklist"
+  "--disable-blink-features=AutomationControlled"
+  "--fingerprint-brand-version=$CLOAK_CHROME_FULL"
+  "--fingerprint-platform-version=$CLOAK_MAC_PLATFORM_VERSION"
+  "--fingerprint-gpu-vendor=Google Inc. (Apple)"
+  "--fingerprint-gpu-renderer=$(gpu_renderer_for_seed "$seed")"
 )
 [[ -n "${TZ:-}" ]] && args+=("--fingerprint-timezone=$TZ")
 if [[ -n "$accept_lang" ]]; then

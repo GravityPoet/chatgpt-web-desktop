@@ -52,17 +52,19 @@ via `NSWorkspace setIcon:forFile:` and refreshes the Dock. Verified: the LaunchS
 icon is full-bleed green and survives a PWA relaunch. Re-run only if a Chromium upgrade recreates
 the shim from scratch.
 
-## Microphone & Camera (Voice)
+## Microphone, Camera & Passkey (TCC)
 
 CloakBrowser ships an ad-hoc Chromium whose `Info.plist` has no `NSMicrophoneUsageDescription`. macOS TCC terminates the process the instant ChatGPT voice input touches the microphone (`"Chromium" 意外退出`).
 
-Inject the usage strings and ad-hoc re-sign:
+The **same TCC rule breaks passkey sign-in**: a WebAuthn *hybrid transport* (phone-QR / caBLE) login touches CoreBluetooth, and with no `NSBluetoothAlwaysUsageDescription` the process is killed mid-flow — so ChatGPT silently falls back to a plugged-in USB security key. (The platform-authenticator / Touch-ID path is a separate limitation: it needs an Apple-granted restricted entitlement an ad-hoc binary cannot self-sign, so `isUVPAA` stays false regardless.)
+
+Inject the usage strings (microphone, camera, **Bluetooth**) and ad-hoc re-sign:
 
 ```bash
 ./packaging/patch-chromium.sh
 ```
 
-CloakBrowser upgrades replace Chromium and drop the keys again, so re-run after each upgrade. The PWA path's coalition leader differs from a custom launcher's, so verify voice once after any change.
+CloakBrowser upgrades replace Chromium and drop the keys again, so re-run after each upgrade — the auto-updater re-applies this patch to every staged candidate. The PWA path's coalition leader differs from a custom launcher's, so verify voice and phone-QR passkey once after any change.
 
 ## Timezone (companion extension)
 
@@ -89,9 +91,20 @@ Tested by driving the cloaked Chromium over CDP (minimal footprint: no `Runtime.
 `Page.enable`) against bot.sannysoft.com, CreepJS, BrowserScan, FingerprintJS, and a Cloudflare
 Turnstile page. Pass: `navigator.webdriver` hidden (all sannysoft rows green), `window.chrome`
 present, 5 plugins, WebRTC fully blocked (no IP leak), BrowserScan "Bot Detection: No Detection".
-Residual gaps: (1) **timezone ≠ IP** — fixed by the companion extension above; (2) WebGL leaks the
-real GPU (`Apple M4 Pro`); (3) high-entropy client hints leak the real OS (`Mac OS 26.5.1`) and full
-Chrome version. (2)/(3) are launch-flag knobs and remain out of reach on the PWA path.
+Residual gaps depend on the launch path. (1) **timezone ≠ IP** — fixed by the companion extension
+above on both paths. (2) WebGL GPU and (3) high-entropy client hints (real OS version, full Chrome
+version) are now **masked on the multi-account / picker path** via CloakBrowser's `--fingerprint-gpu-*`
+and `--fingerprint-*-version` flags: the GPU reports a per-seed Apple-Silicon Metal string
+(`ANGLE (Apple, ANGLE Metal Renderer: Apple M1–M4, Unspecified Version)`, vendor `Google Inc. (Apple)`)
+instead of the host's real `Apple M4 Pro`, and the client hints report a synthetic macOS version with
+a GREASE-correct full-version list. On the **daily PWA path** (2)/(3) stay out of reach — the Dock shim
+does not accept launch flags.
+
+Headed audit (`selftest/run-live-challenge-audit.mjs`, account path) is green on bot.sannysoft.com,
+BrowserScan ("No Detection"), BrowserLeaks WebRTC (no IP leak), CreepJS (0% headless / 0% stealth, live
+Metal GPU string), and deviceandbrowserinfo (CDP / WebGL / client-hint consistency all false). One
+honest residual: FingerprintPro still prints the OS as "Mac OS X 10.15.7" — the frozen UA-reduction
+token real Chrome also sends — but it computes a visitorId and does not block.
 
 ## Known limitations
 
@@ -107,21 +120,31 @@ For more than one ChatGPT account, the strong path is **not** the native profile
 switcher (those profiles share one process → one fingerprint/IP/timezone, so they
 stay linkable by device). Instead `packaging/launch-account.sh <name>` launches a
 **separate** CloakBrowser process per account, and `packaging/pick-account.sh`
-opens a native AppKit account picker over it (also wired to a double-clickable
-`~/Desktop/Cloak Picker.app`, detached — no Terminal window). The picker
+opens a native AppKit account picker over it (also wired to the installed
+`/Applications/Cloak Picker.app`, detached — no Terminal window). The picker
 falls back to the older osascript list if Swift is unavailable, and manages
 accounts in place with no terminal — new, rename (keeps the fingerprint), delete,
 region label, and the locale / proxy toggles below.
 
 Experimental cross-platform path: `cloak-cli` now provides the Rust behavior-equivalent
 account API and launch dry-run, and `cloak-picker/` contains the Tauri day-mode picker.
-Build the picker app with `cd cloak-picker && npm run tauri -- build`; the resulting
-`target/release/bundle/macos/Cloak Picker.app` is preferred by
-`packaging/pick-account.sh`. Raw `target/{release,debug}/cloak-picker` binaries are
+Build and install the picker app with `packaging/install-cloak-picker-app.sh`; it
+rebuilds the Tauri bundle, re-signs it, and atomically replaces
+`/Applications/Cloak Picker.app`. `packaging/pick-account.sh` prefers that installed
+app and falls back to `target/release/bundle/macos/Cloak Picker.app` for development.
+Raw `target/{release,debug}/cloak-picker` binaries are
 only used when `CLOAK_PICKER_RAW=1`, because they can open a blank WebView if frontend
 assets were not embedded by a Tauri build. Set
 `CLOAK_PICKER_TAURI=0` or `CLOAK_PICKER_LEGACY=1` to force the older Swift/osascript
 fallback.
+
+Because Cloak Picker **statically links `cloak-core`** (a Cargo path dependency), a change to
+`crates/cloak-core` does not reach the installed app until it is rebuilt — and the CloakBrowser
+auto-updater rebuilds the engine *binary*, never the Picker. `packaging/check-picker-fresh.sh`
+closes that gap: it content-hashes the Rust source the Picker embeds, stamps it at install time, and
+on every auto-update tick (and on demand) compares the two. Drift logs a warning plus a macOS
+notification carrying the one-line rebuild command; `check-picker-fresh.sh --rebuild` (or
+`CLOAK_PICKER_AUTO_REBUILD=1`) rebuilds and re-stamps in place.
 
 The Rust path keeps the current extension contract: `--load-extension` and
 `--disable-extensions-except` include the per-account `.cloak-companion`, every
@@ -215,5 +238,7 @@ GeoIP timezone (companion + `TZ`, main thread *and* workers), per-account locale
 **per-account proxy** (no-auth direct, authenticated via the local SOCKS5 relay,
 concurrent multi-region), and hands-off CloakBrowser auto-update
 (`packaging/update-chromium.sh` + launchd, SHA256-verified, self-test gated with
-rollback). Still out of reach on the PWA path: GPU / client-hint masking — that
-needs the flag-capable launcher, not the Dock shim.
+rollback, now also checking installed-Picker freshness against `cloak-core`). GPU /
+client-hint masking is covered on the multi-account picker path via CloakBrowser's
+fingerprint flags; it stays out of reach only on the **daily PWA path**, whose Dock
+shim does not accept launch flags.

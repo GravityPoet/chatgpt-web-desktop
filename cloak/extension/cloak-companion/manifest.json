@@ -3,8 +3,17 @@
   "name": "ChatGPT Cloak Companion",
   "version": "1.1.0",
   "description": "Match the browser timezone to your IP/proxy, removing the timezone-vs-IP mismatch fingerprint signal. Pick a zone or auto-match the current IP.",
-  "permissions": ["storage", "scripting", "webNavigation", "tabs"],
+  "permissions": ["storage", "scripting", "webNavigation", "tabs", "declarativeNetRequestWithHostAccess"],
   "host_permissions": ["<all_urls>"],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "browser_identity_headers",
+        "enabled": true,
+        "path": "rules/browser-identity-headers.json"
+      }
+    ]
+  },
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     {
@@ -19,7 +28,7 @@
       "all_frames": true,
       "run_at": "document_start",
       "world": "MAIN",
-      "js": ["account-seed-main.js", "spoof.js", "apply.js"]
+      "js": ["browser-identity-main.js", "account-seed-main.js", "spoof.js", "apply.js"]
     }
   ],
   "action": { "default_popup": "popup.html", "default_title": "Cloak Timezone" }
