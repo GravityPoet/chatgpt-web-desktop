@@ -38,9 +38,9 @@ pub const DEFAULT_ACCEPT_LANGUAGES: &[&str] = &["zh-CN", "en-US"];
 
 // --- macOS Safari/WebKit presets ---
 
-const MAC_SAFARI17_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15";
-const IPAD_SAFARI17_UA: &str = "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
-const IPHONE_SAFARI17_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+const MAC_SAFARI17_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
+const IPAD_SAFARI17_UA: &str = "Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+const IPHONE_SAFARI17_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
 // --- Windows Chromium/WebView2 presets ---
 
@@ -267,11 +267,8 @@ pub fn enhanced_privacy_script(
     } else {
         ("portrait-primary", 0)
     };
-    let webgl_renderer = if max_touch > 0 {
-        "Apple GPU"
-    } else {
-        "Apple M-Series GPU"
-    };
+    // Safari on Apple Silicon always reports "Apple GPU" regardless of touch
+    let webgl_renderer = "Apple GPU";
     let orientation_type_json = json_literal(orientation_type);
 
     format!(
