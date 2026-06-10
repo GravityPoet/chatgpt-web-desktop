@@ -12,5 +12,11 @@
   <string>Cloak Picker can be launched from Desktop and may read local picker resources.</string>
   <key>NSDownloadsFolderUsageDescription</key>
   <string>Cloak Picker may inspect local extension files selected for account isolation.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>ChatGPT voice input uses the microphone.</string>
+  <key>NSCameraUsageDescription</key>
+  <string>ChatGPT video and vision features use the camera.</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>Passkey sign-in uses Bluetooth to connect your phone or security key.</string>
 </dict>
 </plist>
