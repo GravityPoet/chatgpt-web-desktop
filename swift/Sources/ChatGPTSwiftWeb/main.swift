@@ -4001,8 +4001,8 @@ private enum FingerprintCatalog {
     static let defaultAcceptLanguages = ["zh-CN", "en-US"]
 
     private static let macSafari17UserAgent = defaultSafariUserAgent
-    private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
-    private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1"
+    private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
+    private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
 
     static let presets: [FingerprintProfile] = [
         FingerprintProfile(
@@ -4269,7 +4269,8 @@ private enum FingerprintCatalog {
             orientationType = "landscape-primary"
         }
         let orientationAngle = orientationType.hasPrefix("portrait") ? 0 : 90
-        let webGLRenderer = maxTouchPoints > 0 ? "Apple GPU" : "Apple M-Series GPU"
+        // Safari on Apple Silicon always reports "Apple GPU" regardless of touch
+        let webGLRenderer = "Apple GPU"
 
         return """
         (() => {
