@@ -9,12 +9,17 @@
 //   - answers the popup's "detect my IP zone" request.
 // The page-visible spoof itself lives in spoof.js (single source of truth).
 
+try { importScripts("browser-identity-worker.js"); } catch (_) {}
+
 const ZONE_RE = /^[A-Za-z]+(?:\/[A-Za-z0-9_+\-]+){1,2}$/;
+const BROWSER_IDENTITY_HEADER_RULE_ID = 91001;
 
 chrome.runtime.onInstalled.addListener(init);
 chrome.runtime.onStartup.addListener(init);
+installBrowserIdentityHeaderRules();
 
 async function init() {
+  await installBrowserIdentityHeaderRules();
   let { tz, auto } = await chrome.storage.local.get(["tz", "auto"]);
   if (!tz && auto !== false) {
     const detected = await detectIPTimezone();
@@ -74,4 +79,53 @@ async function detectIPTimezone() {
     } catch (_) { /* try next */ }
   }
   return null;
+}
+
+async function installBrowserIdentityHeaderRules() {
+  try {
+    const dnr = chrome.declarativeNetRequest;
+    const identity = self.__cloakBrowserIdentity;
+    if (!dnr || !identity || !identity.userAgent) return;
+
+    const headers = [
+      { header: "User-Agent", operation: "set", value: identity.userAgent },
+    ];
+    const uaData = identity.uaData || {};
+    const brands = formatBrands(uaData.brands);
+    const fullVersionList = formatBrands(uaData.fullVersionList);
+    if (brands) headers.push({ header: "Sec-CH-UA", operation: "set", value: brands });
+    headers.push({ header: "Sec-CH-UA-Mobile", operation: "set", value: uaData.mobile ? "?1" : "?0" });
+    if (uaData.platform) headers.push({ header: "Sec-CH-UA-Platform", operation: "set", value: quoteHeader(uaData.platform) });
+    if (fullVersionList) headers.push({ header: "Sec-CH-UA-Full-Version-List", operation: "set", value: fullVersionList });
+    if (uaData.uaFullVersion) headers.push({ header: "Sec-CH-UA-Full-Version", operation: "set", value: quoteHeader(uaData.uaFullVersion) });
+    if (uaData.platformVersion) headers.push({ header: "Sec-CH-UA-Platform-Version", operation: "set", value: quoteHeader(uaData.platformVersion) });
+    if (uaData.architecture) headers.push({ header: "Sec-CH-UA-Arch", operation: "set", value: quoteHeader(uaData.architecture) });
+    if (uaData.bitness) headers.push({ header: "Sec-CH-UA-Bitness", operation: "set", value: quoteHeader(uaData.bitness) });
+    if (typeof uaData.model === "string") headers.push({ header: "Sec-CH-UA-Model", operation: "set", value: quoteHeader(uaData.model) });
+
+    await dnr.updateSessionRules({
+      removeRuleIds: [BROWSER_IDENTITY_HEADER_RULE_ID],
+      addRules: [{
+        id: BROWSER_IDENTITY_HEADER_RULE_ID,
+        priority: 1,
+        action: { type: "modifyHeaders", requestHeaders: headers },
+        condition: {
+          regexFilter: "^https?://",
+          resourceTypes: ["main_frame", "sub_frame", "stylesheet", "script", "image", "font", "xmlhttprequest", "media", "other"],
+        },
+      }],
+    });
+  } catch (_) { /* header rules are best-effort; page spoof still applies */ }
+}
+
+function quoteHeader(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function formatBrands(brands) {
+  if (!Array.isArray(brands)) return "";
+  return brands
+    .filter((item) => item && typeof item.brand === "string" && typeof item.version === "string")
+    .map((item) => `${quoteHeader(item.brand)};v=${quoteHeader(item.version)}`)
+    .join(", ");
 }

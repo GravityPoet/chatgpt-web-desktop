@@ -31,7 +31,7 @@ set -euo pipefail
 #
 # Usage:  pick-account.sh        # opens the picker
 #         CLOAK_PICKER_TAURI=0 pick-account.sh    # force legacy Swift/osascript
-#   Tip: a double-clickable ~/Desktop/Cloak Picker.app already wraps this.
+#   Tip: /Applications/Cloak Picker.app is the preferred installed picker.
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/packaging/launch-account.sh"
@@ -46,10 +46,20 @@ if [[ "${CLOAK_PICKER_LEGACY:-0}" != "1" ]]; then
   export CLOAK_ACCOUNT_BASE="$ACCT_BASE"
 
   if [[ "${CLOAK_PICKER_TAURI:-1}" != "0" ]]; then
-    TAURI_APP="$ROOT/target/release/bundle/macos/Cloak Picker.app"
-    TAURI_APP_BIN="$TAURI_APP/Contents/MacOS/cloak-picker"
-    if [[ -x "$TAURI_APP_BIN" ]]; then
-      exec "$TAURI_APP_BIN"
+    TAURI_APP="${CLOAK_PICKER_APP:-}"
+    if [[ -z "$TAURI_APP" ]]; then
+      for CANDIDATE in \
+        "/Applications/Cloak Picker.app" \
+        "$ROOT/target/release/bundle/macos/Cloak Picker.app"
+      do
+        if [[ -x "$CANDIDATE/Contents/MacOS/cloak-picker" ]]; then
+          TAURI_APP="$CANDIDATE"
+          break
+        fi
+      done
+    fi
+    if [[ -n "$TAURI_APP" && -x "$TAURI_APP/Contents/MacOS/cloak-picker" ]]; then
+      exec "$TAURI_APP/Contents/MacOS/cloak-picker"
     fi
 
     # Raw cargo binaries can open a blank WebView when the frontend assets were

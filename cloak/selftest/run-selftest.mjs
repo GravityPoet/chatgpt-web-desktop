@@ -8,6 +8,7 @@ import { createServer } from "node:http";
 import {
   cpSync,
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -19,9 +20,22 @@ import { fileURLToPath } from "node:url";
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const HOME = process.env.HOME;
-const BIN = `${HOME}/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium`;
+const BIN = process.env.CLOAK_BROWSER_BIN || `${HOME}/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium`;
 const PROBE_PATH = join(__dir, "probe.html");
 const EXT_SOURCE = join(dirname(__dir), "extension", "cloak-companion");
+const BROWSER_IDENTITY = {
+  userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+  platform: "MacIntel",
+  uaData: {
+    brands: [
+      { brand: "Google Chrome", version: "149" },
+      { brand: "Chromium", version: "149" },
+      { brand: "Not)A;Brand", version: "24" },
+    ],
+    mobile: false,
+    platform: "macOS",
+  },
+};
 
 const defaults = {
   seed: "24680",
@@ -100,6 +114,7 @@ function stripCompanionPageScripts(manifestPath) {
   delete manifest.content_scripts;
   delete manifest.host_permissions;
   delete manifest.background;
+  delete manifest.declarative_net_request;
   manifest.permissions = ["storage"];
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 }
@@ -233,6 +248,9 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
   const dir = mkdtempSync(join(tmpdir(), "cloak-selftest-"));
   const extDir = join(dir, "cloak-companion");
   cpSync(EXT_SOURCE, extDir, { recursive: true });
+  writeFileSync(join(extDir, "browser-identity-main.js"), `window.__cloakBrowserIdentity = ${JSON.stringify(BROWSER_IDENTITY)};\n`);
+  writeFileSync(join(extDir, "browser-identity-worker.js"), `self.__cloakBrowserIdentity = ${JSON.stringify(BROWSER_IDENTITY)};\n`);
+  writeBrowserIdentityHeaderRules(extDir, BROWSER_IDENTITY);
   if (companionPageSpoofEnabled()) {
     writeFileSync(extDir + "/account-seed-main.js", `window.__cloakAccountSeed = ${JSON.stringify(String(seed))};\n`);
   } else {
@@ -247,6 +265,9 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
     "--remote-debugging-port=0",
     `--fingerprint=${seed}`,
     "--fingerprint-platform=macos",
+    `--user-agent=${BROWSER_IDENTITY.userAgent}`,
+    "--ignore-gpu-blocklist",
+    "--disable-blink-features=AutomationControlled",
     `--fingerprint-timezone=${opts.tz}`,
     "--no-first-run",
     "--no-default-browser-check",
@@ -343,6 +364,55 @@ async function runProbe(serverUrl, opts, seed, writeStorage) {
   }
 }
 
+function writeBrowserIdentityHeaderRules(extDir, identity) {
+  const rulesDir = join(extDir, "rules");
+  mkdirSync(rulesDir, { recursive: true });
+  writeFileSync(
+    join(rulesDir, "browser-identity-headers.json"),
+    `${JSON.stringify(browserIdentityHeaderRules(identity), null, 2)}\n`,
+  );
+}
+
+function browserIdentityHeaderRules(identity) {
+  if (!identity?.userAgent) return [];
+  const uaData = identity.uaData || {};
+  const headers = [
+    { header: "User-Agent", operation: "set", value: identity.userAgent },
+  ];
+  const brands = formatHeaderBrands(uaData.brands);
+  const fullVersionList = formatHeaderBrands(uaData.fullVersionList);
+  if (brands) headers.push({ header: "Sec-CH-UA", operation: "set", value: brands });
+  headers.push({ header: "Sec-CH-UA-Mobile", operation: "set", value: uaData.mobile ? "?1" : "?0" });
+  if (uaData.platform) headers.push({ header: "Sec-CH-UA-Platform", operation: "set", value: quoteHeader(uaData.platform) });
+  if (fullVersionList) headers.push({ header: "Sec-CH-UA-Full-Version-List", operation: "set", value: fullVersionList });
+  if (uaData.uaFullVersion) headers.push({ header: "Sec-CH-UA-Full-Version", operation: "set", value: quoteHeader(uaData.uaFullVersion) });
+  if (uaData.platformVersion) headers.push({ header: "Sec-CH-UA-Platform-Version", operation: "set", value: quoteHeader(uaData.platformVersion) });
+  if (uaData.architecture) headers.push({ header: "Sec-CH-UA-Arch", operation: "set", value: quoteHeader(uaData.architecture) });
+  if (uaData.bitness) headers.push({ header: "Sec-CH-UA-Bitness", operation: "set", value: quoteHeader(uaData.bitness) });
+  if (typeof uaData.model === "string") headers.push({ header: "Sec-CH-UA-Model", operation: "set", value: quoteHeader(uaData.model) });
+  return [{
+    id: 91001,
+    priority: 1,
+    action: { type: "modifyHeaders", requestHeaders: headers },
+    condition: {
+      regexFilter: "^https?://",
+      resourceTypes: ["main_frame", "sub_frame", "stylesheet", "script", "image", "font", "xmlhttprequest", "media", "other"],
+    },
+  }];
+}
+
+function quoteHeader(value) {
+  return `"${String(value).replace(/\\/g, "\\\\").replace(/"/g, "\\\"")}"`;
+}
+
+function formatHeaderBrands(brands) {
+  if (!Array.isArray(brands)) return "";
+  return brands
+    .filter((item) => item && typeof item.brand === "string" && typeof item.version === "string")
+    .map((item) => `${quoteHeader(item.brand)};v=${quoteHeader(item.version)}`)
+    .join(", ");
+}
+
 async function runProbeWithRetry(label, serverUrl, opts, seed, writeStorage) {
   const maxAttempts = opts.keep ? 1 : 2;
   let lastError;
@@ -379,12 +449,20 @@ function addProbeChecks(checks, label, probe, opts) {
     hard("companion page spoof is disabled", probe.cloak?.fingerprintInstalled !== true, JSON.stringify(probe.cloak || {}));
   }
   const macUA = /Mac OS X/.test(probe.userAgent || "");
+  const macUAVersion = /Mac OS X 10_15_7/.test(probe.userAgent || "");
   const macPlatform = probe.platform === "MacIntel";
-  const macCH = !probe.uaData || probe.uaData.platform === "macOS";
+  const macCH = !probe.uaData || (probe.uaData.platform === "macOS" && !("platformVersion" in probe.uaData));
   hard(
     "UA / platform / UA-CH are coherent Mac",
-    macUA && macPlatform && macCH,
-    `UA mac=${macUA} platform=${probe.platform} CH=${probe.uaData?.platform ?? "n/a"}`
+    macUA && macUAVersion && macPlatform && macCH,
+    `UA mac=${macUA} ua10157=${macUAVersion} platform=${probe.platform} CH=${probe.uaData?.platform ?? "n/a"} ${probe.uaData?.platformVersion ?? "n/a"}`
+  );
+  hard(
+    "headless-like APIs are present",
+    probe.headless_apis?.contentIndex === true
+      && probe.headless_apis?.contacts === true
+      && probe.headless_apis?.downlinkMax === true,
+    JSON.stringify(probe.headless_apis || {})
   );
 
   hard("main timezone follows expected exit", probe.main_tz === opts.expectTimezone, probe.main_tz);
@@ -507,6 +585,7 @@ async function main() {
     const report = {
       ts: Date.now(),
       verdict: hardFails.length === 0 ? "PASS" : "FAIL",
+      browser_binary: BIN,
       options: opts,
       single,
       pair,

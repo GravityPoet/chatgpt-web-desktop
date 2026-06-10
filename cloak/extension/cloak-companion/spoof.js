@@ -14,6 +14,8 @@ window.__cloakSpoof = function (tz, fpSeed) {
 
     var st = (window.__cloakState = { tz: tz || null, fpSeed: fpSeed ? String(fpSeed) : "" });
     if (tz) window.__cloakTZ = tz;
+    installBrowserIdentitySpoof();
+    installHeadlessSurfaceSpoof();
 
     var RealDTF = Intl.DateTimeFormat;
     var WD = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -91,6 +93,174 @@ window.__cloakSpoof = function (tz, fpSeed) {
     installFingerprintSpoof(st);
   } catch (_) { /* fail open: never break the page */ }
 };
+
+/// Synthesize a full browser identity from navigator.userAgent.
+/// Used when __cloakBrowserIdentity is not injected (PWA main profile path).
+/// Reads the native UA which already reflects the real engine version,
+/// so it auto-follows CloakBrowser engine upgrades — zero Rust dependency.
+function synthesizeIdentityFromUA() {
+  try {
+    var ua = navigator.userAgent;
+    if (!ua) return null;
+    var match = ua.match(/Chrome\/(\d+)/);
+    if (!match) return null;
+    var major = match[1];
+    // Full version from UA: Chrome reports "Chrome/145.0.0.0" (rounded), use that.
+    var fullMatch = ua.match(/Chrome\/([\d.]+)/);
+    var full = fullMatch ? fullMatch[1] : major + ".0.0.0";
+    return {
+      userAgent: ua,
+      platform: "MacIntel",
+      uaData: {
+        brands: [
+          { brand: "Google Chrome", version: major },
+          { brand: "Chromium", version: major },
+          { brand: "Not)A;Brand", version: "24" },
+        ],
+        mobile: false,
+        platform: "macOS",
+        fullVersionList: [
+          { brand: "Google Chrome", version: full },
+          { brand: "Chromium", version: full },
+          { brand: "Not)A;Brand", version: "24.0.0.0" },
+        ],
+        uaFullVersion: full,
+        platformVersion: "15.5.0",
+        architecture: "arm",
+        bitness: "64",
+        model: "",
+      },
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function installBrowserIdentitySpoof() {
+  try {
+    if (window.__cloakBrowserIdentityInstalled) return;
+    var identity = window.__cloakBrowserIdentity || synthesizeIdentityFromUA();
+    if (!identity || !identity.userAgent) return;
+    window.__cloakBrowserIdentityInstalled = true;
+
+    function clone(value) {
+      return value == null ? value : JSON.parse(JSON.stringify(value));
+    }
+    function defineGetter(obj, name, getter) {
+      try { Object.defineProperty(obj, name, { get: getter, configurable: true }); } catch (_) {}
+    }
+
+    var navProto = window.Navigator && Navigator.prototype;
+    if (navProto) {
+      defineGetter(navProto, "userAgent", function () { return identity.userAgent; });
+      if (identity.platform) {
+        defineGetter(navProto, "platform", function () { return identity.platform; });
+      }
+    }
+
+    if (identity.uaData && navProto) {
+      var uaData = {
+        get brands() { return clone(identity.uaData.brands || []); },
+        get mobile() { return !!identity.uaData.mobile; },
+        get platform() { return identity.uaData.platform || "macOS"; },
+        getHighEntropyValues: function (hints) {
+          var result = {
+            brands: clone(identity.uaData.brands || []),
+            mobile: !!identity.uaData.mobile,
+            platform: identity.uaData.platform || "macOS",
+          };
+          var keys = Array.isArray(hints) ? hints : [];
+          for (var i = 0; i < keys.length; i++) {
+            var key = keys[i];
+            if (Object.prototype.hasOwnProperty.call(identity.uaData, key)) {
+              result[key] = clone(identity.uaData[key]);
+            }
+          }
+          return Promise.resolve(result);
+        },
+        toJSON: function () {
+          return {
+            brands: clone(identity.uaData.brands || []),
+            mobile: !!identity.uaData.mobile,
+            platform: identity.uaData.platform || "macOS",
+          };
+        },
+      };
+      try { Object.defineProperty(uaData.getHighEntropyValues, "name", { value: "getHighEntropyValues" }); } catch (_) {}
+      defineGetter(navProto, "userAgentData", function () { return uaData; });
+    }
+  } catch (_) {}
+}
+
+function installHeadlessSurfaceSpoof() {
+  try {
+    if (window.__cloakHeadlessSurfaceInstalled) return;
+    window.__cloakHeadlessSurfaceInstalled = true;
+
+    function defineGetter(obj, name, getter) {
+      try { Object.defineProperty(obj, name, { get: getter, configurable: true }); } catch (_) {}
+    }
+    function defineValue(obj, name, value) {
+      try { Object.defineProperty(obj, name, { value: value, configurable: true, writable: false }); } catch (_) {}
+    }
+
+    if (typeof window.ContentIndex === "undefined") {
+      defineValue(window, "ContentIndex", function ContentIndex() {});
+    }
+
+    var navProto = window.Navigator && Navigator.prototype;
+    if (typeof window.ContactsManager === "undefined") {
+      defineValue(window, "ContactsManager", function ContactsManager() {});
+      try {
+        Object.defineProperty(window.ContactsManager.prototype, Symbol.toStringTag, {
+          value: "ContactsManager",
+          configurable: true,
+        });
+      } catch (_) {}
+    }
+
+    if (navProto && !("contacts" in navigator)) {
+      var contacts = Object.create(window.ContactsManager ? window.ContactsManager.prototype : null);
+      try {
+        Object.defineProperties(contacts, {
+          getProperties: {
+            value: function getProperties() {
+              return Promise.resolve(["name", "email", "tel", "address", "icon"]);
+            },
+            configurable: true,
+          },
+          select: {
+            value: function select() {
+              var ErrorCtor = window.DOMException || Error;
+              return Promise.reject(new ErrorCtor("Permission denied", "NotAllowedError"));
+            },
+            configurable: true,
+          },
+        });
+      } catch (_) {
+        contacts = {
+        getProperties: function () {
+          return Promise.resolve(["name", "email", "tel", "address", "icon"]);
+        },
+        select: function () {
+          var ErrorCtor = window.DOMException || Error;
+          return Promise.reject(new ErrorCtor("Permission denied", "NotAllowedError"));
+        },
+        };
+      }
+      defineGetter(navProto, "contacts", function () { return contacts; });
+    }
+
+    var connection = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+    if (connection && typeof connection.downlinkMax === "undefined") {
+      defineGetter(connection, "downlinkMax", function () { return 10; });
+      var connectionProto = Object.getPrototypeOf(connection);
+      if (connectionProto) {
+        defineGetter(connectionProto, "downlinkMax", function () { return 10; });
+      }
+    }
+  } catch (_) {}
+}
 
 function installFingerprintSpoof(st) {
   try {
@@ -259,17 +429,6 @@ function installFingerprintSpoof(st) {
           });
         };
       });
-    }
-
-    var realToString = Function.prototype.toString;
-    if (!realToString.__cloakWrapped) {
-      Function.prototype.toString = function () {
-        for (var i = 0; i < originals.length; i++) {
-          if (this === originals[i][0]) return realToString.call(originals[i][1]);
-        }
-        return realToString.call(this);
-      };
-      try { Object.defineProperty(Function.prototype.toString, "__cloakWrapped", { value: true }); } catch (_) {}
     }
   } catch (_) {}
 }

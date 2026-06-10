@@ -22,6 +22,93 @@ use walkdir::WalkDir;
 
 const CHATGPT_URL: &str = "https://chatgpt.com/";
 const RELAY_PLACEHOLDER: &str = "socks5://127.0.0.1:<relay-port>";
+const CLOAK_CHROME_MAJOR_FALLBACK: &str = "145";
+const CLOAK_MAC_UA_VERSION: &str = "10_15_7";
+const CLOAK_MAC_PLATFORM_VERSION: &str = "15.5.0";
+
+/// Apple Silicon GPU renderer pool — base chips only, coherent with 8-core hardwareConcurrency.
+/// Pro/Max/Ultra variants excluded to avoid "M4 Max + 8 cores" inconsistency.
+/// Format is the exact ANGLE/Metal string a real Apple-Silicon Chrome reports via
+/// UNMASKED_RENDERER_WEBGL (verified against the live binary). Apple Silicon always
+/// uses the Metal backend, never OpenGL — an "OpenGL 4.1" suffix here would be an
+/// impossible/fake string that CreepJS and BrowserScan flag instantly.
+const CLOAK_GPU_RENDERERS: &[&str] = &[
+    "ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)",
+    "ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)",
+    "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+    "ANGLE (Apple, ANGLE Metal Renderer: Apple M4, Unspecified Version)",
+];
+
+/// Deterministic GPU renderer selection from seed. Sha256("gpu:"+seed) mod pool len.
+fn gpu_renderer_for_seed(seed: &str) -> &'static str {
+    let digest = Sha256::digest(format!("gpu:{seed}").as_bytes());
+    let idx = u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]]) as usize;
+    CLOAK_GPU_RENDERERS[idx % CLOAK_GPU_RENDERERS.len()]
+}
+
+/// Detected engine version from the actual CloakBrowser binary.
+#[derive(Debug, Clone)]
+struct EngineVersion {
+    major: String,
+    full: String,
+}
+
+impl EngineVersion {
+    fn fallback() -> Self {
+        Self {
+            major: CLOAK_CHROME_MAJOR_FALLBACK.to_string(),
+            full: format!("{CLOAK_CHROME_MAJOR_FALLBACK}.0.0.0"),
+        }
+    }
+}
+
+/// Detect the Chrome major version from the actual CloakBrowser binary.
+/// Runs `Chromium --version`, parses "Chromium 145.0.7632.109" → major="145", full="145.0.7632.109".
+/// Falls back to path-based detection (directory name like `chromium-145`), then to the compile-time constant.
+fn detect_engine_version(browser_binary: &Path) -> EngineVersion {
+    // Strategy 1: run --version
+    if let Ok(output) = Command::new(browser_binary)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if let Some(version) = parse_chromium_version(&stdout) {
+            return version;
+        }
+    }
+    // Strategy 2: extract from binary path (e.g. .../chromium-145/...)
+    if let Some(version) = extract_version_from_path(browser_binary) {
+        return version;
+    }
+    // Strategy 3: fallback constant
+    EngineVersion::fallback()
+}
+
+/// Parse "Chromium 145.0.7632.109" or "Chromium.app ... 145.0.7632.109" → EngineVersion
+fn parse_chromium_version(output: &str) -> Option<EngineVersion> {
+    let re = Regex::new(r"(\d+)\.(\d+)\.(\d+)\.(\d+)").ok()?;
+    let caps = re.captures(output)?;
+    let major = caps.get(1)?.as_str().to_string();
+    let full = format!("{}.{}.{}.{}", &caps[1], &caps[2], &caps[3], &caps[4]);
+    Some(EngineVersion { major, full })
+}
+
+/// Try to extract major version from binary path components like `chromium-145`
+fn extract_version_from_path(path: &Path) -> Option<EngineVersion> {
+    let re = Regex::new(r"chromium[-_](\d+)").ok()?;
+    for ancestor in path.ancestors() {
+        let name = ancestor.file_name()?.to_string_lossy();
+        if let Some(caps) = re.captures(&name) {
+            let major = caps.get(1)?.as_str().to_string();
+            let full = format!("{major}.0.0.0");
+            return Some(EngineVersion { major, full });
+        }
+    }
+    None
+}
 
 #[derive(Debug, Error)]
 pub enum CloakError {
@@ -140,6 +227,7 @@ pub struct LaunchPlan {
     pub proxy: ProxyPlan,
     pub geo: GeoPlan,
     pub locale: Option<String>,
+    pub browser_identity: Value,
     pub argv: Vec<String>,
     pub privacy_failures: Vec<String>,
 }
@@ -381,6 +469,7 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
     let extension_runtime_path = profile_path.join(".cloak-companion");
     let extension_plan = discover_extra_extensions(config, &profile_path, &extension_runtime_path)?;
     let browser_binary = resolve_browser_binary(config)?;
+    let engine = detect_engine_version(&browser_binary);
 
     let region = read_first_line(&profile_path.join(".cloak-region"))?;
     let proxy_raw = read_first_line(&profile_path.join(".cloak-proxy"))?;
@@ -455,18 +544,45 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
         None
     };
 
+    let browser_identity = browser_identity_plan(&engine);
+
+    // C5: Privacy gate — version consistency assertion (UA major == engine major)
+    let ua_major = browser_identity
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .and_then(|ua| {
+            let re = Regex::new(r"Chrome/(\d+)").ok()?;
+            let caps = re.captures(ua)?;
+            Some(caps.get(1)?.as_str().to_string())
+        });
+    if let Some(ref major) = ua_major {
+        if *major != engine.major {
+            privacy_failures.push(format!(
+                "版本不一致：UA major={} 但引擎 major={}。这会导致 TLS/JA3 vs UA 矛盾。",
+                major, engine.major
+            ));
+        }
+    }
+
+    let user_agent = browser_identity
+        .get("userAgent")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
     let load_extensions = join_extension_paths(&extension_plan.load_extension_paths);
     let mut argv = vec![
         format!("--user-data-dir={}", profile_path.display()),
         format!("--fingerprint={seed}"),
         format!("--fingerprint-platform={}", fingerprint_platform()),
+        format!("--user-agent={user_agent}"),
         format!("--load-extension={load_extensions}"),
         format!("--disable-extensions-except={load_extensions}"),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--ignore-gpu-blocklist".to_string(),
+        "--disable-blink-features=AutomationControlled".to_string(),
     ];
-    append_native_fingerprint_args(&mut argv, &geo, locale.as_deref());
+    append_native_fingerprint_args(&mut argv, &geo, locale.as_deref(), &engine, &seed);
     if let Some(proxy_arg) = &proxy_config.browser_arg {
         argv.push(format!("--proxy-server={proxy_arg}"));
     }
@@ -491,6 +607,7 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
         },
         geo,
         locale,
+        browser_identity,
         argv,
         privacy_failures,
     })
@@ -746,9 +863,35 @@ fn prepare_companion_extension(
     } else {
         "window.__cloakAccountSeed = \"\";\n".to_string()
     };
+    let identity_script = format!(
+        "window.__cloakBrowserIdentity = {};\n",
+        serde_json::to_string(&plan.browser_identity)?
+    );
+    let worker_identity_script = format!(
+        "self.__cloakBrowserIdentity = {};\n",
+        serde_json::to_string(&plan.browser_identity)?
+    );
+    let header_rules = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&browser_identity_header_rules(&plan.browser_identity))?
+    );
     write_secret_atomic(
         &plan.extension_runtime_path.join("account-seed-main.js"),
         &seed_script,
+    )?;
+    write_secret_atomic(
+        &plan.extension_runtime_path.join("browser-identity-main.js"),
+        &identity_script,
+    )?;
+    write_secret_atomic(
+        &plan.extension_runtime_path.join("browser-identity-worker.js"),
+        &worker_identity_script,
+    )?;
+    write_secret_atomic(
+        &plan
+            .extension_runtime_path
+            .join("rules/browser-identity-headers.json"),
+        &header_rules,
     )?;
     if !page_spoof_enabled {
         strip_companion_page_scripts(&plan.extension_runtime_path.join("manifest.json"))?;
@@ -1373,7 +1516,8 @@ fn primary_locale_from_accept_language(accept_language: &str) -> &str {
         .trim()
 }
 
-fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale: Option<&str>) {
+fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale: Option<&str>, engine: &EngineVersion, seed: &str) {
+    // Existing: timezone + locale + webrtc
     if let Some(tz) = geo.timezone.as_deref().filter(|value| !value.is_empty()) {
         argv.push(format!("--fingerprint-timezone={tz}"));
     }
@@ -1386,12 +1530,162 @@ fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale:
     if let Some(exit_ip) = geo.exit_ip.as_deref().filter(|value| !value.is_empty()) {
         argv.push(format!("--fingerprint-webrtc-ip={exit_ip}"));
     }
+    // New: brand-version, platform-version, GPU vendor/renderer (C2+C3)
+    argv.push(format!("--fingerprint-brand-version={full}", full = engine.full));
+    argv.push(format!("--fingerprint-platform-version={pv}", pv = CLOAK_MAC_PLATFORM_VERSION));
+    argv.push("--fingerprint-gpu-vendor=Google Inc. (Apple)".to_string());
+    argv.push(format!("--fingerprint-gpu-renderer={renderer}", renderer = gpu_renderer_for_seed(seed)));
 }
 
 fn valid_tz(tz: &str) -> bool {
     Regex::new(r"^[A-Za-z]+/[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)?$")
         .expect("timezone regex")
         .is_match(tz)
+}
+
+fn browser_identity_plan(engine: &EngineVersion) -> Value {
+    serde_json::json!({
+        "userAgent": format!(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X {CLOAK_MAC_UA_VERSION}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36",
+            major = engine.major
+        ),
+        "platform": "MacIntel",
+        "uaData": {
+            "brands": [
+                { "brand": "Google Chrome", "version": &engine.major },
+                { "brand": "Chromium", "version": &engine.major },
+                { "brand": "Not)A;Brand", "version": "24" }
+            ],
+            "mobile": false,
+            "platform": "macOS",
+            "fullVersionList": [
+                { "brand": "Google Chrome", "version": &engine.full },
+                { "brand": "Chromium", "version": &engine.full },
+                { "brand": "Not)A;Brand", "version": "24.0.0.0" }
+            ],
+            "uaFullVersion": &engine.full,
+            "platformVersion": CLOAK_MAC_PLATFORM_VERSION,
+            "architecture": "arm",
+            "bitness": "64",
+            "model": ""
+        }
+    })
+}
+
+fn browser_identity_header_rules(identity: &Value) -> Value {
+    let Some(user_agent) = identity.get("userAgent").and_then(Value::as_str) else {
+        return Value::Array(vec![]);
+    };
+    let ua_data = identity.get("uaData").unwrap_or(&Value::Null);
+    let mut headers = vec![serde_json::json!({
+        "header": "User-Agent",
+        "operation": "set",
+        "value": user_agent,
+    })];
+    if let Some(brands) = format_header_brands(ua_data.get("brands")) {
+        headers.push(serde_json::json!({
+            "header": "Sec-CH-UA",
+            "operation": "set",
+            "value": brands,
+        }));
+    }
+    headers.push(serde_json::json!({
+        "header": "Sec-CH-UA-Mobile",
+        "operation": "set",
+        "value": if ua_data.get("mobile").and_then(Value::as_bool).unwrap_or(false) { "?1" } else { "?0" },
+    }));
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Platform",
+        ua_data.get("platform").and_then(Value::as_str),
+    );
+    if let Some(full_version_list) = format_header_brands(ua_data.get("fullVersionList")) {
+        headers.push(serde_json::json!({
+            "header": "Sec-CH-UA-Full-Version-List",
+            "operation": "set",
+            "value": full_version_list,
+        }));
+    }
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Full-Version",
+        ua_data.get("uaFullVersion").and_then(Value::as_str),
+    );
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Platform-Version",
+        ua_data.get("platformVersion").and_then(Value::as_str),
+    );
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Arch",
+        ua_data.get("architecture").and_then(Value::as_str),
+    );
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Bitness",
+        ua_data.get("bitness").and_then(Value::as_str),
+    );
+    push_header_if_string(
+        &mut headers,
+        "Sec-CH-UA-Model",
+        ua_data.get("model").and_then(Value::as_str),
+    );
+    serde_json::json!([{
+        "id": 91001,
+        "priority": 1,
+        "action": {
+            "type": "modifyHeaders",
+            "requestHeaders": headers,
+        },
+        "condition": {
+            "regexFilter": "^https?://",
+            "resourceTypes": [
+                "main_frame",
+                "sub_frame",
+                "stylesheet",
+                "script",
+                "image",
+                "font",
+                "xmlhttprequest",
+                "media",
+                "other"
+            ],
+        },
+    }])
+}
+
+fn push_header_if_string(headers: &mut Vec<Value>, name: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        headers.push(serde_json::json!({
+            "header": name,
+            "operation": "set",
+            "value": quote_header(value),
+        }));
+    }
+}
+
+fn quote_header(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn format_header_brands(value: Option<&Value>) -> Option<String> {
+    let brands = value?.as_array()?;
+    let items = brands
+        .iter()
+        .filter_map(|item| {
+            Some(format!(
+                "{};v={}",
+                quote_header(item.get("brand")?.as_str()?),
+                quote_header(item.get("version")?.as_str()?)
+            ))
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        None
+    } else {
+        Some(items.join(", "))
+    }
 }
 
 fn region_matches(label: &str, country: &str, tz: &str) -> bool {
@@ -1450,6 +1744,7 @@ fn strip_companion_page_scripts(manifest_path: &Path) -> Result<()> {
         object.remove("content_scripts");
         object.remove("host_permissions");
         object.remove("background");
+        object.remove("declarative_net_request");
         object.insert(
             "permissions".to_string(),
             Value::Array(vec![Value::String("storage".to_string())]),
@@ -1676,6 +1971,7 @@ mod tests {
     #[test]
     fn native_fingerprint_args_follow_cloakbrowser_wrapper_contract() {
         let mut argv = Vec::new();
+        let engine = EngineVersion::fallback();
         append_native_fingerprint_args(
             &mut argv,
             &GeoPlan {
@@ -1684,18 +1980,28 @@ mod tests {
                 timezone: Some("Asia/Tokyo".to_string()),
             },
             Some("ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"),
+            &engine,
+            "54321",
         );
 
-        assert_eq!(
-            argv,
-            vec![
-                "--fingerprint-timezone=Asia/Tokyo",
-                "--lang=ja-JP",
-                "--fingerprint-locale=ja-JP",
-                "--accept-lang=ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
-                "--fingerprint-webrtc-ip=203.0.113.24",
-            ]
-        );
+        let expected: Vec<String> = vec![
+            "--fingerprint-timezone=Asia/Tokyo",
+            "--lang=ja-JP",
+            "--fingerprint-locale=ja-JP",
+            "--accept-lang=ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7",
+            "--fingerprint-webrtc-ip=203.0.113.24",
+            "--fingerprint-brand-version=145.0.0.0",
+            "--fingerprint-platform-version=15.5.0",
+            "--fingerprint-gpu-vendor=Google Inc. (Apple)",
+        ]
+        .into_iter()
+        .map(String::from)
+        .chain(std::iter::once(format!(
+            "--fingerprint-gpu-renderer={}",
+            gpu_renderer_for_seed("54321")
+        )))
+        .collect::<Vec<_>>();
+        assert_eq!(argv, expected);
     }
 
     #[test]
@@ -1779,6 +2085,60 @@ mod tests {
     }
 
     #[test]
+    fn chromium_version_parsing_handles_standard_output() {
+        let v = parse_chromium_version("Chromium 145.0.7632.109").unwrap();
+        assert_eq!(v.major, "145");
+        assert_eq!(v.full, "145.0.7632.109");
+
+        let v2 = parse_chromium_version("Chromium.app 149.0.7700.0 Something").unwrap();
+        assert_eq!(v2.major, "149");
+        assert_eq!(v2.full, "149.0.7700.0");
+    }
+
+    #[test]
+    fn chromium_version_parsing_returns_none_for_no_version() {
+        assert!(parse_chromium_version("no version here").is_none());
+        assert!(parse_chromium_version("").is_none());
+    }
+
+    #[test]
+    fn extract_version_from_path_finds_chromium_dir() {
+        let path = Path::new("/home/user/.cloakbrowser/chromium-145/Chromium.app/Contents/MacOS/Chromium");
+        let v = extract_version_from_path(path).unwrap();
+        assert_eq!(v.major, "145");
+
+        let path2 = Path::new("/home/user/.cloakbrowser/chromium-149/chrome");
+        let v2 = extract_version_from_path(path2).unwrap();
+        assert_eq!(v2.major, "149");
+    }
+
+    #[test]
+    fn gpu_renderer_pool_is_deterministic_and_diverse() {
+        // Same seed → same renderer
+        let r1 = gpu_renderer_for_seed("54321");
+        let r2 = gpu_renderer_for_seed("54321");
+        assert_eq!(r1, r2);
+
+        // Different seeds should hit different renderers (with 4 slots, 5 tries should get ≥2)
+        let mut seen = std::collections::HashSet::new();
+        for seed in &["11111", "22222", "33333", "44444", "54321"] {
+            seen.insert(gpu_renderer_for_seed(seed));
+        }
+        assert!(seen.len() >= 2, "GPU pool collision too high: only {} unique from 5 seeds", seen.len());
+
+        // All renderers use the real Apple-Silicon Metal format (not the Intel-Mac
+        // OpenGL backend) — matching what the live binary actually reports.
+        for seed in &["10000", "50000", "99999", "12345"] {
+            let r = gpu_renderer_for_seed(seed);
+            assert!(
+                r.starts_with("ANGLE (Apple, ANGLE Metal Renderer: Apple M")
+                    && r.ends_with(", Unspecified Version)"),
+                "unexpected renderer format: {r}"
+            );
+        }
+    }
+
+    #[test]
     fn companion_prepare_writes_seed_and_keeps_page_scripts_when_enabled() {
         let dir = tempfile::tempdir().unwrap();
         let extension_source = dir.path().join("extension");
@@ -1824,6 +2184,7 @@ mod tests {
                 timezone: None,
             },
             locale: None,
+            browser_identity: browser_identity_plan(&EngineVersion::fallback()),
             argv: Vec::new(),
             privacy_failures: Vec::new(),
         };
@@ -1834,6 +2195,18 @@ mod tests {
             fs::read_to_string(plan.extension_runtime_path.join("account-seed-main.js")).unwrap(),
             "window.__cloakAccountSeed = \"28041\";\n"
         );
+        assert!(fs::read_to_string(plan.extension_runtime_path.join("browser-identity-main.js"))
+            .unwrap()
+            .contains("Chrome/145.0.0.0"));
+        let header_rules: Value = serde_json::from_str(
+            &fs::read_to_string(
+                plan.extension_runtime_path
+                    .join("rules/browser-identity-headers.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(header_rules.to_string().contains("Sec-CH-UA"));
         let manifest: Value =
             serde_json::from_str(&fs::read_to_string(plan.extension_runtime_path.join("manifest.json")).unwrap())
                 .unwrap();
@@ -1850,11 +2223,12 @@ mod tests {
             &manifest,
             r#"{
               "manifest_version": 3,
-              "permissions": ["storage", "scripting", "tabs"],
-              "host_permissions": ["<all_urls>"],
-              "background": { "service_worker": "background.js" },
-              "content_scripts": [{ "matches": ["https://*/*"], "js": ["spoof.js"] }]
-            }"#,
+	              "permissions": ["storage", "scripting", "tabs"],
+	              "host_permissions": ["<all_urls>"],
+	              "background": { "service_worker": "background.js" },
+	              "declarative_net_request": { "rule_resources": [] },
+	              "content_scripts": [{ "matches": ["https://*/*"], "js": ["spoof.js"] }]
+	            }"#,
         )
         .unwrap();
 
@@ -1863,6 +2237,7 @@ mod tests {
         assert!(stripped.get("content_scripts").is_none());
         assert!(stripped.get("host_permissions").is_none());
         assert!(stripped.get("background").is_none());
+        assert!(stripped.get("declarative_net_request").is_none());
         assert_eq!(stripped.get("permissions").unwrap(), &Value::Array(vec![Value::String("storage".to_string())]));
     }
 
