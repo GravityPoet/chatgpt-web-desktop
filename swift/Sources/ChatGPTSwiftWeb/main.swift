@@ -4001,8 +4001,9 @@ private enum FingerprintCatalog {
     static let defaultAcceptLanguages = ["zh-CN", "en-US"]
 
     private static let macSafari17UserAgent = defaultSafariUserAgent
-    private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
-    private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
+    // iOS/iPadOS 26 freezes the UA OS token at 18_6 (like macOS freezes 10_15_7); the real OS major lives only in Version/ (26.0). Real devices report OS 18_6 — do NOT "correct" it to 26_0, that would be a detectable fake.
+    private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
+    private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
 
     static let presets: [FingerprintProfile] = [
         FingerprintProfile(
