@@ -39,8 +39,9 @@ pub const DEFAULT_ACCEPT_LANGUAGES: &[&str] = &["zh-CN", "en-US"];
 // --- macOS Safari/WebKit presets ---
 
 const MAC_SAFARI17_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15";
-const IPAD_SAFARI17_UA: &str = "Mozilla/5.0 (iPad; CPU OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
-const IPHONE_SAFARI17_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 26_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+// iOS/iPadOS 26 freezes the UA OS token at 18_6 (like macOS freezes 10_15_7); the real OS major lives only in Version/ (26.0). Real devices report OS 18_6 — do NOT "correct" it to 26_0, that would be a detectable fake.
+const IPAD_SAFARI17_UA: &str = "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
+const IPHONE_SAFARI17_UA: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1";
 
 // --- Windows Chromium/WebView2 presets ---
 
