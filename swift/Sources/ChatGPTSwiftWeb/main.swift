@@ -33,7 +33,7 @@ private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPart
 // token. Cloudflare reads that truncated UA as a non-standard client and issues repeated
 // challenges. This is the complete, engine-consistent Safari UA used when no fingerprint preset
 // overrides it, so the WebKit engine presents as the real Safari it actually is.
-private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Safari/605.1.15"
+private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
 private var singleInstanceLockFileDescriptor: CInt = -1
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
@@ -87,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func presentIsolationFallbackNotice() {
         let alert = NSAlert()
         alert.messageText = "已回退到默认账号空间"
-        alert.informativeText = "多账号隔离需要 macOS 14 或更新版本。当前系统版本不支持隔离，已自动切回默认空间，避免不同空间共享同一份本地数据。\n\n要使用独立账号空间，请升级到 macOS 14 或更新版本。"
+        alert.informativeText = "多账号隔离需要 macOS 14 或更新版本。当前系统版本不支持隔离，已自动切回内置空间，避免不同空间共享同一份本地数据。\n\n要使用独立账号空间，请升级到 macOS 14 或更新版本。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "知道了")
         alert.runModal()
@@ -318,7 +318,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         )
         let isolation: String
         if #available(macOS 14.0, *) {
-            isolation = profile.id == defaultProfileID ? "默认空间使用本 App 默认 WebView 数据仓库" : "当前空间使用独立 WKWebsiteDataStore"
+            isolation = profile.id == defaultProfileID ? "内置空间使用本 App 默认 WebView 数据仓库" : "当前空间使用独立 WKWebsiteDataStore"
         } else {
             isolation = "当前系统不支持多账号持久数据仓库隔离"
         }
@@ -470,7 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func setProfileAsDefault(id: String) {
         let previousCurrentID = ProfileStore.currentProfileID()
         guard ProfileStore.setStartupProfileID(id) else {
-            presentError("设置默认空间失败：找不到目标空间。")
+            presentError("设置启动默认空间失败：找不到目标空间。")
             return
         }
         profilesMenu.map(rebuildProfilesMenu(_:))
@@ -478,7 +478,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             rebuildMainController()
         }
         let profileName = ProfileStore.loadProfiles().first(where: { $0.id == id })?.name ?? "目标空间"
-        presentInfo("已将「\(profileName)」设为默认空间。")
+        presentInfo("已将「\(profileName)」设为启动默认空间。")
     }
 
     @objc private func selectFingerprintPreset(_ sender: NSMenuItem) {
@@ -688,7 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func deleteProfile(id: String) {
         guard id != defaultProfileID else {
-            presentError("默认空间不能删除，可以重命名或清理数据。")
+            presentError("内置空间不能删除。它使用本 App 默认 WebView 数据仓库，和启动默认空间不是同一个概念；可以重命名，或用“焚烧当前空间…”清理数据。")
             return
         }
         let currentID = ProfileStore.currentProfileID()
@@ -700,7 +700,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let profile = profiles[idx]
         let alert = NSAlert()
         alert.messageText = "删除账号空间 \"\(profile.name)\"？"
-        alert.informativeText = "本空间的所有 cookie、登录态、缓存与本地存储将被永久删除。其他空间不受影响。"
+        let startupDefaultNote = profile.id == ProfileStore.startupProfileID()
+            ? "\n\n此空间当前是启动默认空间；删除后启动默认会自动回到内置空间。"
+            : ""
+        alert.informativeText = "本空间的所有 cookie、登录态、缓存与本地存储将被永久删除。其他空间不受影响。\(startupDefaultNote)"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "删除")
         alert.addButton(withTitle: "取消")
@@ -739,52 +742,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return BrowserWindowController.keyWindowController()?.canGoBack ?? false
         case #selector(goForwardAction(_:)):
             return BrowserWindowController.keyWindowController()?.canGoForward ?? false
+        case #selector(switchToProfile(_:)):
+            guard let id = menuItem.representedObject as? String else {
+                return false
+            }
+            return canUseProfile(id) && id != ProfileStore.currentProfileID()
+        case #selector(setProfileAsDefaultAction(_:)):
+            guard let id = menuItem.representedObject as? String else {
+                return false
+            }
+            return canUseProfile(id) && id != ProfileStore.startupProfileID()
+        case #selector(setCurrentProfileAsDefaultAction(_:)):
+            let currentID = ProfileStore.currentProfileID()
+            return canUseProfile(currentID) && currentID != ProfileStore.startupProfileID()
+        case #selector(addProfileAction(_:)), #selector(importProfileAction(_:)):
+            return isProfileIsolationAvailable
+        case #selector(renameCurrentProfileAction(_:)):
+            return isProfileIsolationAvailable || ProfileStore.currentProfileID() == defaultProfileID
+        case #selector(deleteProfileAction(_:)):
+            guard let id = menuItem.representedObject as? String else {
+                return false
+            }
+            return canDeleteProfile(id)
+        case #selector(deleteCurrentProfileAction(_:)):
+            return canDeleteProfile(ProfileStore.currentProfileID())
         default:
-            return true
+            return menuItem.isEnabled
         }
     }
 
     private func rebuildProfilesMenu(_ menu: NSMenu) {
         menu.removeAllItems()
-        let isolationAvailable: Bool
-        if #available(macOS 14.0, *) {
-            isolationAvailable = true
-        } else {
-            isolationAvailable = false
-        }
+        let isolationAvailable = isProfileIsolationAvailable
 
         let currentID = ProfileStore.currentProfileID()
         let defaultID = ProfileStore.startupProfileID()
         let profiles = ProfileStore.loadProfiles()
         for profile in profiles {
-            let title = profile.id == currentID ? "● \(profile.name)" : "  \(profile.name)"
+            let title = profileMenuTitle(for: profile, currentID: currentID, startupID: defaultID)
             let profileItem = menu.addItem(withTitle: title, action: nil, keyEquivalent: "")
             let profileMenu = NSMenu(title: profile.name)
 
             let switchItem = profileMenu.addItem(withTitle: "切换到本空间", action: #selector(switchToProfile(_:)), keyEquivalent: "")
             switchItem.target = self
             switchItem.representedObject = profile.id
-            switchItem.isEnabled = (isolationAvailable || profile.id == defaultProfileID) && profile.id != currentID
+            switchItem.isEnabled = canUseProfile(profile.id) && profile.id != currentID
 
-            let setDefaultItem = profileMenu.addItem(withTitle: "设为默认空间", action: #selector(setProfileAsDefaultAction(_:)), keyEquivalent: "")
+            let setDefaultTitle = profile.id == defaultID ? "已是启动默认空间" : "设为启动默认空间"
+            let setDefaultItem = profileMenu.addItem(withTitle: setDefaultTitle, action: #selector(setProfileAsDefaultAction(_:)), keyEquivalent: "")
             setDefaultItem.target = self
             setDefaultItem.representedObject = profile.id
-            setDefaultItem.isEnabled = (isolationAvailable || profile.id == defaultProfileID) && profile.id != defaultID
+            setDefaultItem.isEnabled = canUseProfile(profile.id) && profile.id != defaultID
 
             profileMenu.addItem(NSMenuItem.separator())
-            let deleteItem = profileMenu.addItem(withTitle: "删除本空间…", action: #selector(deleteProfileAction(_:)), keyEquivalent: "")
+            let deleteTitle = profile.id == defaultProfileID ? "内置空间不能删除" : "删除本空间…"
+            let deleteItem = profileMenu.addItem(withTitle: deleteTitle, action: #selector(deleteProfileAction(_:)), keyEquivalent: "")
             deleteItem.target = self
             deleteItem.representedObject = profile.id
-            deleteItem.isEnabled = isolationAvailable && profile.id != defaultProfileID
+            deleteItem.isEnabled = canDeleteProfile(profile.id)
+            if profile.id == defaultProfileID {
+                deleteItem.toolTip = "内置空间使用本 App 默认 WebView 数据仓库，只能重命名或清理数据。"
+            }
 
             profileItem.submenu = profileMenu
         }
         menu.addItem(NSMenuItem.separator())
         let setHomeItem = menu.addItem(withTitle: "设置当前空间首页…", action: #selector(setProfileHomepageAction(_:)), keyEquivalent: "")
         setHomeItem.target = self
-        let setDefaultItem = menu.addItem(withTitle: "设为默认空间", action: #selector(setCurrentProfileAsDefaultAction(_:)), keyEquivalent: "")
+        let setDefaultTitle = currentID == defaultID ? "已是启动默认空间" : "设为启动默认空间"
+        let setDefaultItem = menu.addItem(withTitle: setDefaultTitle, action: #selector(setCurrentProfileAsDefaultAction(_:)), keyEquivalent: "")
         setDefaultItem.target = self
-        setDefaultItem.isEnabled = (isolationAvailable || currentID == defaultProfileID) && currentID != defaultID
+        setDefaultItem.isEnabled = canUseProfile(currentID) && currentID != defaultID
         menu.addItem(NSMenuItem.separator())
         let addItem = menu.addItem(withTitle: "新建账号空间…", action: #selector(addProfileAction(_:)), keyEquivalent: "")
         addItem.target = self
@@ -797,15 +825,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let renameItem = menu.addItem(withTitle: "重命名当前空间…", action: #selector(renameCurrentProfileAction(_:)), keyEquivalent: "")
         renameItem.target = self
         renameItem.isEnabled = isolationAvailable || currentID == defaultProfileID
-        let deleteItem = menu.addItem(withTitle: "删除当前空间…", action: #selector(deleteCurrentProfileAction(_:)), keyEquivalent: "")
+        let deleteCurrentTitle = currentID == defaultProfileID ? "内置空间不能删除" : "删除当前空间…"
+        let deleteItem = menu.addItem(withTitle: deleteCurrentTitle, action: #selector(deleteCurrentProfileAction(_:)), keyEquivalent: "")
         deleteItem.target = self
-        deleteItem.isEnabled = isolationAvailable && currentID != defaultProfileID
+        deleteItem.isEnabled = canDeleteProfile(currentID)
+        if currentID == defaultProfileID {
+            deleteItem.toolTip = "内置空间使用本 App 默认 WebView 数据仓库，只能重命名或清理数据。"
+        }
 
         if !isolationAvailable {
             menu.addItem(NSMenuItem.separator())
             let hint = menu.addItem(withTitle: "账号空间隔离需要 macOS 14 或更新版本", action: nil, keyEquivalent: "")
             hint.isEnabled = false
         }
+    }
+
+    private var isProfileIsolationAvailable: Bool {
+        if #available(macOS 14.0, *) {
+            return true
+        }
+        return false
+    }
+
+    private func canUseProfile(_ id: String) -> Bool {
+        isProfileIsolationAvailable || id == defaultProfileID
+    }
+
+    private func canDeleteProfile(_ id: String) -> Bool {
+        isProfileIsolationAvailable && id != defaultProfileID
+    }
+
+    private func profileMenuTitle(for profile: WebProfile, currentID: String, startupID: String) -> String {
+        var badges: [String] = []
+        if profile.id == startupID {
+            badges.append("启动默认")
+        }
+        if profile.id == defaultProfileID {
+            badges.append("内置")
+        }
+        let suffix = badges.isEmpty ? "" : "（\(badges.joined(separator: "，"))）"
+        return "\(profile.id == currentID ? "●" : " ") \(profile.name)\(suffix)"
     }
 
     private func rebuildPrivacyMenu(_ menu: NSMenu) {
@@ -904,7 +963,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
         let alert = NSAlert()
         alert.messageText = "无法新建账号空间"
-        alert.informativeText = "多账号隔离需要 macOS 14 或更新版本。当前系统版本只支持默认空间和无痕窗口。"
+        alert.informativeText = "多账号隔离需要 macOS 14 或更新版本。当前系统版本只支持内置空间和无痕窗口。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "知道了")
         alert.runModal()
@@ -2603,6 +2662,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled {
             userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
+        userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
@@ -4898,6 +4958,108 @@ private let privacySignalsScript = """
 })();
 """
 
+private let openAIPasskeyFallbackScript = """
+(() => {
+  if (window.__wkOpenAIPasskeyFallbackInstalled) return;
+
+  const trustedHost = (host) => {
+    const normalized = String(host || '').toLowerCase();
+    return normalized === 'chatgpt.com'
+      || normalized.endsWith('.chatgpt.com')
+      || normalized === 'chat.openai.com'
+      || normalized.endsWith('.chat.openai.com')
+      || normalized === 'openai.com'
+      || normalized.endsWith('.openai.com');
+  };
+
+  if (!trustedHost(location.hostname)) return;
+
+  try {
+    Object.defineProperty(window, '__wkOpenAIPasskeyFallbackInstalled', { value: true, configurable: false, writable: false });
+    Object.defineProperty(window, '__wkOpenAIPasskeyFallbackActive', { value: true, configurable: false, writable: false });
+  } catch (_) {}
+
+  const signalFallback = (reason) => {
+    try {
+      if (!window.__wkOpenAIPasskeyFallbackUsed) {
+        Object.defineProperty(window, '__wkOpenAIPasskeyFallbackUsed', { value: true, configurable: true, writable: false });
+      }
+      window.__wkOpenAIPasskeyFallbackReason = String(reason || 'passkey');
+      window.dispatchEvent(new CustomEvent('chatgpt-swift-passkey-fallback', { detail: { reason: window.__wkOpenAIPasskeyFallbackReason } }));
+    } catch (_) {}
+  };
+
+  const unsupportedError = () => {
+    try {
+      return new DOMException('Passkey is unavailable in this local WKWebView wrapper. Use another sign-in method.', 'NotAllowedError');
+    } catch (_) {
+      const error = new Error('Passkey is unavailable in this local WKWebView wrapper. Use another sign-in method.');
+      error.name = 'NotAllowedError';
+      return error;
+    }
+  };
+
+  try {
+    Reflect.deleteProperty(window, 'PublicKeyCredential');
+  } catch (_) {}
+
+  try {
+    if ('PublicKeyCredential' in window) {
+      Object.defineProperty(window, 'PublicKeyCredential', {
+        get: function () {
+          signalFallback('PublicKeyCredential');
+          return undefined;
+        },
+        configurable: true
+      });
+    }
+  } catch (_) {}
+
+  try {
+    const credentials = navigator.credentials;
+    if (!credentials) return;
+
+    const originalGet = typeof credentials.get === 'function' ? credentials.get.bind(credentials) : null;
+    const originalCreate = typeof credentials.create === 'function' ? credentials.create.bind(credentials) : null;
+
+    const hasPublicKeyRequest = (options) => {
+      try {
+        return !!options && typeof options === 'object' && 'publicKey' in options;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const get = function get(options) {
+      if (hasPublicKeyRequest(options)) {
+        signalFallback('navigator.credentials.get(publicKey)');
+        return Promise.reject(unsupportedError());
+      }
+      return originalGet ? originalGet(options) : Promise.reject(unsupportedError());
+    };
+
+    const create = function create(options) {
+      if (hasPublicKeyRequest(options)) {
+        signalFallback('navigator.credentials.create(publicKey)');
+        return Promise.reject(unsupportedError());
+      }
+      return originalCreate ? originalCreate(options) : Promise.reject(unsupportedError());
+    };
+
+    try {
+      Object.defineProperty(credentials, 'get', { value: get, configurable: true, writable: true });
+    } catch (_) {
+      try { credentials.get = get; } catch (_) {}
+    }
+    try {
+      Object.defineProperty(credentials, 'create', { value: create, configurable: true, writable: true });
+    } catch (_) {
+      try { credentials.create = create; } catch (_) {}
+    }
+  } catch (_) {}
+})();
+"""
+
 private let passkeyLimitationNoticeScript = """
 (() => {
   if (window.__wkPasskeyLimitationNoticeInstalled) return;
@@ -4914,6 +5076,9 @@ private let passkeyLimitationNoticeScript = """
       || normalized === 'openai.com'
       || normalized.endsWith('.openai.com');
   };
+
+  const fallbackActive = () => !!window.__wkOpenAIPasskeyFallbackActive;
+  const fallbackUsed = () => !!window.__wkOpenAIPasskeyFallbackUsed;
 
   const pageLooksLikePasskey = () => {
     const href = String(location.href || '').toLowerCase();
@@ -4936,8 +5101,25 @@ private let passkeyLimitationNoticeScript = """
     return urlSignal || textSignal;
   };
 
+  const pageLooksLikeAuthFallback = () => {
+    const href = String(location.href || '').toLowerCase();
+    return fallbackActive() && (
+      fallbackUsed()
+      || href.includes('auth')
+      || href.includes('login')
+      || href.includes('signin')
+      || href.includes('verify')
+      || href.includes('verification')
+      || href.includes('challenge')
+      || href.includes('continue')
+      || href.includes('credential')
+      || href.includes('passkey')
+      || href.includes('webauthn')
+    );
+  };
+
   const showNotice = () => {
-    if (!trustedHost(location.hostname) || !pageLooksLikePasskey()) return;
+    if (!trustedHost(location.hostname) || (!pageLooksLikePasskey() && !pageLooksLikeAuthFallback())) return;
     if (document.getElementById('chatgpt-swift-passkey-notice')) return;
     if (!document.body || window.__wkPasskeyLimitationNoticeDismissed) return;
 
@@ -4963,12 +5145,16 @@ private let passkeyLimitationNoticeScript = """
     ].join(';');
 
     const title = document.createElement('div');
-    title.textContent = '这个本地 WKWebView wrapper 不能使用 chatgpt.com / openai.com 的 Apple 通行密钥。';
+    title.textContent = fallbackActive()
+      ? (fallbackUsed() ? '已阻止这个页面调用 passkey / WebAuthn。' : '已为这个本地 WKWebView 关闭 passkey / WebAuthn。')
+      : '这个本地 WKWebView wrapper 不能使用 chatgpt.com / openai.com 的 Apple 通行密钥。';
     title.style.cssText = 'font-weight:650;margin:0 0 4px';
     notice.appendChild(title);
 
     const detail = document.createElement('div');
-    detail.textContent = '请点“尝试其他方法”，或用 Safari、Chrome、官方 ChatGPT App 完成 passkey 登录。';
+    detail.textContent = fallbackActive()
+      ? '请继续使用邮箱验证码、密码或“尝试其他方法”。如必须用通行密钥，请改用 Safari、Chrome 或官方 ChatGPT App。'
+      : '请点“尝试其他方法”，或用 Safari、Chrome、官方 ChatGPT App 完成 passkey 登录。';
     detail.style.cssText = 'color:rgba(255,255,255,.78);margin:0';
     notice.appendChild(detail);
 
@@ -5004,6 +5190,9 @@ private let passkeyLimitationNoticeScript = """
   } else {
     schedule();
   }
+  window.addEventListener('chatgpt-swift-passkey-fallback', schedule);
+  window.setTimeout(schedule, 1000);
+  window.setTimeout(schedule, 3000);
 
   try {
     const observer = new MutationObserver(schedule);
