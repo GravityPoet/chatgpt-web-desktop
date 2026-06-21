@@ -296,7 +296,7 @@ export default function App() {
                   <span className="accountRail" />
                   <span className="accountMain">
                     <span className="accountTitle">
-                      <strong>{account.name}</strong>
+                      <strong title={account.name}>{middleTruncate(account.name, 34)}</strong>
                       <code>{account.seed}</code>
                     </span>
                     <span className="accountMeta">
@@ -318,7 +318,7 @@ export default function App() {
               <header className="detailHeader">
                 <div className="titleBlock">
                   <span className="eyebrow">Isolated identity</span>
-                  <h1>{selected.name}</h1>
+                  <h1 title={selected.name}>{middleTruncate(selected.name, 44)}</h1>
                 </div>
                 <button className="launchButton" disabled={busy} onClick={() => void launchAccount(selected)}>
                   <Play size={16} />
@@ -432,7 +432,9 @@ function EditorDialog({
           <button className="modalClose" type="button" aria-label="关闭" onClick={onClose}>
             <X size={15} />
           </button>
-          <h2>删除「{dialog.account.name}」？</h2>
+          <h2 title={`删除「${dialog.account.name}」？`}>
+            删除「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
+          </h2>
           <p>Profile、cookie 和登录状态会被清除。</p>
           {error ? <p className="modalError">{error}</p> : null}
           <div className="modalActions">
@@ -483,12 +485,18 @@ function dialogConfig(dialog: Exclude<DialogState, { kind: "delete" }>) {
   switch (dialog.kind) {
     case "create":
       return { title: "新建账号", label: "名称", placeholder: "work_01", action: "创建" };
-    case "rename":
-      return { title: `重命名「${dialog.account.name}」`, label: "新名称", placeholder: dialog.account.name, action: "保存" };
-    case "proxy":
-      return { title: `代理「${dialog.account.name}」`, label: "代理 URL", placeholder: "socks5://user:pass@host:1080", action: dialog.account.has_proxy ? "保存 / 清除" : "保存" };
-    case "region":
-      return { title: `区域「${dialog.account.name}」`, label: "区域标签", placeholder: "US / JP / Tokyo", action: dialog.account.region ? "保存 / 清除" : "保存" };
+    case "rename": {
+      const accountName = middleTruncate(dialog.account.name, 28);
+      return { title: `重命名「${accountName}」`, label: "新名称", placeholder: dialog.account.name, action: "保存" };
+    }
+    case "proxy": {
+      const accountName = middleTruncate(dialog.account.name, 28);
+      return { title: `代理「${accountName}」`, label: "代理 URL", placeholder: "socks5://user:pass@host:1080", action: dialog.account.has_proxy ? "保存 / 清除" : "保存" };
+    }
+    case "region": {
+      const accountName = middleTruncate(dialog.account.name, 28);
+      return { title: `区域「${accountName}」`, label: "区域标签", placeholder: "US / JP / Tokyo", action: dialog.account.region ? "保存 / 清除" : "保存" };
+    }
   }
 }
 
@@ -584,6 +592,15 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
 
 function mockAccounts(): Account[] {
   return [
+    {
+      name: "573505658353maddest_ferries3@icloud.com",
+      profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/573505658353maddest_ferries3@icloud.com",
+      seed: "48366",
+      region: null,
+      locale_enabled: false,
+      proxy_display: "off (system VPN / direct)",
+      has_proxy: false,
+    },
     {
       name: "moonlitpoet88",
       profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/moonlitpoet88",

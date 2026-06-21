@@ -194,6 +194,8 @@ button {
 }
 
 .accountTitle strong {
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
   color: var(--text);
   font-size: 13px;
@@ -275,6 +277,7 @@ button {
 
 .titleBlock {
   display: grid;
+  flex: 1 1 auto;
   min-width: 0;
   gap: 3px;
 }
@@ -294,7 +297,7 @@ h2 {
 
 h1 {
   overflow: hidden;
-  font-size: 22px;
+  font-size: 19px;
   line-height: 1.15;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -499,6 +502,10 @@ h2 {
   background: var(--green-hover);
 }
 
+.launchButton {
+  flex: 0 0 auto;
+}
+
 .dangerButton {
   border-color: var(--danger);
   background: var(--danger);
@@ -565,7 +572,10 @@ button:disabled {
   position: relative;
   display: grid;
   gap: 14px;
-  width: min(392px, 100%);
+  width: min(440px, calc(100vw - 36px));
+  max-width: 100%;
+  min-width: 0;
+  overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
   background: var(--panel);
@@ -574,9 +584,17 @@ button:disabled {
 }
 
 .modal h2 {
+  min-width: 0;
   padding-right: 34px;
   color: var(--text);
   font-size: 16px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.dialogAccountName {
+  overflow-wrap: anywhere;
+  word-break: break-word;
 }
 
 .modal p {
@@ -648,6 +666,13 @@ button:disabled {
 
 .modalActions {
   justify-content: flex-end;
+  min-width: 0;
+  width: 100%;
+  flex-wrap: wrap;
+}
+
+.modalActions button {
+  flex: 0 0 auto;
 }
 
 .spin {
