@@ -687,10 +687,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func deleteProfile(id: String) {
-        guard id != defaultProfileID else {
-            presentError("内置空间不能删除。它使用本 App 默认 WebView 数据仓库，和启动默认空间不是同一个概念；可以重命名，或用“焚烧当前空间…”清理数据。")
-            return
-        }
         let currentID = ProfileStore.currentProfileID()
         var profiles = ProfileStore.loadProfiles()
         guard let idx = profiles.firstIndex(where: { $0.id == id }) else {
@@ -698,6 +694,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return
         }
         let profile = profiles[idx]
+        if profile.id == defaultProfileID {
+            deleteDefaultProfile(profile, isCurrent: currentID == profile.id)
+            return
+        }
+
         let alert = NSAlert()
         alert.messageText = "删除账号空间 \"\(profile.name)\"？"
         let startupDefaultNote = profile.id == ProfileStore.startupProfileID()
@@ -725,6 +726,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
                 WKWebsiteDataStore.remove(forIdentifier: uuid) { _ in }
             }
+        }
+    }
+
+    private func deleteDefaultProfile(_ profile: WebProfile, isCurrent: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "删除内置空间 \"\(profile.name)\"？"
+        alert.informativeText = "内置空间使用本 App 的默认 WebView 数据仓库。删除后会清空它的 cookies、登录态、缓存与本地存储，并把名称、首页、指纹和增强隐私设置重建为一个全新的内置空间。其他独立空间不受影响。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "删除并新建")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+
+        WebsiteDataCleaner.removeAllData(from: WKWebsiteDataStore.default()) { [weak self] in
+            guard let self else {
+                return
+            }
+            ProfileStore.resetDefaultProfile()
+            ProfileStore.setCurrentProfileID(isCurrent ? defaultProfileID : ProfileStore.currentProfileID())
+            self.profilesMenu.map(self.rebuildProfilesMenu(_:))
+            if isCurrent {
+                self.rebuildMainController()
+            }
+            self.presentInfo("已删除并重新创建内置空间。")
         }
     }
 
@@ -795,13 +821,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             setDefaultItem.isEnabled = canUseProfile(profile.id) && profile.id != defaultID
 
             profileMenu.addItem(NSMenuItem.separator())
-            let deleteTitle = profile.id == defaultProfileID ? "内置空间不能删除" : "删除本空间…"
-            let deleteItem = profileMenu.addItem(withTitle: deleteTitle, action: #selector(deleteProfileAction(_:)), keyEquivalent: "")
+            let deleteItem = profileMenu.addItem(withTitle: "删除本空间…", action: #selector(deleteProfileAction(_:)), keyEquivalent: "")
             deleteItem.target = self
             deleteItem.representedObject = profile.id
             deleteItem.isEnabled = canDeleteProfile(profile.id)
             if profile.id == defaultProfileID {
-                deleteItem.toolTip = "内置空间使用本 App 默认 WebView 数据仓库，只能重命名或清理数据。"
+                deleteItem.toolTip = "删除内置空间会清空默认 WebView 数据仓库，并立即创建一个全新的内置空间。"
             }
 
             profileItem.submenu = profileMenu
@@ -825,12 +850,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let renameItem = menu.addItem(withTitle: "重命名当前空间…", action: #selector(renameCurrentProfileAction(_:)), keyEquivalent: "")
         renameItem.target = self
         renameItem.isEnabled = isolationAvailable || currentID == defaultProfileID
-        let deleteCurrentTitle = currentID == defaultProfileID ? "内置空间不能删除" : "删除当前空间…"
-        let deleteItem = menu.addItem(withTitle: deleteCurrentTitle, action: #selector(deleteCurrentProfileAction(_:)), keyEquivalent: "")
+        let deleteItem = menu.addItem(withTitle: "删除当前空间…", action: #selector(deleteCurrentProfileAction(_:)), keyEquivalent: "")
         deleteItem.target = self
         deleteItem.isEnabled = canDeleteProfile(currentID)
         if currentID == defaultProfileID {
-            deleteItem.toolTip = "内置空间使用本 App 默认 WebView 数据仓库，只能重命名或清理数据。"
+            deleteItem.toolTip = "删除内置空间会清空默认 WebView 数据仓库，并立即创建一个全新的内置空间。"
         }
 
         if !isolationAvailable {
@@ -852,7 +876,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func canDeleteProfile(_ id: String) -> Bool {
-        isProfileIsolationAvailable && id != defaultProfileID
+        id == defaultProfileID || isProfileIsolationAvailable
     }
 
     private func profileMenuTitle(for profile: WebProfile, currentID: String, startupID: String) -> String {
@@ -1557,9 +1581,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         let sourceURL = webView.url
 
         if navigationAction.targetFrame == nil {
-            // New window / window.open / target=_blank. Default to an in-app popup; only a deliberate
-            // click on a genuine third-party link is handed to the system browser.
-            if Self.shouldOpenInSystemBrowser(cleanedURL, navigationType: navigationAction.navigationType) {
+            // New window / window.open / target=_blank. The privacy menu decides whether third-party
+            // destinations stay in an app popup or leave through the user's default browser.
+            if Self.shouldOpenNewWindowInSystemBrowser(cleanedURL, sourceURL: sourceURL) {
                 browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
                 NSWorkspace.shared.open(cleanedURL)
             } else {
@@ -1578,7 +1602,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
                 return
             }
             decisionHandler(.allow)
-        } else if Self.shouldOpenInSystemBrowser(cleanedURL, navigationType: navigationAction.navigationType) {
+        } else if Self.shouldOpenInSystemBrowser(cleanedURL, sourceURL: sourceURL, navigationType: navigationAction.navigationType) {
             browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
             NSWorkspace.shared.open(cleanedURL)
             decisionHandler(.cancel)
@@ -1608,6 +1632,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if let url = navigationAction.request.url {
+            let cleanedURL = Self.cleanTrackingParameters(from: url)
+            if Self.shouldOpenNewWindowInSystemBrowser(cleanedURL, sourceURL: webView.url) {
+                browserLogger.info("Opening user-clicked third-party popup URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
+                NSWorkspace.shared.open(cleanedURL)
+                return nil
+            }
+        }
+
         let host = navigationAction.request.url?.host ?? "ChatGPT"
         let child = BrowserWindowController(
             initialURL: nil,
@@ -2177,36 +2210,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     private func burnWebsiteData(completion: @escaping () -> Void) {
-        let dataStore = webView.configuration.websiteDataStore
-        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
-        let group = DispatchGroup()
-
-        group.enter()
-        dataStore.removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
-            group.leave()
-        }
-
-        group.enter()
-        dataStore.httpCookieStore.getAllCookies { cookies in
-            guard !cookies.isEmpty else {
-                group.leave()
-                return
-            }
-
-            let cookieGroup = DispatchGroup()
-            for cookie in cookies {
-                cookieGroup.enter()
-                dataStore.httpCookieStore.delete(cookie) {
-                    cookieGroup.leave()
-                }
-            }
-
-            cookieGroup.notify(queue: .main) {
-                group.leave()
-            }
-        }
-
-        group.notify(queue: .main) { [weak self] in
+        WebsiteDataCleaner.removeAllData(from: webView.configuration.websiteDataStore) { [weak self] in
             guard let self else {
                 return
             }
@@ -2844,17 +2848,29 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     /// Only a deliberate user click on a genuine third-party https link should leave the app for the
     /// system browser. Automatic redirects, script-driven navigations, and ChatGPT's own popups stay
     /// in-app, so the user is never bounced to the default browser unexpectedly mid-session.
-    private static func shouldOpenInSystemBrowser(_ url: URL, navigationType: WKNavigationType) -> Bool {
+    private static func shouldOpenInSystemBrowser(_ url: URL, sourceURL: URL? = nil, navigationType: WKNavigationType) -> Bool {
         if PrivacySettings.keepThirdPartyLinksInApp() {
             return false
         }
         guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
             return false
         }
-        if shouldOpenInsideApp(url) {
+        if shouldOpenInsideApp(url, sourceURL: sourceURL) {
             return false
         }
         return navigationType == .linkActivated
+    }
+
+    /// WebKit often reports JS-mediated target=_blank/window.open as `.other`, even when it came from
+    /// a user click. For new-window requests the menu setting is the source of truth.
+    private static func shouldOpenNewWindowInSystemBrowser(_ url: URL, sourceURL: URL? = nil) -> Bool {
+        if PrivacySettings.keepThirdPartyLinksInApp() {
+            return false
+        }
+        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
+            return false
+        }
+        return !shouldOpenInsideApp(url, sourceURL: sourceURL)
     }
 
     private static func loggableURL(_ url: URL) -> String {
@@ -4029,6 +4045,40 @@ private struct WebProfile: Codable {
     var createdAt: Date
 }
 
+private enum WebsiteDataCleaner {
+    static func removeAllData(from dataStore: WKWebsiteDataStore, completion: @escaping () -> Void) {
+        let dataTypes = WKWebsiteDataStore.allWebsiteDataTypes()
+        let group = DispatchGroup()
+
+        group.enter()
+        dataStore.removeData(ofTypes: dataTypes, modifiedSince: Date(timeIntervalSince1970: 0)) {
+            group.leave()
+        }
+
+        group.enter()
+        dataStore.httpCookieStore.getAllCookies { cookies in
+            guard !cookies.isEmpty else {
+                group.leave()
+                return
+            }
+
+            let cookieGroup = DispatchGroup()
+            for cookie in cookies {
+                cookieGroup.enter()
+                dataStore.httpCookieStore.delete(cookie) {
+                    cookieGroup.leave()
+                }
+            }
+
+            cookieGroup.notify(queue: .main) {
+                group.leave()
+            }
+        }
+
+        group.notify(queue: .main, execute: completion)
+    }
+}
+
 private struct ProfileExportDocument: Codable {
     let schemaVersion: Int
     let exportedAt: Date
@@ -4785,6 +4835,17 @@ private enum ProfileStore {
         UserDefaults.standard.synchronize()
     }
 
+    static func resetDefaultProfile() {
+        var profiles = loadProfiles()
+        profiles.removeAll { $0.id == defaultProfileID }
+        profiles.insert(WebProfile(id: defaultProfileID, name: "默认", createdAt: Date()), at: 0)
+        save(profiles)
+        removeHomepage(for: defaultProfileID)
+        disableFingerprint(for: defaultProfileID)
+        setEnhancedPrivacyEnabled(false, for: defaultProfileID)
+        clearStartupProfileIfNeeded(defaultProfileID)
+    }
+
     static func currentProfileID() -> String {
         UserDefaults.standard.string(forKey: currentProfileDefaultsKey) ?? defaultProfileID
     }
@@ -4903,7 +4964,10 @@ private enum PrivacySettings {
     }
 
     static func keepThirdPartyLinksInApp() -> Bool {
-        UserDefaults.standard.bool(forKey: keepThirdPartyLinksInAppDefaultsKey)
+        if UserDefaults.standard.object(forKey: keepThirdPartyLinksInAppDefaultsKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: keepThirdPartyLinksInAppDefaultsKey)
     }
 
     static func setKeepThirdPartyLinksInApp(_ enabled: Bool) {
