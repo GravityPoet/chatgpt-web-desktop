@@ -44,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var privacyMenu: NSMenu?
     private var webRTCProtectionItem: NSMenuItem?
     private var enhancedPrivacyItem: NSMenuItem?
+    private var didApplyLaunchGeoIP = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.regular)
@@ -64,6 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         mainController = controller
         controller.show()
         NSApp.activate(ignoringOtherApps: true)
+
+        primeExitTimezoneAlignment()
 
         if needsIsolationFallbackNotice {
             DispatchQueue.main.async { [weak self] in
@@ -953,6 +956,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         menu.addItem(NSMenuItem.separator())
         let aboutItem = menu.addItem(withTitle: "关于指纹混淆…", action: #selector(showFingerprintAbout(_:)), keyEquivalent: "")
         aboutItem.target = self
+    }
+
+    /// Resolve the network exit timezone (VPN egress) and align the injected fingerprint to it. With
+    /// a cached value the first window is already aligned; the background lookup then keeps the cache
+    /// fresh. When the lookup first discovers (or changes) the exit timezone, rebuild the main window
+    /// once -- early in launch, before any Cloudflare challenge -- so the new timezone is injected at
+    /// document start. Later exit changes (e.g. switching VPN nodes) apply on the next new window
+    /// rather than yanking the current page out from under an in-progress challenge.
+    private func primeExitTimezoneAlignment() {
+        GeoIPResolver.refresh { [weak self] timezone, changed in
+            guard let self, changed, timezone != nil, !self.didApplyLaunchGeoIP else {
+                return
+            }
+            self.didApplyLaunchGeoIP = true
+            self.rebuildMainController(initialURL: self.mainController?.currentURL())
+        }
     }
 
     private func rebuildMainController(initialURL: URL? = nil) {
@@ -4106,6 +4125,81 @@ private struct FingerprintProfile: Codable {
     let timezone: String?
 }
 
+/// Resolves the timezone of the current network egress so the injected browser fingerprint's
+/// timezone matches the exit IP's country. A system VPN routes URLSession traffic through its exit,
+/// so a plain request reports the exit's geo. Cloudflare treats "IP in country A, browser timezone
+/// in country B" as a bot signal and issues more managed challenges; aligning the timezone removes
+/// it. Every failure path degrades to nil (no override -> system timezone), so offline / non-VPN
+/// behavior is unchanged.
+private enum GeoIPResolver {
+    private static let cacheKey = "geoip.exit.timezone"
+
+    private static var endpoints: [(url: URL, timezone: (Any) -> String?)] {
+        var list: [(URL, (Any) -> String?)] = []
+        if let u = URL(string: "https://ipwho.is/") {
+            // ipwho.is: { "timezone": { "id": "America/New_York", ... } }
+            list.append((u, { json in
+                ((json as? [String: Any])?["timezone"] as? [String: Any])?["id"] as? String
+            }))
+        }
+        if let u = URL(string: "https://ipinfo.io/json") {
+            // ipinfo.io: { "timezone": "America/New_York", ... }
+            list.append((u, { json in
+                (json as? [String: Any])?["timezone"] as? String
+            }))
+        }
+        return list
+    }
+
+    static func cachedTimezone() -> String? {
+        guard let tz = UserDefaults.standard.string(forKey: cacheKey), isValidTimezone(tz) else {
+            return nil
+        }
+        return tz
+    }
+
+    /// Resolve the exit timezone in the background; the completion runs on the main queue with the
+    /// resolved timezone (nil on total failure) and whether it differs from the previously cached
+    /// value, so a caller can refresh injection only when the exit actually changed.
+    static func refresh(completion: ((String?, Bool) -> Void)? = nil) {
+        let previous = cachedTimezone()
+        DispatchQueue.global(qos: .utility).async {
+            resolve(endpointIndex: 0) { resolved in
+                if let resolved {
+                    UserDefaults.standard.set(resolved, forKey: cacheKey)
+                }
+                guard let completion else { return }
+                let changed = resolved != nil && resolved != previous
+                DispatchQueue.main.async { completion(resolved, changed) }
+            }
+        }
+    }
+
+    private static func resolve(endpointIndex: Int, completion: @escaping (String?) -> Void) {
+        let endpoints = self.endpoints
+        guard endpointIndex < endpoints.count else {
+            completion(nil)
+            return
+        }
+        let endpoint = endpoints[endpointIndex]
+        var request = URLRequest(url: endpoint.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        URLSession.shared.dataTask(with: request) { data, _, _ in
+            if let data,
+               let json = try? JSONSerialization.jsonObject(with: data),
+               let tz = endpoint.timezone(json), isValidTimezone(tz) {
+                completion(tz)
+            } else {
+                resolve(endpointIndex: endpointIndex + 1, completion: completion)
+            }
+        }.resume()
+    }
+
+    private static func isValidTimezone(_ tz: String) -> Bool {
+        !tz.isEmpty && tz.count <= 64 && TimeZone(identifier: tz) != nil
+    }
+}
+
 private enum FingerprintCatalog {
     static let offPresetID = "off"
     static let defaultAcceptLanguages = ["zh-CN", "en-US"]
@@ -4259,8 +4353,12 @@ private enum FingerprintCatalog {
     static func script(for fingerprint: FingerprintProfile) -> String {
         let languagesJSON = jsonLiteral(fingerprint.acceptLanguages)
         let primaryLanguage = fingerprint.acceptLanguages.first ?? "en-US"
+        // A selected preset's own timezone wins; otherwise fall back to the GeoIP-resolved exit
+        // timezone so a VPN user's page timezone matches their exit IP's country (Cloudflare flags
+        // IP/timezone mismatch). Nil on both -> no override -> system timezone, unchanged behavior.
+        let resolvedTimezone = fingerprint.timezone ?? GeoIPResolver.cachedTimezone()
         let timezoneBlock: String
-        if let timezone = fingerprint.timezone {
+        if let timezone = resolvedTimezone {
             timezoneBlock = """
               try {
                 const OrigDTF = Intl.DateTimeFormat;
