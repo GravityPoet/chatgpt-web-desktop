@@ -8,7 +8,8 @@ private let appBundleIdentifier = "local.chatgpt-cloak"
 private let chromiumBundleIdentifier = "org.chromium.Chromium"
 private let chatGPTAppURL = "https://chatgpt.com/"
 private let defaultProfileID = "main"
-private let cloakChromiumRelativePath = ".cloakbrowser/chromium-145.0.7632.109.2/Chromium.app/Contents/MacOS/Chromium"
+private let cloakBrowserDirectoryName = ".cloakbrowser"
+private let chromiumBinarySubpath = "Chromium.app/Contents/MacOS/Chromium"
 private let launcherLogger = Logger(subsystem: appBundleIdentifier, category: "Launcher")
 private var singleInstanceLockFileDescriptor: CInt = -1
 
@@ -114,7 +115,7 @@ struct CloakLauncher {
 
     init() throws {
         let homeDirectory = fileManager.homeDirectoryForCurrentUser
-        chromiumBinaryURL = homeDirectory.appendingPathComponent(cloakChromiumRelativePath)
+        chromiumBinaryURL = Self.resolveChromiumBinaryURL(home: homeDirectory, fileManager: fileManager)
 
         guard let baseSupportDirectory = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             throw LauncherError.applicationSupportDirectoryUnavailable
@@ -124,6 +125,54 @@ struct CloakLauncher {
         profileDirectoryURL = supportDirectoryURL
             .appendingPathComponent("Profiles", isDirectory: true)
             .appendingPathComponent(defaultProfileID, isDirectory: true)
+    }
+
+    // Resolve the CloakBrowser Chromium binary without pinning a version. Mirrors
+    // packaging/update-chromium.sh: prefer the `current` symlink the auto-updater maintains
+    // (it is only repointed after the challenge gate passes), else fall back to the newest
+    // ~/.cloakbrowser/chromium-* directory by natural version order. Returns the preferred
+    // `current` path as a last resort so a missing install still surfaces a clear, stable path.
+    private static func resolveChromiumBinaryURL(home: URL, fileManager: FileManager) -> URL {
+        let cloakDir = home.appendingPathComponent(cloakBrowserDirectoryName, isDirectory: true)
+        let currentBinary = cloakDir
+            .appendingPathComponent("current", isDirectory: true)
+            .appendingPathComponent(chromiumBinarySubpath)
+
+        if fileManager.isExecutableFile(atPath: currentBinary.path) {
+            return currentBinary
+        }
+
+        if let newest = newestVersionedChromiumBinaryURL(in: cloakDir, fileManager: fileManager) {
+            return newest
+        }
+
+        return currentBinary
+    }
+
+    private static func newestVersionedChromiumBinaryURL(in cloakDir: URL, fileManager: FileManager) -> URL? {
+        guard let entries = try? fileManager.contentsOfDirectory(
+            at: cloakDir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        ) else {
+            return nil
+        }
+
+        let versioned = entries
+            .filter { $0.lastPathComponent.hasPrefix("chromium-") }
+            .sorted {
+                // Natural version order, equivalent to `sort -V` in update-chromium.sh.
+                $0.lastPathComponent.compare($1.lastPathComponent, options: .numeric) == .orderedAscending
+            }
+
+        for directory in versioned.reversed() {
+            let binary = directory.appendingPathComponent(chromiumBinarySubpath)
+            if fileManager.isExecutableFile(atPath: binary.path) {
+                return binary
+            }
+        }
+
+        return nil
     }
 
     func launchOrActivate() throws -> LaunchResult {
@@ -359,7 +408,7 @@ enum LauncherError: LocalizedError {
         case .applicationSupportDirectoryUnavailable:
             return "无法解析本机 Application Support 目录，暂时不能创建 ChatGPT Cloak 数据目录。"
         case .chromiumBinaryMissing(let path):
-            return "找不到 CloakBrowser Chromium binary。\n\n预期路径：\(path)\n\n请确认 cloakbrowser-0.3.31 已安装，且 Chromium.app 仍在 ~/.cloakbrowser/chromium-145.0.7632.109.2/。"
+            return "找不到 CloakBrowser Chromium binary。\n\n预期路径：\(path)\n\n请确认 CloakBrowser 已安装：~/.cloakbrowser/current 指向某个 chromium-*，或 ~/.cloakbrowser/chromium-* 下存在 Chromium.app。"
         case .chromiumBinaryNotExecutable(let path):
             return "CloakBrowser Chromium binary 存在，但没有可执行权限。\n\n路径：\(path)"
         case .profileDirectoryCreationFailed(let path, let reason):
