@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream as StdTcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use url::Url;
 use walkdir::WalkDir;
@@ -183,6 +183,7 @@ impl CloakConfig {
 pub struct Account {
     pub name: String,
     pub profile_path: PathBuf,
+    pub created_at: u64,
     pub seed: String,
     pub region: Option<String>,
     pub locale_enabled: bool,
@@ -350,7 +351,11 @@ pub fn list_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
         }
         accounts.push(read_account(config, &name)?);
     }
-    accounts.sort_by(|a, b| a.name.cmp(&b.name));
+    accounts.sort_by(|a, b| {
+        b.created_at
+            .cmp(&a.created_at)
+            .then_with(|| a.name.cmp(&b.name))
+    });
     Ok(accounts)
 }
 
@@ -369,10 +374,12 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         .and_then(|raw| proxy_config(raw).ok())
         .map(|p| p.display)
         .unwrap_or_else(|| "关".to_string());
+    let created_at = account_created_at(&profile_path)?;
 
     Ok(Account {
         name: name.to_string(),
         profile_path,
+        created_at,
         seed,
         region: region.filter(|s| !s.is_empty()),
         locale_enabled,
@@ -390,6 +397,10 @@ pub fn create_account(config: &CloakConfig, name: &str) -> Result<Account> {
     secure_account_dir(&profile)?;
     let seed = rand::thread_rng().gen_range(10_000..100_000).to_string();
     write_secret_atomic(&profile.join(".cloak-seed"), &seed)?;
+    write_secret_atomic(
+        &profile.join(".cloak-created-at"),
+        &current_created_at().to_string(),
+    )?;
     read_account(config, name)
 }
 
@@ -929,6 +940,33 @@ fn pinned_seed(profile_path: &Path) -> Result<Option<String>> {
     } else {
         Ok(None)
     }
+}
+
+fn account_created_at(profile_path: &Path) -> Result<u64> {
+    if let Some(raw) = read_first_line(&profile_path.join(".cloak-created-at"))? {
+        if let Ok(created_at) = raw.parse::<u64>() {
+            return Ok(created_at);
+        }
+    }
+
+    let metadata = fs::metadata(profile_path)?;
+    let created_at = metadata.created().or_else(|_| metadata.modified()).ok();
+    Ok(created_at.map(system_time_micros).unwrap_or(0))
+}
+
+fn current_created_at() -> u64 {
+    system_time_micros(SystemTime::now())
+}
+
+fn system_time_micros(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| {
+            duration
+                .as_secs()
+                .saturating_mul(1_000_000)
+                .saturating_add(u64::from(duration.subsec_micros()))
+        })
+        .unwrap_or(0)
 }
 
 fn proxy_config(raw: &str) -> Result<ProxyConfig> {
@@ -1788,7 +1826,13 @@ fn remove_if_present(path: &Path) -> Result<()> {
 fn secure_account_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
     secure_dir(path)?;
-    for file in [".cloak-seed", ".cloak-proxy", ".cloak-locale", ".cloak-region"] {
+    for file in [
+        ".cloak-seed",
+        ".cloak-created-at",
+        ".cloak-proxy",
+        ".cloak-locale",
+        ".cloak-region",
+    ] {
         let path = path.join(file);
         if path.exists() {
             secure_file(&path)?;
@@ -1958,7 +2002,38 @@ mod tests {
         let account = create_account(&config, "work").unwrap();
         let renamed = rename_account(&config, "work", "work2").unwrap();
         assert_eq!(account.seed, renamed.seed);
+        assert_eq!(account.created_at, renamed.created_at);
         assert!(renamed.profile_path.join(".cloak-seed").exists());
+        assert!(renamed.profile_path.join(".cloak-created-at").exists());
+    }
+
+    #[test]
+    fn list_accounts_orders_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        create_account(&config, "older").unwrap();
+        create_account(&config, "newer").unwrap();
+        write_secret_atomic(
+            &config.profile_dir("older").join(".cloak-created-at"),
+            "1000",
+        )
+        .unwrap();
+        write_secret_atomic(
+            &config.profile_dir("newer").join(".cloak-created-at"),
+            "2000",
+        )
+        .unwrap();
+
+        let accounts = list_accounts(&config).unwrap();
+        assert_eq!(accounts[0].name, "newer");
+        assert_eq!(accounts[1].name, "older");
     }
 
     #[test]

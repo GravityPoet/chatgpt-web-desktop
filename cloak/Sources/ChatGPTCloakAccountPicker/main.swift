@@ -63,6 +63,7 @@ final class AccountPickerAppDelegate: NSObject, NSApplicationDelegate {
 struct Account: Equatable {
     let name: String
     let directoryURL: URL
+    let createdAt: UInt64
     let seed: String
     let region: String?
     let localeEnabled: Bool
@@ -118,8 +119,13 @@ final class AccountStore {
                 let values = try? url.resourceValues(forKeys: [.isDirectoryKey])
                 return values?.isDirectory == true && url.lastPathComponent != "main"
             }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             .map { readAccount(at: $0) }
+            .sorted { lhs, rhs in
+                if lhs.createdAt != rhs.createdAt {
+                    return lhs.createdAt > rhs.createdAt
+                }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
     }
 
     func createAccount(named name: String) throws -> Account {
@@ -131,6 +137,7 @@ final class AccountStore {
 
         try secureAccountDirectory(directory)
         try writeSecret(String(randomSeed()), to: directory.appendingPathComponent(".cloak-seed"))
+        try writeSecret(currentCreatedAt(), to: directory.appendingPathComponent(".cloak-created-at"))
         return readAccount(at: directory)
     }
 
@@ -229,6 +236,7 @@ final class AccountStore {
         return Account(
             name: name,
             directoryURL: directory,
+            createdAt: createdAt(for: directory),
             seed: seed,
             region: region?.isEmpty == false ? region : nil,
             localeEnabled: localeEnabled,
@@ -240,7 +248,7 @@ final class AccountStore {
     private func secureAccountDirectory(_ directory: URL) throws {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         chmod(directory.path, S_IRWXU)
-        for fileName in [".cloak-seed", ".cloak-proxy", ".cloak-locale", ".cloak-region"] {
+        for fileName in [".cloak-seed", ".cloak-created-at", ".cloak-proxy", ".cloak-locale", ".cloak-region"] {
             let fileURL = directory.appendingPathComponent(fileName)
             if fileManager.fileExists(atPath: fileURL.path) {
                 chmod(fileURL.path, S_IRUSR | S_IWUSR)
@@ -280,6 +288,27 @@ final class AccountStore {
             return nil
         }
         return content.split(whereSeparator: \.isNewline).first.map(String.init)
+    }
+
+    private func createdAt(for directory: URL) -> UInt64 {
+        if let rawValue = readFirstLine(directory.appendingPathComponent(".cloak-created-at")),
+           let createdAt = UInt64(rawValue) {
+            return createdAt
+        }
+
+        let values = try? directory.resourceValues(forKeys: [.creationDateKey, .contentModificationDateKey])
+        if let date = values?.creationDate ?? values?.contentModificationDate {
+            return dateMicros(date)
+        }
+        return 0
+    }
+
+    private func currentCreatedAt() -> String {
+        String(dateMicros(Date()))
+    }
+
+    private func dateMicros(_ date: Date) -> UInt64 {
+        UInt64(max(date.timeIntervalSince1970, 0) * 1_000_000)
     }
 
     private func deterministicSeed(for name: String) -> String {
