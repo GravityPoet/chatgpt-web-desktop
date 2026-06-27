@@ -20,9 +20,9 @@ set -euo pipefail
 # and nothing ever rebuilds this bundle, so the icon stays green for good.
 #
 # Usage:   make-account-app.sh <account-name> [display-label]
-#   make-account-app.sh moonlitpoet88
-#   make-account-app.sh moonlitpoet88 "Cloak 工作号"
-#   DEST_DIR=~/Applications make-account-app.sh moonlitpoet88   # elsewhere
+#   make-account-app.sh demo-profile-88
+#   make-account-app.sh demo-profile-88 "Cloak 工作号"
+#   DEST_DIR=~/Applications make-account-app.sh demo-profile-88   # elsewhere
 #   ICON=/path/to/other.icns make-account-app.sh work           # custom icon
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

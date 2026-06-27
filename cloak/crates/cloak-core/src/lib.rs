@@ -1959,8 +1959,8 @@ mod tests {
 
     #[test]
     fn legacy_seed_matches_bash_contract() {
-        assert_eq!(legacy_seed("moonlitpoet88"), "77296");
-        assert_eq!(legacy_seed("starrypoet88"), "43105");
+        assert_eq!(legacy_seed("demo-profile-88"), "90584");
+        assert_eq!(legacy_seed("demo-alt-88"), "99363");
     }
 
     #[test]

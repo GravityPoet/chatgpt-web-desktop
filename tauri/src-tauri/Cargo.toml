@@ -2,7 +2,7 @@
 name = "chatgpt-rust"
 version = "0.2.0"
 description = "Cross-platform ChatGPT desktop wrapper with privacy spaces, built on Rust/Tauri."
-authors = ["moonlitpoet"]
+authors = ["Contributors"]
 edition = "2021"
 license = "MIT"
 
