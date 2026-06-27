@@ -63,6 +63,8 @@ Runtime login state is stored by the operating system WebView at runtime. The Sw
 
 The Swift app also includes a clear website data action for resetting this app's WebView cookies, login state, cache, localStorage, IndexedDB, service workers, and other local website data before reloading ChatGPT.
 
+The Swift app additionally provides optional, off-by-default fingerprint controls for a consistent per-profile browser identity: a stable Safari-family navigator/screen profile, enhanced-privacy noise for Canvas/WebGL/Audio, and WebRTC leak protection. Independently of those, when the network egress (for example a VPN exit) resolves to a different timezone than the system, the app aligns the page timezone with the exit so the reported timezone stays consistent with the exit IP, without otherwise altering the real Safari fingerprint.
+
 ## Build
 
 Swift:
@@ -84,7 +86,7 @@ npm run build:signed-dmg
 
 ## Status
 
-- Swift wrapper: native macOS AppKit/WKWebView path.
+- Swift wrapper: native macOS AppKit/WKWebView path; optional per-profile fingerprint controls and VPN-egress timezone alignment.
 - Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
 - Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.
 
