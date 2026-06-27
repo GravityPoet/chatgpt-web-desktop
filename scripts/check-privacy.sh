@@ -5,8 +5,8 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
 # Read-only guard: no backup needed. This script only scans Git content.
-LOCAL_USER="moonlitpoet"
-LOCAL_HOME="/Users/${LOCAL_USER}"
+LOCAL_HOME_RAW="${PRIVACY_LOCAL_HOME:-$HOME}"
+LOCAL_HOME="$(printf '%s' "$LOCAL_HOME_RAW" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
 SOCKET_KEY='"socket''Path"[[:space:]]*:'
 PATTERN="(@gmail\\.com|@icloud\\.com|${LOCAL_HOME}|\\.codegraph/daemon\\.(pid|sock)|${SOCKET_KEY})"
 ZERO_SHA="0000000000000000000000000000000000000000"
