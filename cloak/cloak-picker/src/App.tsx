@@ -19,6 +19,7 @@ import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "re
 type Account = {
   name: string;
   profile_path: string;
+  created_at: number;
   seed: string;
   region: string | null;
   locale_enabled: boolean;
@@ -584,7 +585,9 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     const account = accounts.find((item) => item.name === name) ?? accounts[0];
     return mockLaunchPlan(account) as T;
   }
-  if (command === "create_account") return { ...accounts[0], name: String(args?.name ?? "new"), seed: "68122" } as T;
+  if (command === "create_account") {
+    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, seed: "68122" } as T;
+  }
   if (command === "rename_account") return { ...accounts[0], name: String(args?.newName ?? "renamed") } as T;
   if (command === "set_proxy" || command === "set_region" || command === "toggle_locale") return accounts[0] as T;
   return undefined as T;
@@ -595,6 +598,7 @@ function mockAccounts(): Account[] {
     {
       name: "573505658353maddest_ferries3@icloud.com",
       profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/573505658353maddest_ferries3@icloud.com",
+      created_at: 1_700_000_001_000_000,
       seed: "48366",
       region: null,
       locale_enabled: false,
@@ -604,6 +608,7 @@ function mockAccounts(): Account[] {
     {
       name: "moonlitpoet88",
       profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/moonlitpoet88",
+      created_at: 1_700_000_002_000_000,
       seed: "77296",
       region: "JP",
       locale_enabled: true,
@@ -613,6 +618,7 @@ function mockAccounts(): Account[] {
     {
       name: "relish_callous4t",
       profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/relish_callous4t",
+      created_at: 1_700_000_003_000_000,
       seed: "68098",
       region: "US",
       locale_enabled: false,
