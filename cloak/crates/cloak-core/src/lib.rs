@@ -1966,8 +1966,8 @@ mod tests {
     #[test]
     fn account_name_validation_matches_picker_rules() {
         assert!(validate_account_name("work_01").is_ok());
-        assert!(validate_account_name("poet-quench-9i@icloud.com").is_ok());
-        assert!(validate_account_name("poet+quench@icloud.com").is_ok());
+        assert!(validate_account_name("poet-quench-9i@example.test").is_ok());
+        assert!(validate_account_name("poet+quench@example.test").is_ok());
         assert!(validate_account_name("main").is_err());
         assert!(validate_account_name("../x").is_err());
         assert!(validate_account_name("x\\y").is_err());

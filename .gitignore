@@ -40,3 +40,6 @@ tauri/src-tauri/target/
 # Audit process artifacts
 REPORT.md
 ground-truth.txt
+cloak/packaging/cloakbrowser-current.sha256
+cloak/selftest/last-result.json
+cloak/selftest/live-results/

@@ -598,8 +598,8 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
 function mockAccounts(): Account[] {
   return [
     {
-      name: "573505658353maddest_ferries3@icloud.com",
-      profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/573505658353maddest_ferries3@icloud.com",
+      name: "demo-alpha@example.test",
+      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-alpha@example.test",
       created_at: 1_700_000_001_000_000,
       seed: "48366",
       region: null,
@@ -608,8 +608,8 @@ function mockAccounts(): Account[] {
       has_proxy: false,
     },
     {
-      name: "moonlitpoet88",
-      profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/moonlitpoet88",
+      name: "demo-beta",
+      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-beta",
       created_at: 1_700_000_002_000_000,
       seed: "77296",
       region: "JP",
@@ -618,8 +618,8 @@ function mockAccounts(): Account[] {
       has_proxy: false,
     },
     {
-      name: "relish_callous4t",
-      profile_path: "/Users/moonlitpoet/Library/Application Support/ChatGPT Cloak/Accounts/relish_callous4t",
+      name: "demo-gamma",
+      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-gamma",
       created_at: 1_700_000_003_000_000,
       seed: "68098",
       region: "US",
@@ -638,20 +638,20 @@ function mockLaunchPlan(account: Account): LaunchPlan {
     extension_runtime_path: `${account.profile_path}/.cloak-companion`,
     load_extension_paths: [
       `${account.profile_path}/.cloak-companion`,
-      "/Users/moonlitpoet/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件/Chromium Web Store 插件",
-      "/Users/moonlitpoet/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/Chromium Web Store 插件",
+      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
     extra_extension_paths: [
-      "/Users/moonlitpoet/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件/Chromium Web Store 插件",
-      "/Users/moonlitpoet/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/Chromium Web Store 插件",
+      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
     selftest_extension_paths: [
-      "/Users/moonlitpoet/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
-    browser_binary: "/Users/moonlitpoet/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium",
+    browser_binary: "/Users/example/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium",
     proxy: {
       mode: account.has_proxy ? "relay" : "none",
       display: account.proxy_display,
