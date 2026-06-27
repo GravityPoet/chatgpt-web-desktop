@@ -51,9 +51,14 @@ swift/
 
 tauri/
   Rust + Tauri v2 cross-platform desktop implementation.
+
+cloak/
+  Multi-account macOS launcher: one isolated CloakBrowser (Chromium) profile per account.
 ```
 
 The Swift version is a native macOS implementation. The Tauri version is the cross-platform implementation for desktop builds across macOS, Windows, and Linux.
+
+The cloak version targets people who run several ChatGPT accounts and want each one to stay fully separate. Every account gets its own isolated Chromium profile (independent storage and login state) launched through a CloakBrowser build, with a per-account fingerprint seed (navigator/UA/GPU/platform), an optional per-account proxy, and timezone, locale, and WebRTC-IP values derived from that account's own network egress so each identity stays internally consistent. A small Dock picker app lists the accounts and launches the selected one.
 
 ## Privacy
 
