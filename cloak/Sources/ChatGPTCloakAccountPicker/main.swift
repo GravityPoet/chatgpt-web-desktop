@@ -604,6 +604,7 @@ final class AccountPickerViewController: NSViewController {
 
         let rows: [[NSView]] = [
             [metaKey("指纹"), metaValue(account.seed, monospaced: true)],
+            [metaKey("创建时间"), metaValue(createdAtLabel(for: account.createdAt))],
             [metaKey("区域"), metaValue(account.region ?? "未设置")],
             [metaKey("语言"), metaValue(account.localeEnabled ? "跟随出口" : "关")],
             [metaKey("代理"), metaValue(account.proxyDisplay)],
@@ -622,6 +623,17 @@ final class AccountPickerViewController: NSViewController {
         ])
 
         return card
+    }
+
+    private func createdAtLabel(for createdAt: UInt64) -> String {
+        guard createdAt > 0 else {
+            return "未知"
+        }
+
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: Date(timeIntervalSince1970: TimeInterval(createdAt) / 1_000_000))
     }
 
     private func selectedAccount() -> Account? {

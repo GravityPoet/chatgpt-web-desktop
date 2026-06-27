@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
+  CalendarClock,
   Globe2,
   KeyRound,
   Loader2,
@@ -336,6 +337,7 @@ export default function App() {
                 <section className="inspector">
                   <InspectorGroup title="Identity">
                     <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
+                    <InfoRow icon={<CalendarClock size={15} />} label="创建时间" value={formatCreatedAt(selected.created_at)} />
                     <InfoRow label="Profile" value={selected.profile_path} mono />
                   </InspectorGroup>
 
@@ -677,6 +679,17 @@ function middleTruncate(value: string, max: number) {
   if (value.length <= max) return value;
   const keep = Math.max(4, Math.floor((max - 1) / 2));
   return `${value.slice(0, keep)}…${value.slice(-keep)}`;
+}
+
+function formatCreatedAt(createdAtMicros: number) {
+  if (!Number.isFinite(createdAtMicros) || createdAtMicros <= 0) return "未知";
+  return new Intl.DateTimeFormat(undefined, {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(Math.floor(createdAtMicros / 1000)));
 }
 
 function extensionSummary(paths: string[]) {
