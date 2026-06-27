@@ -14,7 +14,7 @@ fi
 if [[ -z "$SHA_FILE" ]]; then
   SHA_FILE="$DEFAULT_SHA_FILE"
 fi
-ACCOUNT_NAME="${CLOAK_VERIFY_ACCOUNT:-challenge-smoke-9i@icloud.com}"
+ACCOUNT_NAME="${CLOAK_VERIFY_ACCOUNT:-challenge-smoke-9i@example.test}"
 
 fail() {
   printf 'FAIL: %s\n' "$*" >&2

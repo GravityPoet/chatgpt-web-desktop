@@ -289,7 +289,7 @@ do_rename() {
   local n new d s
   n="$(pick_account "重命名哪个账号：")"
   [[ -z "$n" ]] && return 0
-  new="$(ask "「$n」的新名字（可用邮箱格式，如 poet-quench-9i@icloud.com）：")"
+  new="$(ask "「$n」的新名字（可用邮箱格式，如 poet-quench-9i@example.test）：")"
   [[ -z "$new" ]] && return 0
   valid_account_name "$new" || { choose "$invalid_name_message" "好" >/dev/null; return 0; }
   d="$ACCT_BASE/$n"
@@ -322,7 +322,7 @@ main_menu() {
   [[ -z "$choice" ]] && exit 0
   case "$choice" in
     "$NEW")
-      n="$(ask "新账号名字（可用邮箱格式，如 poet-quench-9i@icloud.com）：")"
+      n="$(ask "新账号名字（可用邮箱格式，如 poet-quench-9i@example.test）：")"
       [[ -z "$n" ]] && exit 0
       valid_account_name "$n" || { choose "$invalid_name_message" "好" >/dev/null; main_menu; return; }
       create_account "$n" || { main_menu; return; }
