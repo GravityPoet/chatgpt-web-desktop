@@ -5,10 +5,19 @@ ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
 # Read-only guard: no backup needed. This script only scans Git content.
+escape_regex() {
+  printf '%s' "$1" | sed 's/[][\\.^$*+?{}|()]/\\&/g'
+}
+
 LOCAL_HOME_RAW="${PRIVACY_LOCAL_HOME:-$HOME}"
-LOCAL_HOME="$(printf '%s' "$LOCAL_HOME_RAW" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
+LOCAL_HOME="$(escape_regex "$LOCAL_HOME_RAW")"
+LOCAL_USER_RAW="${PRIVACY_LOCAL_USER:-$(id -un 2>/dev/null || basename "$HOME")}"
+LOCAL_USER_PATTERN=""
+if [[ "${#LOCAL_USER_RAW}" -ge 5 ]]; then
+  LOCAL_USER_PATTERN="|$(escape_regex "$LOCAL_USER_RAW")"
+fi
 SOCKET_KEY='"socket''Path"[[:space:]]*:'
-PATTERN="(@gmail\\.com|@icloud\\.com|${LOCAL_HOME}|\\.codegraph/daemon\\.(pid|sock)|${SOCKET_KEY})"
+PATTERN="(@gmail\\.com|@icloud\\.com|${LOCAL_HOME}${LOCAL_USER_PATTERN}|\\.codegraph/daemon\\.(pid|sock)|${SOCKET_KEY})"
 ZERO_SHA="0000000000000000000000000000000000000000"
 
 run_git_grep() {
