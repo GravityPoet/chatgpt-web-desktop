@@ -2682,7 +2682,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
-        if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled {
+        // 默认(无指纹混淆)仍对齐 VPN 出口时区:不伪造 navigator/screen,只修正 IP/时区错位。
+        // 未开 VPN(出口时区==系统时区)或尚未解析到出口时区时为 nil,完全保持原生 Safari 行为。
+        let timezoneOnlyScript = fingerprint == nil
+            ? FingerprintCatalog.timezoneOnlyScript(systemTimezone: TimeZone.current.identifier)
+            : nil
+        if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled || timezoneOnlyScript != nil {
             userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -2690,6 +2695,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
+        if let timezoneOnlyScript {
+            userContentController.addUserScript(WKUserScript(source: timezoneOnlyScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         if enhancedPrivacyEnabled {
             userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -4350,6 +4358,79 @@ private enum FingerprintCatalog {
         return issues
     }
 
+    /// 仅时区对齐的 JS 片段(只改 Intl.DateTimeFormat / Date.getTimezoneOffset,不碰 navigator/screen)。
+    /// 指纹脚本与「默认不混淆」时区脚本共用此片段,避免两处时区逻辑漂移。
+    private static func timezoneAlignmentBlock(timezone: String) -> String {
+        return """
+          try {
+            const OrigDTF = Intl.DateTimeFormat;
+            const TZ = \(jsonLiteral(timezone));
+            function DateTimeFormat(locales, options) {
+              const o = Object.assign({}, options || {});
+              if (!o.timeZone) o.timeZone = TZ;
+              return new OrigDTF(locales, o);
+            }
+            DateTimeFormat.prototype = OrigDTF.prototype;
+            for (const k of ['supportedLocalesOf']) {
+              if (typeof OrigDTF[k] === 'function') {
+                DateTimeFormat[k] = OrigDTF[k].bind(OrigDTF);
+                markFake(DateTimeFormat[k], k);
+              }
+            }
+            markFake(DateTimeFormat, 'DateTimeFormat');
+            Intl.DateTimeFormat = DateTimeFormat;
+            const origResolved = Object.getOwnPropertyDescriptor(OrigDTF.prototype, 'resolvedOptions');
+            if (origResolved && typeof origResolved.value === 'function') {
+              const origFn = origResolved.value;
+              function resolvedOptions() {
+                const r = origFn.call(this);
+                r.timeZone = TZ;
+                return r;
+              }
+              markFake(resolvedOptions, 'resolvedOptions');
+              Object.defineProperty(OrigDTF.prototype, 'resolvedOptions', { value: resolvedOptions, writable: true, configurable: true });
+            }
+            const origGetTZO = Date.prototype.getTimezoneOffset;
+            function getTimezoneOffset() {
+              try {
+                const parts = new OrigDTF('en-US', { timeZone: TZ, timeZoneName: 'shortOffset' }).formatToParts(this);
+                const tzPart = parts.find(p => p.type === 'timeZoneName');
+                if (tzPart && tzPart.value) {
+                  const m = tzPart.value.match(/GMT([+-])(\\d+)(?::(\\d+))?/);
+                  if (m) {
+                    const sign = m[1] === '+' ? -1 : 1;
+                    const h = parseInt(m[2], 10) || 0;
+                    const mi = parseInt(m[3] || '0', 10) || 0;
+                    return sign * (h * 60 + mi);
+                  }
+                }
+              } catch (_) {}
+              return origGetTZO.call(this);
+            }
+            markFake(getTimezoneOffset, 'getTimezoneOffset');
+            Date.prototype.getTimezoneOffset = getTimezoneOffset;
+          } catch (_) {}
+        """
+    }
+
+    /// 默认真 Safari(不混淆)下也对齐 VPN 出口时区:只改时区,绝不伪造 navigator/screen。
+    /// 仅当已解析到出口时区且与系统时区不同(典型 = 开了 VPN)时返回脚本;否则 nil(零注入、零影响)。
+    static func timezoneOnlyScript(systemTimezone: String) -> String? {
+        guard let timezone = GeoIPResolver.cachedTimezone(), timezone != systemTimezone else {
+            return nil
+        }
+        return """
+        (() => {
+          if (window.__wkTimezoneAlign) return;
+          try {
+            Object.defineProperty(window, '__wkTimezoneAlign', { value: true, configurable: false, writable: false });
+          } catch (_) {}
+          const markFake = window.__wkMarkNative || ((fn) => fn);
+        \(timezoneAlignmentBlock(timezone: timezone))
+        })();
+        """
+    }
+
     static func script(for fingerprint: FingerprintProfile) -> String {
         let languagesJSON = jsonLiteral(fingerprint.acceptLanguages)
         let primaryLanguage = fingerprint.acceptLanguages.first ?? "en-US"
@@ -4357,61 +4438,7 @@ private enum FingerprintCatalog {
         // timezone so a VPN user's page timezone matches their exit IP's country (Cloudflare flags
         // IP/timezone mismatch). Nil on both -> no override -> system timezone, unchanged behavior.
         let resolvedTimezone = fingerprint.timezone ?? GeoIPResolver.cachedTimezone()
-        let timezoneBlock: String
-        if let timezone = resolvedTimezone {
-            timezoneBlock = """
-              try {
-                const OrigDTF = Intl.DateTimeFormat;
-                const TZ = \(jsonLiteral(timezone));
-                function DateTimeFormat(locales, options) {
-                  const o = Object.assign({}, options || {});
-                  if (!o.timeZone) o.timeZone = TZ;
-                  return new OrigDTF(locales, o);
-                }
-                DateTimeFormat.prototype = OrigDTF.prototype;
-                for (const k of ['supportedLocalesOf']) {
-                  if (typeof OrigDTF[k] === 'function') {
-                    DateTimeFormat[k] = OrigDTF[k].bind(OrigDTF);
-                    markFake(DateTimeFormat[k], k);
-                  }
-                }
-                markFake(DateTimeFormat, 'DateTimeFormat');
-                Intl.DateTimeFormat = DateTimeFormat;
-                const origResolved = Object.getOwnPropertyDescriptor(OrigDTF.prototype, 'resolvedOptions');
-                if (origResolved && typeof origResolved.value === 'function') {
-                  const origFn = origResolved.value;
-                  function resolvedOptions() {
-                    const r = origFn.call(this);
-                    r.timeZone = TZ;
-                    return r;
-                  }
-                  markFake(resolvedOptions, 'resolvedOptions');
-                  Object.defineProperty(OrigDTF.prototype, 'resolvedOptions', { value: resolvedOptions, writable: true, configurable: true });
-                }
-                const origGetTZO = Date.prototype.getTimezoneOffset;
-                function getTimezoneOffset() {
-                  try {
-                    const parts = new OrigDTF('en-US', { timeZone: TZ, timeZoneName: 'shortOffset' }).formatToParts(this);
-                    const tzPart = parts.find(p => p.type === 'timeZoneName');
-                    if (tzPart && tzPart.value) {
-                      const m = tzPart.value.match(/GMT([+-])(\\d+)(?::(\\d+))?/);
-                      if (m) {
-                        const sign = m[1] === '+' ? -1 : 1;
-                        const h = parseInt(m[2], 10) || 0;
-                        const mi = parseInt(m[3] || '0', 10) || 0;
-                        return sign * (h * 60 + mi);
-                      }
-                    }
-                  } catch (_) {}
-                  return origGetTZO.call(this);
-                }
-                markFake(getTimezoneOffset, 'getTimezoneOffset');
-                Date.prototype.getTimezoneOffset = getTimezoneOffset;
-              } catch (_) {}
-            """
-        } else {
-            timezoneBlock = ""
-        }
+        let timezoneBlock = resolvedTimezone.map { timezoneAlignmentBlock(timezone: $0) } ?? ""
 
         return """
         (() => {
