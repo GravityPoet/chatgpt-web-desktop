@@ -63,6 +63,8 @@ Swift 版本是原生 macOS 实现。Tauri 版本是面向 macOS、Windows 和 L
 
 Swift App 也提供清空网站数据的菜单动作，可以在重新加载 ChatGPT 前重置本 App WebView 保存的 cookie、登录态、缓存、localStorage、IndexedDB、Service Worker 和其他本地网站数据。
 
+Swift App 还提供一组默认关闭的指纹控制项，用于在每个空间维持一致的浏览器身份：稳定的 Safari 家族 navigator/screen 画像、针对 Canvas/WebGL/Audio 的增强隐私扰动，以及 WebRTC 泄露防护。与这些独立：当网络出口（例如 VPN 出口）解析出的时区与系统不同时，App 会把页面时区与出口对齐，使上报时区与出口 IP 保持一致，且不改变其余真实 Safari 指纹。
+
 ## 构建
 
 Swift：
@@ -84,7 +86,7 @@ npm run build:signed-dmg
 
 ## 状态
 
-- Swift wrapper：原生 macOS AppKit/WKWebView 路线。
+- Swift wrapper：原生 macOS AppKit/WKWebView 路线；可选的每空间指纹控制与 VPN 出口时区对齐。
 - Tauri wrapper：Rust/Tauri v2 跨平台桌面路线。
 - 打包辅助：已包含 macOS app/DMG 辅助脚本；其他桌面目标可以沿用标准 Tauri build flow。
 
