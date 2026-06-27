@@ -93,6 +93,7 @@ npm run build:signed-dmg
 
 - Swift wrapper: native macOS AppKit/WKWebView path; optional per-profile fingerprint controls and VPN-egress timezone alignment.
 - Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
+- Cloak launcher: macOS multi-account path; per-account isolated CloakBrowser profile, fingerprint seed, optional proxy, and egress-derived timezone/locale/WebRTC-IP, with a Dock account picker.
 - Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.
 
 ## Disclaimer
