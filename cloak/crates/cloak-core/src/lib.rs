@@ -184,6 +184,7 @@ pub struct Account {
     pub name: String,
     pub profile_path: PathBuf,
     pub created_at: u64,
+    pub archived: bool,
     pub seed: String,
     pub region: Option<String>,
     pub locale_enabled: bool,
@@ -335,6 +336,14 @@ pub fn legacy_seed(name: &str) -> String {
 }
 
 pub fn list_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
+    list_accounts_by_archive_state(config, false)
+}
+
+pub fn list_archived_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
+    list_accounts_by_archive_state(config, true)
+}
+
+fn list_accounts_by_archive_state(config: &CloakConfig, archived: bool) -> Result<Vec<Account>> {
     fs::create_dir_all(&config.account_base)?;
     secure_dir(&config.account_base)?;
 
@@ -349,7 +358,10 @@ pub fn list_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
         if name == "main" || name.starts_with('.') {
             continue;
         }
-        accounts.push(read_account(config, &name)?);
+        let account = read_account(config, &name)?;
+        if account.archived == archived {
+            accounts.push(account);
+        }
     }
     accounts.sort_by(|a, b| {
         b.created_at
@@ -375,11 +387,13 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         .map(|p| p.display)
         .unwrap_or_else(|| "关".to_string());
     let created_at = account_created_at(&profile_path)?;
+    let archived = profile_path.join(".cloak-archived").exists();
 
     Ok(Account {
         name: name.to_string(),
         profile_path,
         created_at,
+        archived,
         seed,
         region: region.filter(|s| !s.is_empty()),
         locale_enabled,
@@ -433,6 +447,17 @@ pub fn delete_account(config: &CloakConfig, name: &str) -> Result<()> {
         fs::remove_dir_all(path)?;
     }
     Ok(())
+}
+
+pub fn set_account_archived(config: &CloakConfig, name: &str, archived: bool) -> Result<Account> {
+    let profile = ensure_profile(config, name)?;
+    let path = profile.join(".cloak-archived");
+    if archived {
+        write_secret_atomic(&path, "")?;
+    } else {
+        remove_if_present(&path)?;
+    }
+    read_account(config, name)
 }
 
 pub fn set_proxy(config: &CloakConfig, name: &str, value: Option<&str>) -> Result<Account> {
@@ -1829,6 +1854,7 @@ fn secure_account_dir(path: &Path) -> Result<()> {
     for file in [
         ".cloak-seed",
         ".cloak-created-at",
+        ".cloak-archived",
         ".cloak-proxy",
         ".cloak-locale",
         ".cloak-region",
@@ -2034,6 +2060,36 @@ mod tests {
         let accounts = list_accounts(&config).unwrap();
         assert_eq!(accounts[0].name, "newer");
         assert_eq!(accounts[1].name, "older");
+    }
+
+    #[test]
+    fn archived_accounts_are_hidden_until_restored() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        create_account(&config, "active").unwrap();
+        create_account(&config, "parked").unwrap();
+        let archived = set_account_archived(&config, "parked", true).unwrap();
+        assert!(archived.archived);
+
+        let active_accounts = list_accounts(&config).unwrap();
+        assert_eq!(active_accounts.len(), 1);
+        assert_eq!(active_accounts[0].name, "active");
+
+        let archived_accounts = list_archived_accounts(&config).unwrap();
+        assert_eq!(archived_accounts.len(), 1);
+        assert_eq!(archived_accounts[0].name, "parked");
+
+        let restored = set_account_archived(&config, "parked", false).unwrap();
+        assert!(!restored.archived);
+        assert_eq!(list_archived_accounts(&config).unwrap().len(), 0);
+        assert_eq!(list_accounts(&config).unwrap().len(), 2);
     }
 
     #[test]

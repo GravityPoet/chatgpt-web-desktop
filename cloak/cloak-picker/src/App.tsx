@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   AlertTriangle,
+  Archive,
+  ArchiveRestore,
   CalendarClock,
   Globe2,
   KeyRound,
@@ -21,6 +23,7 @@ type Account = {
   name: string;
   profile_path: string;
   created_at: number;
+  archived: boolean;
   seed: string;
   region: string | null;
   locale_enabled: boolean;
@@ -62,9 +65,11 @@ type DialogState =
   | { kind: "delete"; account: Account };
 
 const emptyAccounts: Account[] = [];
+type AccountView = "active" | "archived";
 
 export default function App() {
   const [accounts, setAccounts] = useState<Account[]>(emptyAccounts);
+  const [accountView, setAccountView] = useState<AccountView>("active");
   const [selectedName, setSelectedName] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
@@ -78,9 +83,10 @@ export default function App() {
     [accounts, selectedName],
   );
 
-  async function refresh(preferredName?: string) {
+  async function refresh(preferredName?: string, view: AccountView = accountView) {
     setError("");
-    const next = await call<Account[]>("list_accounts");
+    const command = view === "archived" ? "list_archived_accounts" : "list_accounts";
+    const next = await call<Account[]>(command);
     setAccounts(next);
     setSelectedName((current) => {
       if (preferredName && next.some((account) => account.name === preferredName)) return preferredName;
@@ -106,8 +112,8 @@ export default function App() {
   }
 
   useEffect(() => {
-    void run(() => refresh());
-  }, []);
+    void run(() => refresh(undefined, accountView));
+  }, [accountView]);
 
   useEffect(() => {
     if (!error) return;
@@ -157,7 +163,8 @@ export default function App() {
       const account = await run(() => call<Account>("create_account", { name: value }));
       if (account) {
         setDialog(null);
-        await refresh(account.name);
+        setAccountView("active");
+        await refresh(account.name, "active");
       }
       return;
     }
@@ -218,6 +225,18 @@ export default function App() {
     await run(() => call<void>("launch_account", { name: account.name }));
   }
 
+  async function setArchived(account: Account, archived: boolean) {
+    const updated = await run(() => call<Account>("archive_account", { name: account.name, archived }));
+    if (!updated) return;
+    setPlan(null);
+    if (archived) {
+      await refresh(undefined, "active");
+    } else {
+      setAccountView("active");
+      await refresh(updated.name, "active");
+    }
+  }
+
   async function confirmDeleteAccount(account: Account) {
     setBusy(true);
     setError("");
@@ -236,7 +255,9 @@ export default function App() {
     }
   }
 
-  const accountCountLabel = `${accounts.length} account${accounts.length === 1 ? "" : "s"}`;
+  const accountCountLabel = `${accounts.length} ${accountView === "archived" ? "archived" : "active"} account${accounts.length === 1 ? "" : "s"}`;
+  const emptyTitle = accountView === "archived" ? "暂无归档账号" : "暂无活跃账号";
+  const emptyAction = accountView === "archived" ? "查看活跃" : "新建账号";
   const proxyLabel = selected ? middleTruncate(selected.proxy_display, 48) : "";
   const planHasGeo = Boolean(plan?.geo.exit_ip && plan.geo.timezone);
   const planStatusLabel = planLoading
@@ -276,15 +297,38 @@ export default function App() {
             <span>Accounts</span>
             {busy ? <Loader2 className="spin" size={14} /> : null}
           </div>
+          <div className="viewSwitch" role="tablist" aria-label="账号视图">
+            <button
+              className={accountView === "active" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={accountView === "active"}
+              onClick={() => setAccountView("active")}
+            >
+              活跃
+            </button>
+            <button
+              className={accountView === "archived" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={accountView === "archived"}
+              onClick={() => setAccountView("archived")}
+            >
+              归档
+            </button>
+          </div>
 
           <div className="accountList">
             {accounts.length === 0 ? (
               <div className="emptyState">
-                <ShieldCheck size={24} />
-                <strong>暂无账号</strong>
-                <button className="subtleButton" onClick={openCreateDialog}>
-                  <Plus size={14} />
-                  新建账号
+                {accountView === "archived" ? <Archive size={24} /> : <ShieldCheck size={24} />}
+                <strong>{emptyTitle}</strong>
+                <button
+                  className="subtleButton"
+                  onClick={accountView === "archived" ? () => setAccountView("active") : openCreateDialog}
+                >
+                  {accountView === "archived" ? <ArchiveRestore size={14} /> : <Plus size={14} />}
+                  {emptyAction}
                 </button>
               </div>
             ) : (
@@ -338,6 +382,7 @@ export default function App() {
                   <InspectorGroup title="Identity">
                     <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
                     <InfoRow icon={<CalendarClock size={15} />} label="创建时间" value={formatCreatedAt(selected.created_at)} />
+                    <InfoRow icon={selected.archived ? <Archive size={15} /> : <ShieldCheck size={15} />} label="状态" value={selected.archived ? "已归档" : "活跃"} />
                     <InfoRow label="Profile" value={selected.profile_path} mono />
                   </InspectorGroup>
 
@@ -376,6 +421,11 @@ export default function App() {
                   <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
                   <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
                   <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
+                  <ActionButton
+                    icon={selected.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+                    label={selected.archived ? "恢复" : "归档"}
+                    onClick={() => void setArchived(selected, !selected.archived)}
+                  />
                   <ActionButton danger icon={<Trash2 size={15} />} label="删除" onClick={() => setDialog({ kind: "delete", account: selected })} />
                 </div>
               </footer>
@@ -581,16 +631,18 @@ function shouldUseMockTauri() {
 async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   await new Promise((resolve) => window.setTimeout(resolve, 80));
   const accounts = mockAccounts();
-  if (command === "list_accounts") return accounts as T;
+  if (command === "list_accounts") return accounts.filter((account) => !account.archived) as T;
+  if (command === "list_archived_accounts") return accounts.filter((account) => account.archived) as T;
   if (command === "launch_dry_run") {
     const name = String(args?.name ?? accounts[0].name);
     const account = accounts.find((item) => item.name === name) ?? accounts[0];
     return mockLaunchPlan(account) as T;
   }
   if (command === "create_account") {
-    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, seed: "68122" } as T;
+    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, seed: "68122" } as T;
   }
   if (command === "rename_account") return { ...accounts[0], name: String(args?.newName ?? "renamed") } as T;
+  if (command === "archive_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), archived: Boolean(args?.archived) } as T;
   if (command === "set_proxy" || command === "set_region" || command === "toggle_locale") return accounts[0] as T;
   return undefined as T;
 }
@@ -601,6 +653,7 @@ function mockAccounts(): Account[] {
       name: "demo-alpha@example.test",
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-alpha@example.test",
       created_at: 1_700_000_001_000_000,
+      archived: false,
       seed: "48366",
       region: null,
       locale_enabled: false,
@@ -611,6 +664,7 @@ function mockAccounts(): Account[] {
       name: "demo-beta",
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-beta",
       created_at: 1_700_000_002_000_000,
+      archived: false,
       seed: "77296",
       region: "JP",
       locale_enabled: true,
@@ -621,6 +675,7 @@ function mockAccounts(): Account[] {
       name: "demo-gamma",
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-gamma",
       created_at: 1_700_000_003_000_000,
+      archived: true,
       seed: "68098",
       region: "US",
       locale_enabled: false,
