@@ -64,6 +64,7 @@ struct Account: Equatable {
     let name: String
     let directoryURL: URL
     let createdAt: UInt64
+    let archived: Bool
     let seed: String
     let region: String?
     let localeEnabled: Bool
@@ -104,7 +105,7 @@ final class AccountStore {
         }
     }
 
-    func loadAccounts() throws -> [Account] {
+    func loadAccounts(includeArchived: Bool = false) throws -> [Account] {
         try fileManager.createDirectory(at: accountBaseURL, withIntermediateDirectories: true)
         chmod(accountBaseURL.path, S_IRWXU)
 
@@ -120,6 +121,7 @@ final class AccountStore {
                 return values?.isDirectory == true && url.lastPathComponent != "main"
             }
             .map { readAccount(at: $0) }
+            .filter { $0.archived == includeArchived }
             .sorted { lhs, rhs in
                 if lhs.createdAt != rhs.createdAt {
                     return lhs.createdAt > rhs.createdAt
@@ -197,6 +199,16 @@ final class AccountStore {
         try fileManager.removeItem(at: account.directoryURL)
     }
 
+    func setArchived(_ account: Account, archived: Bool) throws {
+        let target = account.directoryURL.appendingPathComponent(".cloak-archived")
+        try secureAccountDirectory(account.directoryURL)
+        if archived {
+            try writeSecret("", to: target)
+        } else {
+            removeIfPresent(target)
+        }
+    }
+
     func launch(_ account: Account) throws {
         try validateLaunchScript()
 
@@ -237,6 +249,7 @@ final class AccountStore {
             name: name,
             directoryURL: directory,
             createdAt: createdAt(for: directory),
+            archived: fileManager.fileExists(atPath: directory.appendingPathComponent(".cloak-archived").path),
             seed: seed,
             region: region?.isEmpty == false ? region : nil,
             localeEnabled: localeEnabled,
@@ -248,7 +261,7 @@ final class AccountStore {
     private func secureAccountDirectory(_ directory: URL) throws {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         chmod(directory.path, S_IRWXU)
-        for fileName in [".cloak-seed", ".cloak-created-at", ".cloak-proxy", ".cloak-locale", ".cloak-region"] {
+        for fileName in [".cloak-seed", ".cloak-created-at", ".cloak-archived", ".cloak-proxy", ".cloak-locale", ".cloak-region"] {
             let fileURL = directory.appendingPathComponent(fileName)
             if fileManager.fileExists(atPath: fileURL.path) {
                 chmod(fileURL.path, S_IRUSR | S_IWUSR)
@@ -339,9 +352,11 @@ final class AccountPickerViewController: NSViewController {
     private let store: AccountStore
     private var accounts: [Account] = []
     private var selectedAccountName: String?
+    private var showArchived = false
     private let listStack = NSStackView()
     private let detailStack = NSStackView()
     private let accountCountLabel = NSTextField(labelWithString: "")
+    private let accountViewControl = NSSegmentedControl(labels: ["活跃", "归档"], trackingMode: .selectOne, target: nil, action: nil)
 
     init(store: AccountStore) {
         self.store = store
@@ -415,6 +430,10 @@ final class AccountPickerViewController: NSViewController {
         header.addArrangedSubview(toolbarButton("刷新", symbol: "arrow.clockwise", action: #selector(refreshAccounts)))
         header.addArrangedSubview(toolbarButton("新建", symbol: "plus", action: #selector(newAccount)))
 
+        accountViewControl.selectedSegment = 0
+        accountViewControl.target = self
+        accountViewControl.action = #selector(accountViewChanged(_:))
+
         let scrollView = NSScrollView()
         scrollView.drawsBackground = false
         scrollView.hasVerticalScroller = true
@@ -441,6 +460,7 @@ final class AccountPickerViewController: NSViewController {
 
         let stack = paneStack(in: pane)
         stack.addArrangedSubview(header)
+        stack.addArrangedSubview(accountViewControl)
         stack.addArrangedSubview(scrollView)
     }
 
@@ -485,7 +505,7 @@ final class AccountPickerViewController: NSViewController {
 
     private func reloadAccounts(selecting desiredName: String?) {
         do {
-            accounts = try store.loadAccounts()
+            accounts = try store.loadAccounts(includeArchived: showArchived)
         } catch {
             presentError(error, title: "无法读取账号")
             accounts = []
@@ -505,15 +525,15 @@ final class AccountPickerViewController: NSViewController {
 
     private func renderList() {
         clearStack(listStack)
-        accountCountLabel.stringValue = "\(accounts.count) 个隔离账号"
+        accountCountLabel.stringValue = showArchived ? "\(accounts.count) 个归档账号" : "\(accounts.count) 个活跃账号"
 
         guard !accounts.isEmpty else {
             listStack.addArrangedSubview(EmptyStateView(
-                title: "还没有账号",
-                subtitle: "先新建一个隔离账号。",
-                buttonTitle: "新建账号",
+                title: showArchived ? "还没有归档账号" : "还没有账号",
+                subtitle: showArchived ? "归档的账号会在这里恢复。" : "先新建一个隔离账号。",
+                buttonTitle: showArchived ? "查看活跃" : "新建账号",
                 target: self,
-                action: #selector(newAccount)
+                action: showArchived ? #selector(showActiveAccounts) : #selector(newAccount)
             ))
             return
         }
@@ -576,8 +596,8 @@ final class AccountPickerViewController: NSViewController {
              actionButton("区域", symbol: "tag", action: #selector(editRegion))],
             [actionButton(account.localeEnabled ? "关闭语言" : "开启语言", symbol: "globe", action: #selector(toggleLocale)),
              actionButton("重命名", symbol: "pencil", action: #selector(renameAccount))],
-            [dangerButton("删除账号", symbol: "trash", action: #selector(deleteAccount)),
-             actionButton("刷新", symbol: "arrow.clockwise", action: #selector(refreshAccounts))],
+            [actionButton(account.archived ? "恢复" : "归档", symbol: account.archived ? "arrow.uturn.backward" : "archivebox", action: #selector(toggleArchive)),
+             dangerButton("删除账号", symbol: "trash", action: #selector(deleteAccount))],
         ])
         actionGrid.rowSpacing = 8
         actionGrid.columnSpacing = 8
@@ -605,6 +625,7 @@ final class AccountPickerViewController: NSViewController {
         let rows: [[NSView]] = [
             [metaKey("指纹"), metaValue(account.seed, monospaced: true)],
             [metaKey("创建时间"), metaValue(createdAtLabel(for: account.createdAt))],
+            [metaKey("状态"), metaValue(account.archived ? "已归档" : "活跃")],
             [metaKey("区域"), metaValue(account.region ?? "未设置")],
             [metaKey("语言"), metaValue(account.localeEnabled ? "跟随出口" : "关")],
             [metaKey("代理"), metaValue(account.proxyDisplay)],
@@ -653,6 +674,17 @@ final class AccountPickerViewController: NSViewController {
         reloadAccounts(selecting: selectedAccountName)
     }
 
+    @objc private func accountViewChanged(_ sender: NSSegmentedControl) {
+        showArchived = sender.selectedSegment == 1
+        reloadAccounts(selecting: nil)
+    }
+
+    @objc private func showActiveAccounts() {
+        showArchived = false
+        accountViewControl.selectedSegment = 0
+        reloadAccounts(selecting: nil)
+    }
+
     @objc private func newAccount() {
         guard let name = promptForText(title: "新建账号", message: "可用字母、数字、.、@、+、-、_；不能叫 main。")?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -662,6 +694,8 @@ final class AccountPickerViewController: NSViewController {
 
         do {
             let account = try store.createAccount(named: name)
+            showArchived = false
+            accountViewControl.selectedSegment = 0
             reloadAccounts(selecting: account.name)
         } catch {
             presentError(error, title: "无法新建账号")
@@ -740,6 +774,25 @@ final class AccountPickerViewController: NSViewController {
             reloadAccounts(selecting: newName)
         } catch {
             presentError(error, title: "无法重命名账号")
+        }
+    }
+
+    @objc private func toggleArchive() {
+        guard let account = selectedAccount() else {
+            return
+        }
+
+        do {
+            try store.setArchived(account, archived: !account.archived)
+            if account.archived {
+                showArchived = false
+                accountViewControl.selectedSegment = 0
+                reloadAccounts(selecting: account.name)
+            } else {
+                reloadAccounts(selecting: nil)
+            }
+        } catch {
+            presentError(error, title: account.archived ? "无法恢复账号" : "无法归档账号")
         }
     }
 
