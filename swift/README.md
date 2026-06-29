@@ -9,11 +9,12 @@
 - 原生 `NSWindow`，窗口大小和位置由 macOS `setFrameAutosaveName` 记住
 - 原生 Dock / App 图标 / 菜单 / 轻量工具栏，toolbar 自定义布局会保存
 - `WKWebView` 加载 `https://chatgpt.com/`
-- 慢加载、白屏、WebKit 渲染进程重启和加载失败会显示原生状态层，并尽量自动恢复
+- 慢加载会收敛到 toolbar 状态；白屏、WebKit 渲染进程重启和加载失败才显示原生状态层，并尽量自动恢复
 - 本机输入草稿恢复：刷新、白屏恢复或渲染进程重启后，尽量把未发送输入还原到网页输入框
+- 可选后台完成通知：窗口不在前台时，检测到网页回复从生成中变为空闲后发送 macOS 通知
 - 可把 Apple Notes 当前选中的备忘录正文作为文本上下文插入 ChatGPT 输入框
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
-- 只读 `诊断…` 面板，可复制 App/Profile/WebView/分发状态，便于排查白屏、加载失败和 WebKit 进程重启
+- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索和最近本 App 日志
 - 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`

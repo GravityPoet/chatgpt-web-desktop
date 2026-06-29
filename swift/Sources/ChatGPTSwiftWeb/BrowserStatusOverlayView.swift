@@ -2,7 +2,6 @@ import AppKit
 
 enum BrowserStatusOverlayMode: Equatable {
     case hidden
-    case slowLoading(progress: Int)
     case recovering(String)
     case blank(String)
     case failed(String)
@@ -15,8 +14,6 @@ enum BrowserStatusOverlayMode: Equatable {
         switch self {
         case .hidden:
             return ""
-        case let .slowLoading(progress):
-            return "ChatGPT 仍在加载 \(progress)%"
         case .recovering:
             return "正在恢复页面"
         case .blank:
@@ -30,8 +27,6 @@ enum BrowserStatusOverlayMode: Equatable {
         switch self {
         case .hidden:
             return ""
-        case .slowLoading:
-            return "网页脚本或网络响应偏慢，可以继续等待或重新加载。"
         case let .recovering(reason):
             return reason
         case let .blank(reason):
@@ -43,7 +38,7 @@ enum BrowserStatusOverlayMode: Equatable {
 
     var showsProgress: Bool {
         switch self {
-        case .slowLoading, .recovering:
+        case .recovering:
             return true
         case .hidden, .blank, .failed:
             return false
@@ -54,7 +49,7 @@ enum BrowserStatusOverlayMode: Equatable {
         switch self {
         case .hidden:
             return nil
-        case .slowLoading, .failed:
+        case .failed:
             return "重新加载"
         case .recovering, .blank:
             return "恢复"
@@ -65,8 +60,6 @@ enum BrowserStatusOverlayMode: Equatable {
         switch self {
         case .hidden:
             return "hidden"
-        case let .slowLoading(progress):
-            return "slowLoading progress=\(progress)"
         case let .recovering(reason):
             return "recovering \(reason)"
         case let .blank(reason):

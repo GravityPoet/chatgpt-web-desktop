@@ -17,6 +17,7 @@ let package = Package(
                 .linkedFramework("AppKit"),
                 .linkedFramework("WebKit"),
                 .linkedFramework("UniformTypeIdentifiers"),
+                .linkedFramework("UserNotifications"),
             ]
         ),
     ]
