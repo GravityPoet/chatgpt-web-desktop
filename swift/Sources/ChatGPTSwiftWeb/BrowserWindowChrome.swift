@@ -25,7 +25,7 @@ extension BrowserWindowController {
         toolbar.displayMode = .iconOnly
         toolbar.sizeMode = .regular
         toolbar.allowsUserCustomization = true
-        toolbar.autosavesConfiguration = false
+        toolbar.autosavesConfiguration = true
         window.toolbar = toolbar
         if #available(macOS 11.0, *) {
             window.toolbarStyle = .unifiedCompact

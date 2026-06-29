@@ -5,6 +5,8 @@ struct AppSettingsState {
     let currentProfileName: String
     let startupProfileName: String
     let homepage: String
+    let promptDraftRestoreEnabled: Bool
+    let promptDraftSummary: String
     let profileIsolation: String
     let fingerprintName: String
     let enhancedPrivacyEnabled: Bool
@@ -16,6 +18,7 @@ struct AppSettingsState {
 }
 
 struct AppSettingsCallbacks {
+    let setPromptDraftRestore: (Bool) -> Void
     let setWebRTCProtection: (Bool) -> Void
     let setThirdPartyLinksInApp: (Bool) -> Void
     let setEnhancedPrivacy: (Bool) -> Void
@@ -58,13 +61,13 @@ final class AppSettingsWindowController: NSWindowController {
         self.callbacks = callbacks
 
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 680, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
         )
         window.title = "设置"
-        window.minSize = NSSize(width: 640, height: 460)
+        window.minSize = NSSize(width: 680, height: 500)
         window.isReleasedWhenClosed = false
         if #available(macOS 11.0, *) {
             window.toolbarStyle = .unifiedCompact
@@ -203,6 +206,13 @@ final class AppSettingsWindowController: NSWindowController {
         addKeyValue("当前账号空间", state.currentProfileName)
         addKeyValue("启动默认空间", state.startupProfileName)
         addKeyValue("当前空间首页", state.homepage)
+        addToggle(
+            "恢复输入草稿（本机）",
+            detail: "刷新、白屏恢复或 WebKit 进程重启后，尽量把当前空间未发送的输入还原到 ChatGPT 输入框。",
+            state: state.promptDraftRestoreEnabled,
+            action: #selector(togglePromptDraftRestore(_:))
+        )
+        addKeyValue("当前草稿", state.promptDraftSummary)
         addKeyValue("数据隔离", state.profileIsolation)
         addActionButton("打开诊断", action: #selector(showDiagnostics(_:)))
     }
@@ -331,6 +341,10 @@ final class AppSettingsWindowController: NSWindowController {
 
     @objc private func toggleWebRTC(_ sender: NSButton) {
         callbacks.setWebRTCProtection(sender.state == .on)
+    }
+
+    @objc private func togglePromptDraftRestore(_ sender: NSButton) {
+        callbacks.setPromptDraftRestore(sender.state == .on)
     }
 
     @objc private func toggleThirdPartyLinks(_ sender: NSButton) {

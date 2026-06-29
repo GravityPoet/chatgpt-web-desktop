@@ -7,8 +7,10 @@
 - 独立 bundle id：`local.chatgpt-web.swift`
 - 独立 Cookie / WebsiteDataStore，与 Chrome、Tauri 版隔离
 - 原生 `NSWindow`，窗口大小和位置由 macOS `setFrameAutosaveName` 记住
-- 原生 Dock / App 图标 / 菜单 / 轻量工具栏
+- 原生 Dock / App 图标 / 菜单 / 轻量工具栏，toolbar 自定义布局会保存
 - `WKWebView` 加载 `https://chatgpt.com/`
+- 慢加载、白屏、WebKit 渲染进程重启和加载失败会显示原生状态层，并尽量自动恢复
+- 本机输入草稿恢复：刷新、白屏恢复或渲染进程重启后，尽量把未发送输入还原到网页输入框
 - 可把 Apple Notes 当前选中的备忘录正文作为文本上下文插入 ChatGPT 输入框
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
 - 只读 `诊断…` 面板，可复制 App/Profile/WebView/分发状态，便于排查白屏、加载失败和 WebKit 进程重启
@@ -82,6 +84,8 @@ open "/Applications/ChatGPT Swift.app"
 ## 原生聊天架构边界
 
 当前主聊天 UI 仍是 `chatgpt.com` 的整页 `WKWebView`。原生消息列表、原生 token streaming、原生 composer、代码块/表格/数学公式组件可以做，但不能可靠复用 `chatgpt.com` 私有 DOM；需要改成 OpenAI API 或自有中间层驱动的原生聊天栈，再实现会话存储、虚拟列表、异步 Markdown 渲染和组件化富文本。
+
+Route A 当前策略：不新增第二个聊天界面，不替换主聊天区；只在现有 WebView 壳层上补窗口、状态、恢复、设置、诊断和少量 macOS 原生集成。
 
 官方参考：
 - [ChatGPT macOS app release notes](https://help.openai.com/en/articles/9703738-chatgpt-macos-app-release-notes)

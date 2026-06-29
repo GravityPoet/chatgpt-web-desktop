@@ -12,9 +12,12 @@ private let latestReleaseAPIURL = URL(string: "https://api.github.com/repos/Grav
 private let browserLogger = Logger(subsystem: appBundleIdentifier, category: "Browser")
 private let mainFrameDefaultsKey = "ChatGPTSwiftWeb.MainWindowFrame"
 private let webZoomDefaultsKey = "ChatGPTSwiftWeb.WebViewZoom"
+private let promptDraftRestoreDefaultsKey = "ChatGPTSwiftWeb.PromptDraftRestoreEnabled"
+private let promptDraftDefaultsPrefix = "ChatGPTSwiftWeb.PromptDraft."
 private let minimumWebZoom: CGFloat = 0.85
 private let maximumWebZoom: CGFloat = 1.40
 private let webZoomStep: CGFloat = 0.05
+private let maximumPromptDraftCharacters = 12_000
 private let maximumCookieImportBytes = 2 * 1024 * 1024
 private let maximumChatGPTCookieHeaderBytes = 6 * 1024
 private let maximumBridgeDownloadBytes = 200 * 1024 * 1024
@@ -49,6 +52,59 @@ private struct GitHubRelease: Decodable {
         case name
         case htmlURL = "html_url"
         case publishedAt = "published_at"
+    }
+}
+
+private enum PromptDraftStore {
+    static func isRestoreEnabled() -> Bool {
+        if UserDefaults.standard.object(forKey: promptDraftRestoreDefaultsKey) == nil {
+            return true
+        }
+        return UserDefaults.standard.bool(forKey: promptDraftRestoreDefaultsKey)
+    }
+
+    static func setRestoreEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: promptDraftRestoreDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+
+    static func draft(for profileID: String?) -> String {
+        UserDefaults.standard.string(forKey: draftKey(profileID: profileID)) ?? ""
+    }
+
+    static func draftSummary(for profileID: String?) -> String {
+        let draft = draft(for: profileID)
+        guard !draft.isEmpty else {
+            return "无"
+        }
+        return "\(draft.count) 个字符，仅保存在本机偏好中"
+    }
+
+    static func saveDraft(_ rawText: String, profileID: String?) {
+        let text = normalizedDraft(rawText)
+        let key = draftKey(profileID: profileID)
+        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            UserDefaults.standard.removeObject(forKey: key)
+        } else {
+            UserDefaults.standard.set(text, forKey: key)
+        }
+    }
+
+    static func clearDraft(for profileID: String?) {
+        UserDefaults.standard.removeObject(forKey: draftKey(profileID: profileID))
+        UserDefaults.standard.synchronize()
+    }
+
+    private static func draftKey(profileID: String?) -> String {
+        promptDraftDefaultsPrefix + (profileID ?? defaultProfileID)
+    }
+
+    private static func normalizedDraft(_ rawText: String) -> String {
+        let text = rawText.replacingOccurrences(of: "\r\n", with: "\n")
+        if text.count <= maximumPromptDraftCharacters {
+            return text
+        }
+        return String(text.prefix(maximumPromptDraftCharacters))
     }
 }
 
@@ -323,6 +379,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             controller = AppSettingsWindowController(
                 state: makeAppSettingsState(),
                 callbacks: AppSettingsCallbacks(
+                    setPromptDraftRestore: { [weak self] enabled in
+                        self?.setPromptDraftRestoreFromSettings(enabled)
+                    },
                     setWebRTCProtection: { [weak self] enabled in
                         self?.setWebRTCProtectionFromSettings(enabled)
                     },
@@ -400,6 +459,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         PrivacySettings.setWebRTCProtectionEnabled(enabled)
         updateWebRTCProtectionMenuItem()
         rebuildMainController(initialURL: mainController?.currentURL())
+        refreshNativeUtilityWindows()
+    }
+
+    private func setPromptDraftRestoreFromSettings(_ enabled: Bool) {
+        PromptDraftStore.setRestoreEnabled(enabled)
+        if !enabled {
+            PromptDraftStore.clearDraft(for: ProfileStore.currentProfileID())
+        }
+        mainController?.restorePromptDraftIfAvailable(reason: "settings toggled")
         refreshNativeUtilityWindows()
     }
 
@@ -522,6 +590,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             currentProfileName: profile.name,
             startupProfileName: startupName,
             homepage: ProfileStore.homepageURL(for: profile.id).absoluteString,
+            promptDraftRestoreEnabled: PromptDraftStore.isRestoreEnabled(),
+            promptDraftSummary: PromptDraftStore.draftSummary(for: profile.id),
             profileIsolation: isolation,
             fingerprintName: fingerprintName,
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
@@ -558,6 +628,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("当前空间", profile.name),
             ("首页", ProfileStore.homepageURL(for: profile.id).absoluteString),
             ("启动默认空间", ProfileStore.startupProfileID()),
+            ("本机草稿恢复", PromptDraftStore.isRestoreEnabled() ? "开启" : "关闭"),
+            ("当前空间草稿", PromptDraftStore.draftSummary(for: profile.id)),
             ("指纹预设", fingerprintName),
             ("增强隐私模式", ProfileStore.isEnhancedPrivacyEnabled(for: profile.id) ? "开启" : "关闭"),
             ("WebRTC 防护", PrivacySettings.isWebRTCProtectionEnabled() ? "开启" : "关闭"),
@@ -1576,6 +1648,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private(set) var window: NSWindow!
     private(set) var webView: WKWebView!
+    private var contentContainer: NSView!
+    private var statusOverlay: BrowserStatusOverlayView!
     private var childControllers: [BrowserWindowController] = []
     private let isPopup: Bool
     private let persistent: Bool
@@ -1594,6 +1668,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var lastBlankRecoverySummary = "无"
     private var lastNavigationStartedAt: Date?
     private var lastNavigationFinishedAt: Date?
+    private var loadingWatchdogGeneration = 0
+    private var currentOverlayMode = BrowserStatusOverlayMode.hidden
     var toolbarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     var statusLabel: NSTextField?
     var statusContainer: NSView?
@@ -1644,17 +1720,35 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         window = NSWindow(contentRect: restoredFrame ?? defaultRect, styleMask: style, backing: .buffered, defer: false)
         window.title = title
         window.delegate = self
-        window.contentView = webView
         window.titlebarAppearsTransparent = false
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 900, height: 640)
         window.tabbingMode = .disallowed
+        contentContainer = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
+        contentContainer.autoresizingMask = [.width, .height]
+        webView.translatesAutoresizingMaskIntoConstraints = false
+        statusOverlay = BrowserStatusOverlayView()
+        statusOverlay.primaryAction = { [weak self] in
+            self?.reload(nil)
+        }
+        contentContainer.addSubview(webView)
+        contentContainer.addSubview(statusOverlay)
+        window.contentView = contentContainer
+        NSLayoutConstraint.activate([
+            webView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            webView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            webView.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            webView.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor),
+
+            statusOverlay.topAnchor.constraint(equalTo: contentContainer.safeAreaLayoutGuide.topAnchor, constant: 12),
+            statusOverlay.centerXAnchor.constraint(equalTo: contentContainer.centerXAnchor),
+            statusOverlay.widthAnchor.constraint(lessThanOrEqualTo: contentContainer.widthAnchor, constant: -48)
+        ])
         configureNativeToolbar()
         if isPopup || restoredFrame == nil {
             window.center()
         }
 
-        webView.autoresizingMask = [.width, .height]
         observeWebViewState()
 
         if let initialURL {
@@ -1766,6 +1860,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("lastRenderProbe", lastRenderProbeSummary),
             ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
             ("lastBlankRecovery", lastBlankRecoverySummary),
+            ("nativeStatusOverlay", currentOverlayMode.diagnosticDescription),
             ("webContentProcessTerminationCount", "\(webContentProcessTerminationCount)"),
             ("navigationFailureCount", "\(navigationFailureCount)"),
             ("lastNavigationFailure", lastNavigationFailureDescription),
@@ -1985,6 +2080,42 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         closeHandler?()
     }
 
+    private func showStatusOverlay(_ mode: BrowserStatusOverlayMode) {
+        currentOverlayMode = mode
+        statusOverlay?.update(mode: mode)
+    }
+
+    private func hideStatusOverlayIfTransient() {
+        switch currentOverlayMode {
+        case .hidden, .failed, .blank:
+            return
+        case .slowLoading, .recovering:
+            showStatusOverlay(.hidden)
+        }
+    }
+
+    private func startLoadingWatchdog(reason: String) {
+        loadingWatchdogGeneration += 1
+        let generation = loadingWatchdogGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + 8.0) { [weak self, weak webView] in
+            guard let self,
+                  let webView,
+                  self.webView === webView,
+                  !self.isDisposing,
+                  generation == self.loadingWatchdogGeneration,
+                  webView.isLoading else {
+                return
+            }
+            let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
+            browserLogger.info("Navigation still loading after watchdog delay (\(reason, privacy: .public)); progress=\(percent, privacy: .public)")
+            self.showStatusOverlay(.slowLoading(progress: percent))
+        }
+    }
+
+    private func stopLoadingWatchdog() {
+        loadingWatchdogGeneration += 1
+    }
+
     private func invalidateRenderedContentProbes() {
         renderProbeGeneration += 1
     }
@@ -2044,10 +2175,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 browserLogger.error("Rendered content probe found blank page (\(reason, privacy: .public)) at \(urlText, privacy: .public); textLength=\(textLength, privacy: .public), visibleElements=\(visibleElements, privacy: .public), bodyChildren=\(bodyChildren, privacy: .public)")
                 if recoverIfBlank {
                     setStatus("页面空白，正在自动恢复…", showsProgress: true)
+                    showStatusOverlay(.recovering("页面内容探针判定当前页为空，正在重新载入。"))
                     recoverFromBlankContent(reason: reason)
+                } else {
+                    showStatusOverlay(.blank("页面内容探针判定当前页为空，可以点恢复重新载入。"))
                 }
             } else {
                 blankRecoveryAttempts = 0
+                hideStatusOverlayIfTransient()
             }
 
             completion?(isBlank)
@@ -2058,6 +2193,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard blankRecoveryAttempts < 2 else {
             browserLogger.error("Blank page recovery suppressed after repeated attempts (\(reason, privacy: .public))")
             setStatus("自动恢复已停止，请手动重新加载", showsProgress: false)
+            showStatusOverlay(.blank("自动恢复已达到上限，避免循环刷新；可以手动点恢复再试。"))
             return
         }
 
@@ -2066,6 +2202,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastBlankRecoverySummary = "\(Self.diagnosticDateString(Date())) reason=\(reason), url=\(urlText)"
         browserLogger.error("Recovering blank WebView (\(reason, privacy: .public)) at \(urlText, privacy: .public)")
         setStatus("正在恢复页面…", showsProgress: true)
+        showStatusOverlay(.recovering("正在重新载入 \(urlText)。"))
 
         if let appDelegate = NSApp.delegate as? AppDelegate {
             appDelegate.recoverBlankContent(in: self)
@@ -2093,6 +2230,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastNavigationStartedAt = Date()
         lastRenderProbeWasBlank = false
         invalidateRenderedContentProbes()
+        if case .recovering = currentOverlayMode {
+            statusOverlay?.update(mode: currentOverlayMode)
+        } else {
+            showStatusOverlay(.hidden)
+        }
+        startLoadingWatchdog(reason: "navigation started")
         updateNativeChromeStatus()
     }
 
@@ -2148,8 +2291,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         lastNavigationFinishedAt = Date()
+        stopLoadingWatchdog()
+        hideStatusOverlayIfTransient()
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
+        schedulePromptDraftRestore(reason: "navigation finished")
         scheduleRenderedContentProbe(reason: "navigation finished", delay: 2.0)
         updateNativeChromeStatus()
     }
@@ -2160,24 +2306,39 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webContentProcessTerminationCount += 1
         browserLogger.error("Web content process terminated; reloading to recover blank view")
         setStatus("渲染进程已重启，正在恢复…", showsProgress: true)
+        showStatusOverlay(.recovering("WebKit 渲染进程刚刚重启，正在重新载入当前页面。"))
         let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
         webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard !Self.isBenignNavigationError(error) else {
+            updateNativeChromeStatus()
+            return
+        }
+
         // Surface the failure so a blank window after a failed load is diagnosable in the unified log.
         navigationFailureCount += 1
         lastNavigationFailureDescription = error.localizedDescription
         lastRenderProbeWasBlank = true
+        stopLoadingWatchdog()
         setStatus("页面加载失败", showsProgress: false)
+        showStatusOverlay(.failed(error.localizedDescription))
         browserLogger.error("Provisional navigation failed: \(error.localizedDescription, privacy: .public)")
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard !Self.isBenignNavigationError(error) else {
+            updateNativeChromeStatus()
+            return
+        }
+
         navigationFailureCount += 1
         lastNavigationFailureDescription = error.localizedDescription
         lastRenderProbeWasBlank = true
+        stopLoadingWatchdog()
         setStatus("页面加载失败", showsProgress: false)
+        showStatusOverlay(.failed(error.localizedDescription))
         browserLogger.error("Navigation failed: \(error.localizedDescription, privacy: .public)")
     }
 
@@ -2263,9 +2424,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "promptDraft" {
+            handlePromptDraftMessage(message)
+            return
+        }
+
         guard message.name == "downloadBlob",
               message.frameInfo.isMainFrame,
-              Self.isTrustedDownloadBridgeOrigin(message.frameInfo.securityOrigin),
+              Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any]
         else {
             return
@@ -2277,6 +2443,20 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         saveImageDownloadPayload(payload)
+    }
+
+    private func handlePromptDraftMessage(_ message: WKScriptMessage) {
+        guard persistent,
+              PromptDraftStore.isRestoreEnabled(),
+              message.frameInfo.isMainFrame,
+              Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
+              let payload = message.body as? [String: Any],
+              let rawText = payload["text"] as? String
+        else {
+            return
+        }
+
+        PromptDraftStore.saveDraft(rawText, profileID: profileID)
     }
 
     private func saveImageDownloadPayload(_ payload: [String: Any]) {
@@ -2396,6 +2576,51 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         } catch (_) {}
         """
         webView.evaluateJavaScript(script, completionHandler: nil)
+    }
+
+    func restorePromptDraftIfAvailable(reason: String) {
+        guard persistent,
+              PromptDraftStore.isRestoreEnabled() else {
+            return
+        }
+
+        let draft = PromptDraftStore.draft(for: profileID)
+        guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        webView.evaluateJavaScript(Self.restorePromptDraftScript(text: draft)) { result, error in
+            if let error {
+                browserLogger.debug("Prompt draft restore failed (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+                return
+            }
+
+            guard let report = result as? [String: Any],
+                  Self.boolValue(report["restored"]) else {
+                return
+            }
+            browserLogger.info("Prompt draft restored (\(reason, privacy: .public))")
+        }
+    }
+
+    private func schedulePromptDraftRestore(reason: String) {
+        guard persistent,
+              PromptDraftStore.isRestoreEnabled(),
+              !PromptDraftStore.draft(for: profileID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        for delay in [0.9, 2.8] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak webView] in
+                guard let self,
+                      let webView,
+                      self.webView === webView,
+                      !self.isDisposing else {
+                    return
+                }
+                self.restorePromptDraftIfAvailable(reason: reason)
+            }
+        }
     }
 
     private func renderFingerprintReport() {
@@ -3225,6 +3450,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return 0
     }
 
+    private static func isBenignNavigationError(_ error: Error) -> Bool {
+        let nsError = error as NSError
+        return nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled
+    }
+
     private static func diagnosticSection(_ title: String, _ rows: [(String, String)]) -> String {
         let body = rows.map { key, value in
             "\(key): \(value)"
@@ -3316,9 +3546,127 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     })()
     """
 
+    private static let promptDraftCaptureScript = """
+    (() => {
+      const host = String(location.hostname || '').toLowerCase();
+      const isChatGPTPage = location.protocol === 'https:' && (
+        host === 'chatgpt.com' ||
+        host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' ||
+        host.endsWith('.chat.openai.com')
+      );
+      if (!isChatGPTPage || window.__chatgptSwiftPromptDraftBridgeInstalled) return;
+      window.__chatgptSwiftPromptDraftBridgeInstalled = true;
+
+      const maxLength = 12000;
+      const visible = (element) => {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const firstVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(visible);
+      const findComposer = () =>
+        firstVisible('textarea[data-testid="prompt-textarea"]') ||
+        firstVisible('[contenteditable="true"][data-testid="prompt-textarea"]') ||
+        firstVisible('#prompt-textarea') ||
+        firstVisible('textarea') ||
+        firstVisible('[role="textbox"]') ||
+        firstVisible('div[contenteditable="true"]');
+      const readText = (element) => {
+        if (!element) return '';
+        if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+          return String(element.value || '').slice(0, maxLength);
+        }
+        return String(element.innerText || element.textContent || '').slice(0, maxLength);
+      };
+
+      let publishTimer = 0;
+      const publish = () => {
+        window.clearTimeout(publishTimer);
+        publishTimer = window.setTimeout(() => {
+          try {
+            const composer = findComposer();
+            window.webkit.messageHandlers.promptDraft.postMessage({ text: readText(composer) });
+          } catch (_) {}
+        }, 250);
+      };
+
+      const attach = () => {
+        const composer = findComposer();
+        if (!composer || composer.__chatgptSwiftDraftObserved) return;
+        composer.__chatgptSwiftDraftObserved = true;
+        ['input', 'change', 'keyup', 'paste', 'cut'].forEach((eventName) => {
+          composer.addEventListener(eventName, publish, true);
+        });
+      };
+
+      attach();
+      new MutationObserver(attach).observe(document.documentElement, { childList: true, subtree: true });
+      window.setInterval(attach, 2500);
+    })()
+    """
+
+    private static func restorePromptDraftScript(text: String) -> String {
+        let textLiteral = javascriptStringLiteral(text)
+        return """
+        (() => {
+          const text = \(textLiteral);
+          const visible = (element) => {
+            if (!element) return false;
+            const rect = element.getBoundingClientRect();
+            const style = window.getComputedStyle(element);
+            return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+          };
+          const firstVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(visible);
+          const composer =
+            firstVisible('textarea[data-testid="prompt-textarea"]') ||
+            firstVisible('[contenteditable="true"][data-testid="prompt-textarea"]') ||
+            firstVisible('#prompt-textarea') ||
+            firstVisible('textarea') ||
+            firstVisible('[role="textbox"]') ||
+            firstVisible('div[contenteditable="true"]');
+
+          if (!composer || !text.trim()) {
+            return { restored: false, reason: 'missing composer or draft' };
+          }
+
+          const existing = composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement
+            ? String(composer.value || '')
+            : String(composer.innerText || composer.textContent || '');
+          if (existing.trim().length > 0) {
+            return { restored: false, reason: 'composer not empty' };
+          }
+
+          composer.focus();
+          if (composer instanceof HTMLTextAreaElement || composer instanceof HTMLInputElement) {
+            const descriptor = Object.getOwnPropertyDescriptor(
+              composer instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype,
+              'value'
+            );
+            if (descriptor?.set) {
+              descriptor.set.call(composer, text);
+            } else {
+              composer.value = text;
+            }
+          } else {
+            const inserted = document.execCommand('insertText', false, text);
+            if (!inserted && !String(composer.innerText || composer.textContent || '').trim()) {
+              composer.textContent = text;
+            }
+          }
+
+          composer.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: text }));
+          composer.dispatchEvent(new Event('change', { bubbles: true }));
+          return { restored: true };
+        })()
+        """
+    }
+
     private static func makeConfiguration(messageHandler: WKScriptMessageHandler, persistent: Bool, profileID: String?) -> WKWebViewConfiguration {
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
+        userContentController.add(messageHandler, name: "promptDraft")
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
@@ -3332,6 +3680,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -3481,7 +3830,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return isOpenAIFamilyHost(host) || isOAuthProviderHost(host)
     }
 
-    private static func isTrustedDownloadBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
+    private static func isTrustedChatGPTBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
         guard origin.protocol == "https" else {
             return false
         }
