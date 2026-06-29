@@ -14,7 +14,7 @@
 - 可选后台完成通知：窗口不在前台时，检测到网页回复从生成中变为空闲后发送 macOS 通知
 - 可把 Apple Notes 当前选中的备忘录正文作为文本上下文插入 ChatGPT 输入框
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
-- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、CPU/RSS/footprint 采样趋势和最近本 App 日志
+- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、最近崩溃报告、CPU/RSS/footprint 采样趋势和最近本 App 日志
 - 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
@@ -102,6 +102,36 @@ CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX="https://example.com/releases/" \
 ```
 
 真实自动更新发布还需要：HTTPS 托管 `appcast.xml` 和 DMG、Developer ID 签名、notarization/stapler、Sparkle 私钥在 Keychain 或 CI secret 中可用。私钥不要提交到仓库。
+
+## GitHub Release CI
+
+仓库提供手动触发的 GitHub Actions workflow：`.github/workflows/swift-macos-release.yml`。它会：
+
+- 导入 Developer ID Application `.p12` 证书
+- 构建带 Sparkle feed/key 的 DMG
+- notarize 并 staple DMG
+- 生成带 EdDSA 签名的 `appcast.xml`
+- 上传 `ChatGPT Swift.dmg` 和 `appcast.xml` 到指定 GitHub Release
+
+需要配置这些 GitHub Secrets：
+
+```text
+CHATGPT_SWIFT_CERTIFICATE_P12_BASE64
+CHATGPT_SWIFT_CERTIFICATE_PASSWORD
+CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY
+CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY
+APPLE_ID
+APPLE_TEAM_ID
+APPLE_APP_SPECIFIC_PASSWORD
+```
+
+推荐的 `feed_url` 是固定入口：
+
+```text
+https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appcast.xml
+```
+
+发布某个 tag 时，workflow 会把 appcast 内的下载地址指向该 tag 的 release asset，例如 `https://github.com/GravityPoet/chatgpt-web-desktop/releases/download/v0.1.2/`。
 
 ## 安装到 Applications
 

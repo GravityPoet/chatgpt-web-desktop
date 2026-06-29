@@ -1,0 +1,153 @@
+name: Swift macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update, for example v0.1.2
+        required: true
+        type: string
+      feed_url:
+        description: Stable HTTPS Sparkle appcast URL embedded in the app
+        required: true
+        default: https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appcast.xml
+        type: string
+      draft:
+        description: Create a draft release when the tag does not exist
+        required: true
+        default: true
+        type: boolean
+      prerelease:
+        description: Mark the release as prerelease when the tag does not exist
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build, notarize, and publish Swift macOS app
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: swift
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Validate release secrets
+        env:
+          CHATGPT_SWIFT_CERTIFICATE_P12_BASE64: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 }}
+          CHATGPT_SWIFT_CERTIFICATE_PASSWORD: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_PASSWORD }}
+          CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
+          CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          missing=0
+          require_secret() {
+            name="$1"
+            value="$2"
+            if [[ -z "$value" ]]; then
+              echo "error: missing required secret: $name" >&2
+              missing=1
+            fi
+          }
+
+          require_secret CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 "$CHATGPT_SWIFT_CERTIFICATE_P12_BASE64"
+          require_secret CHATGPT_SWIFT_CERTIFICATE_PASSWORD "$CHATGPT_SWIFT_CERTIFICATE_PASSWORD"
+          require_secret CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY "$CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY"
+          require_secret CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY "$CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY"
+          require_secret APPLE_ID "$APPLE_ID"
+          require_secret APPLE_TEAM_ID "$APPLE_TEAM_ID"
+          require_secret APPLE_APP_SPECIFIC_PASSWORD "$APPLE_APP_SPECIFIC_PASSWORD"
+
+          case "${{ inputs.feed_url }}" in
+            https://*) ;;
+            *)
+              echo "error: feed_url must be an https:// URL." >&2
+              missing=1
+              ;;
+          esac
+
+          if [[ "$missing" != "0" ]]; then
+            exit 2
+          fi
+
+      - name: Import Developer ID certificate
+        env:
+          CHATGPT_SWIFT_CERTIFICATE_P12_BASE64: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 }}
+          CHATGPT_SWIFT_CERTIFICATE_PASSWORD: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_PASSWORD }}
+        run: |
+          identity="$(./packaging/import-ci-certificate.sh)"
+          {
+            echo "CHATGPT_SWIFT_CODESIGN_IDENTITY=$identity"
+            echo "CHATGPT_SWIFT_CODESIGN_TIMESTAMP=1"
+          } >>"$GITHUB_ENV"
+
+      - name: Build signed DMG with Sparkle configuration
+        env:
+          CHATGPT_SWIFT_SPARKLE_FEED_URL: ${{ inputs.feed_url }}
+          CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
+        run: ./packaging/make-dmg.sh
+
+      - name: Notarize and staple DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: ./packaging/notarize-dmg.sh
+
+      - name: Generate signed Sparkle appcast
+        env:
+          CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/
+          CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY }}
+        run: ./packaging/make-sparkle-appcast.sh
+
+      - name: Verify release artifacts
+        env:
+          FEED_URL: ${{ inputs.feed_url }}
+        run: |
+          app_path="dist/ChatGPT Swift.app"
+          dmg_path="dist/ChatGPT Swift.dmg"
+          appcast_path="dist/sparkle-appcast/appcast.xml"
+
+          test -d "$app_path"
+          test -f "$dmg_path"
+          test -f "$appcast_path"
+          test "$(plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist")" = "$FEED_URL"
+          test -n "$(plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist")"
+          /usr/bin/codesign --verify --deep --strict "$app_path"
+          /usr/bin/xcrun stapler validate "$dmg_path"
+          /usr/bin/xmllint --noout "$appcast_path"
+          /usr/bin/grep -q 'sparkle:edSignature=' "$appcast_path"
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          DRAFT: ${{ inputs.draft }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          dmg_path="dist/ChatGPT Swift.dmg"
+          appcast_path="dist/sparkle-appcast/appcast.xml"
+          title="ChatGPT Swift $TAG"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$dmg_path" "$appcast_path" --clobber
+            exit 0
+          fi
+
+          release_args=(--title "$title" --generate-notes)
+          if [[ "$DRAFT" == "true" ]]; then
+            release_args+=(--draft)
+          fi
+          if [[ "$PRERELEASE" == "true" ]]; then
+            release_args+=(--prerelease)
+          fi
+
+          gh release create "$TAG" "$dmg_path" "$appcast_path" "${release_args[@]}"
