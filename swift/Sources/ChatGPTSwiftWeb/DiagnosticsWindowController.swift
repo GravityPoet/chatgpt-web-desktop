@@ -7,6 +7,7 @@ struct AppDiagnosticsState {
 
 struct AppDiagnosticsCallbacks {
     let refresh: () -> AppDiagnosticsState
+    let exportPackage: (AppDiagnosticsState) -> Void
 }
 
 final class DiagnosticsWindowController: NSWindowController {
@@ -85,10 +86,14 @@ final class DiagnosticsWindowController: NSWindowController {
         let copyButton = NSButton(title: "复制诊断信息", target: self, action: #selector(copyReport(_:)))
         copyButton.bezelStyle = .rounded
 
+        let exportButton = NSButton(title: "导出诊断包…", target: self, action: #selector(exportPackage(_:)))
+        exportButton.bezelStyle = .rounded
+
         header.addArrangedSubview(title)
         header.addArrangedSubview(spacer)
         header.addArrangedSubview(refreshButton)
         header.addArrangedSubview(copyButton)
+        header.addArrangedSubview(exportButton)
         root.addArrangedSubview(header)
 
         generatedLabel.font = .systemFont(ofSize: 12, weight: .regular)
@@ -130,6 +135,10 @@ final class DiagnosticsWindowController: NSWindowController {
     @objc private func copyReport(_ sender: Any?) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(state.report, forType: .string)
+    }
+
+    @objc private func exportPackage(_ sender: Any?) {
+        callbacks.exportPackage(state)
     }
 }
 

@@ -3,6 +3,7 @@ import Darwin
 import Foundation
 import OSLog
 import UniformTypeIdentifiers
+import UserNotifications
 import WebKit
 
 private let chatGPTURL = URL(string: "https://chatgpt.com/")!
@@ -14,6 +15,10 @@ private let mainFrameDefaultsKey = "ChatGPTSwiftWeb.MainWindowFrame"
 private let webZoomDefaultsKey = "ChatGPTSwiftWeb.WebViewZoom"
 private let promptDraftRestoreDefaultsKey = "ChatGPTSwiftWeb.PromptDraftRestoreEnabled"
 private let promptDraftDefaultsPrefix = "ChatGPTSwiftWeb.PromptDraft."
+private let backgroundCompletionNotificationsDefaultsKey = "ChatGPTSwiftWeb.BackgroundCompletionNotificationsEnabled"
+private let lastRunStartedAtDefaultsKey = "ChatGPTSwiftWeb.LastRunStartedAt"
+private let lastRunEndedAtDefaultsKey = "ChatGPTSwiftWeb.LastRunEndedAt"
+private let lastRunCleanExitDefaultsKey = "ChatGPTSwiftWeb.LastRunCleanExit"
 private let minimumWebZoom: CGFloat = 0.85
 private let maximumWebZoom: CGFloat = 1.40
 private let webZoomStep: CGFloat = 0.05
@@ -39,6 +44,7 @@ private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPart
 // challenges. This is the complete, engine-consistent Safari UA used when no fingerprint preset
 // overrides it, so the WebKit engine presents as the real Safari it actually is.
 private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
+private let processStartedAt = Date()
 private var singleInstanceLockFileDescriptor: CInt = -1
 
 private struct GitHubRelease: Decodable {
@@ -53,6 +59,12 @@ private struct GitHubRelease: Decodable {
         case htmlURL = "html_url"
         case publishedAt = "published_at"
     }
+}
+
+private struct ProcessRunResult {
+    let exitCode: Int32
+    let output: String
+    let errorOutput: String
 }
 
 private enum PromptDraftStore {
@@ -108,6 +120,17 @@ private enum PromptDraftStore {
     }
 }
 
+private enum BackgroundCompletionNotifications {
+    static func isEnabled() -> Bool {
+        UserDefaults.standard.bool(forKey: backgroundCompletionNotificationsDefaultsKey)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        UserDefaults.standard.set(enabled, forKey: backgroundCompletionNotificationsDefaultsKey)
+        UserDefaults.standard.synchronize()
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     var mainController: BrowserWindowController?
     private var incognitoControllers: [BrowserWindowController] = []
@@ -120,8 +143,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var diagnosticsWindowController: DiagnosticsWindowController?
     private var updateCheckStatus = "未检查；当前只提供 GitHub Releases 检查入口，完整自动更新需要 Sparkle appcast、EdDSA key 和签名发布流。"
     private var didApplyLaunchGeoIP = false
+    private var didFinishLaunchingAt: Date?
+    private var previousRunSummary = "未记录"
+    private var notificationPermissionStatus = "未检查"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        didFinishLaunchingAt = Date()
+        capturePreviousRunState()
+        markRunStarted()
+        UNUserNotificationCenter.current().delegate = self
+        refreshNotificationPermissionStatus()
         NSApp.setActivationPolicy(.regular)
         buildMenu()
         installKeyboardZoomShortcuts()
@@ -187,9 +218,116 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        markRunEndedCleanly()
         mainController?.persistMainWindowFrame()
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
+        }
+    }
+
+    private func capturePreviousRunState() {
+        let defaults = UserDefaults.standard
+        let started = defaults.object(forKey: lastRunStartedAtDefaultsKey) as? Date
+        let ended = defaults.object(forKey: lastRunEndedAtDefaultsKey) as? Date
+        let hadCleanFlag = defaults.object(forKey: lastRunCleanExitDefaultsKey) != nil
+        let clean = defaults.bool(forKey: lastRunCleanExitDefaultsKey)
+
+        guard let started else {
+            previousRunSummary = "首次运行或无历史记录"
+            return
+        }
+
+        if hadCleanFlag, clean {
+            previousRunSummary = "干净退出；开始 \(Self.timestampString(started))，结束 \(ended.map(Self.timestampString) ?? "未知")"
+        } else {
+            previousRunSummary = "可能非正常退出；上次开始 \(Self.timestampString(started))"
+        }
+    }
+
+    private func markRunStarted() {
+        let defaults = UserDefaults.standard
+        defaults.set(processStartedAt, forKey: lastRunStartedAtDefaultsKey)
+        defaults.removeObject(forKey: lastRunEndedAtDefaultsKey)
+        defaults.set(false, forKey: lastRunCleanExitDefaultsKey)
+        defaults.synchronize()
+    }
+
+    private func markRunEndedCleanly() {
+        let defaults = UserDefaults.standard
+        defaults.set(Date(), forKey: lastRunEndedAtDefaultsKey)
+        defaults.set(true, forKey: lastRunCleanExitDefaultsKey)
+        defaults.synchronize()
+    }
+
+    private func refreshNotificationPermissionStatus() {
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self] settings in
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+                self.notificationPermissionStatus = Self.notificationStatusText(settings.authorizationStatus)
+                if settings.authorizationStatus == .denied, BackgroundCompletionNotifications.isEnabled() {
+                    BackgroundCompletionNotifications.setEnabled(false)
+                }
+                self.refreshNativeUtilityWindows()
+            }
+        }
+    }
+
+    private static func notificationStatusText(_ status: UNAuthorizationStatus) -> String {
+        switch status {
+        case .notDetermined:
+            return "未请求"
+        case .denied:
+            return "已拒绝"
+        case .authorized:
+            return "已授权"
+        case .provisional:
+            return "临时授权"
+        case .ephemeral:
+            return "临时会话授权"
+        @unknown default:
+            return "未知"
+        }
+    }
+
+    func postBackgroundCompletionNotification(from controller: BrowserWindowController) {
+        guard BackgroundCompletionNotifications.isEnabled() else {
+            return
+        }
+
+        UNUserNotificationCenter.current().getNotificationSettings { [weak self, weak controller] settings in
+            guard let self,
+                  let controller else {
+                return
+            }
+
+            guard settings.authorizationStatus == .authorized || settings.authorizationStatus == .provisional else {
+                DispatchQueue.main.async {
+                    self.notificationPermissionStatus = Self.notificationStatusText(settings.authorizationStatus)
+                    if settings.authorizationStatus == .denied {
+                        BackgroundCompletionNotifications.setEnabled(false)
+                    }
+                    self.refreshNativeUtilityWindows()
+                }
+                return
+            }
+
+            let content = UNMutableNotificationContent()
+            content.title = "ChatGPT 回复完成"
+            content.body = controller.notificationContextText()
+            content.sound = .default
+
+            let request = UNNotificationRequest(
+                identifier: "chatgpt-swift-completion-\(UUID().uuidString)",
+                content: content,
+                trigger: nil
+            )
+            UNUserNotificationCenter.current().add(request) { error in
+                if let error {
+                    browserLogger.error("Failed to post background completion notification: \(error.localizedDescription, privacy: .public)")
+                }
+            }
         }
     }
 
@@ -382,6 +520,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     setPromptDraftRestore: { [weak self] enabled in
                         self?.setPromptDraftRestoreFromSettings(enabled)
                     },
+                    setBackgroundCompletionNotifications: { [weak self] enabled in
+                        self?.setBackgroundCompletionNotificationsFromSettings(enabled)
+                    },
                     setWebRTCProtection: { [weak self] enabled in
                         self?.setWebRTCProtectionFromSettings(enabled)
                     },
@@ -431,9 +572,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         } else {
             controller = DiagnosticsWindowController(
                 state: makeDiagnosticsState(),
-                callbacks: AppDiagnosticsCallbacks { [weak self] in
-                    self?.makeDiagnosticsState() ?? AppDiagnosticsState(generatedAt: "unknown", report: "AppDelegate unavailable")
-                }
+                callbacks: AppDiagnosticsCallbacks(
+                    refresh: { [weak self] in
+                        self?.makeDiagnosticsState() ?? AppDiagnosticsState(generatedAt: "unknown", report: "AppDelegate unavailable")
+                    },
+                    exportPackage: { [weak self] state in
+                        self?.exportDiagnosticsPackage(state)
+                    }
+                )
             )
             diagnosticsWindowController = controller
         }
@@ -469,6 +615,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
         mainController?.restorePromptDraftIfAvailable(reason: "settings toggled")
         refreshNativeUtilityWindows()
+    }
+
+    private func setBackgroundCompletionNotificationsFromSettings(_ enabled: Bool) {
+        if !enabled {
+            BackgroundCompletionNotifications.setEnabled(false)
+            refreshNativeUtilityWindows()
+            return
+        }
+
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { [weak self] granted, error in
+            DispatchQueue.main.async {
+                if let error {
+                    BackgroundCompletionNotifications.setEnabled(false)
+                    self?.notificationPermissionStatus = "请求失败：\(error.localizedDescription)"
+                    self?.presentError("通知权限请求失败：\(error.localizedDescription)")
+                } else {
+                    BackgroundCompletionNotifications.setEnabled(granted)
+                    self?.notificationPermissionStatus = granted ? "已授权" : "未授权"
+                    if !granted {
+                        self?.presentError("系统没有授予通知权限。可以到系统设置的通知里为 ChatGPT Swift 打开。")
+                    }
+                }
+                self?.refreshNativeUtilityWindows()
+            }
+        }
     }
 
     private func setThirdPartyLinksInAppFromSettings(_ enabled: Bool) {
@@ -592,6 +763,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             homepage: ProfileStore.homepageURL(for: profile.id).absoluteString,
             promptDraftRestoreEnabled: PromptDraftStore.isRestoreEnabled(),
             promptDraftSummary: PromptDraftStore.draftSummary(for: profile.id),
+            backgroundCompletionNotificationsEnabled: BackgroundCompletionNotifications.isEnabled(),
+            notificationPermissionStatus: notificationPermissionStatus,
             profileIsolation: isolation,
             fingerprintName: fingerprintName,
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
@@ -608,6 +781,107 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return AppDiagnosticsState(generatedAt: generatedAt, report: makeDiagnosticsReport(generatedAt: generatedAt))
     }
 
+    private func exportDiagnosticsPackage(_ state: AppDiagnosticsState) {
+        let panel = NSSavePanel()
+        panel.title = "导出诊断包"
+        panel.message = "导出当前诊断信息和最近 10 分钟本 App 统一日志。不会导出 cookies、localStorage 或聊天内容。"
+        panel.prompt = "导出"
+        panel.allowedContentTypes = [.zip]
+        panel.nameFieldStringValue = "chatgpt-swift-diagnostics-\(Self.filenameTimestamp(Date())).zip"
+
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else {
+                return
+            }
+            self?.writeDiagnosticsPackage(state, to: url)
+        }
+    }
+
+    private func writeDiagnosticsPackage(_ state: AppDiagnosticsState, to destinationURL: URL) {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            do {
+                let fileManager = FileManager.default
+                let tempRoot = fileManager.temporaryDirectory
+                    .appendingPathComponent("ChatGPTSwiftDiagnostics-\(UUID().uuidString)", isDirectory: true)
+                let packageDir = tempRoot.appendingPathComponent("ChatGPT Swift Diagnostics", isDirectory: true)
+                try fileManager.createDirectory(at: packageDir, withIntermediateDirectories: true)
+
+                try state.report.write(
+                    to: packageDir.appendingPathComponent("diagnostics.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+
+                let manifest = """
+                generatedAt: \(state.generatedAt)
+                bundleID: \(Bundle.main.bundleIdentifier ?? appBundleIdentifier)
+                version: \(Self.appVersionText())
+                process: \(ProcessInfo.processInfo.processName)
+                note: This package excludes cookies, localStorage, IndexedDB, and chat transcript content.
+                """
+                try manifest.write(
+                    to: packageDir.appendingPathComponent("manifest.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+
+                let logResult = Self.runProcess(
+                    executable: "/usr/bin/log",
+                    arguments: [
+                        "show",
+                        "--predicate",
+                        "process == \"ChatGPTSwiftWeb\" OR subsystem == \"\(appBundleIdentifier)\"",
+                        "--last",
+                        "10m",
+                        "--style",
+                        "compact"
+                    ],
+                    currentDirectory: nil
+                )
+                let logText = logResult.output.isEmpty ? logResult.errorOutput : logResult.output
+                try logText.write(
+                    to: packageDir.appendingPathComponent("recent-log.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+
+                if fileManager.fileExists(atPath: destinationURL.path) {
+                    try fileManager.removeItem(at: destinationURL)
+                }
+
+                let zipResult = Self.runProcess(
+                    executable: "/usr/bin/ditto",
+                    arguments: [
+                        "-c",
+                        "-k",
+                        "--sequesterRsrc",
+                        "--keepParent",
+                        packageDir.lastPathComponent,
+                        destinationURL.path
+                    ],
+                    currentDirectory: tempRoot
+                )
+                try fileManager.removeItem(at: tempRoot)
+
+                guard zipResult.exitCode == 0 else {
+                    throw NSError(
+                        domain: "ChatGPTSwiftWeb.DiagnosticsExport",
+                        code: Int(zipResult.exitCode),
+                        userInfo: [NSLocalizedDescriptionKey: zipResult.errorOutput.isEmpty ? "ditto 打包失败" : zipResult.errorOutput]
+                    )
+                }
+
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.activateFileViewerSelecting([destinationURL])
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.presentError("导出诊断包失败：\(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
     private func makeDiagnosticsReport(generatedAt: String) -> String {
         let profile = ProfileStore.currentProfile()
         let fingerprintName = ProfileStore.fingerprint(for: profile.id)?.displayName ?? "默认 Safari（不混淆）"
@@ -622,6 +896,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("进程", "\(process.processName) / pid \(process.processIdentifier)"),
             ("系统", process.operatingSystemVersionString),
             ("Bundle 路径", bundle.bundlePath),
+            ("进程启动时间", Self.timestampString(processStartedAt)),
+            ("App 完成启动时间", didFinishLaunchingAt.map(Self.timestampString) ?? "未知"),
+            ("启动到 didFinishLaunching", Self.durationString(from: processStartedAt, to: didFinishLaunchingAt)),
+            ("当前运行时长", Self.durationString(from: processStartedAt, to: Date())),
+            ("上次运行", previousRunSummary),
         ]))
 
         sections.append(Self.diagnosticSection("账号空间 / 隐私", [
@@ -630,6 +909,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("启动默认空间", ProfileStore.startupProfileID()),
             ("本机草稿恢复", PromptDraftStore.isRestoreEnabled() ? "开启" : "关闭"),
             ("当前空间草稿", PromptDraftStore.draftSummary(for: profile.id)),
+            ("后台完成通知", BackgroundCompletionNotifications.isEnabled() ? "开启" : "关闭"),
+            ("通知权限", notificationPermissionStatus),
             ("指纹预设", fingerprintName),
             ("增强隐私模式", ProfileStore.isEnhancedPrivacyEnabled(for: profile.id) ? "开启" : "关闭"),
             ("WebRTC 防护", PrivacySettings.isWebRTCProtectionEnabled() ? "开启" : "关闭"),
@@ -669,6 +950,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
+    }
+
+    private static func filenameTimestamp(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: date)
+    }
+
+    private static func durationString(from start: Date, to end: Date?) -> String {
+        guard let end else {
+            return "未知"
+        }
+        return String(format: "%.3fs", max(0, end.timeIntervalSince(start)))
+    }
+
+    private static func runProcess(
+        executable: String,
+        arguments: [String],
+        currentDirectory: URL?
+    ) -> ProcessRunResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
+
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return ProcessRunResult(exitCode: 127, output: "", errorOutput: error.localizedDescription)
+        }
+
+        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        return ProcessRunResult(exitCode: process.terminationStatus, output: output, errorOutput: errorOutput)
     }
 
     private static func diagnosticSection(_ title: String, _ rows: [(String, String)]) -> String {
@@ -1643,6 +1965,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 }
 
+extension AppDelegate: UNUserNotificationCenterDelegate {
+    func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([])
+    }
+}
+
 final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     private static var controllers: [BrowserWindowController] = []
 
@@ -1654,6 +1986,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private let isPopup: Bool
     private let persistent: Bool
     private let profileID: String?
+    private let controllerCreatedAt = Date()
     private var closeHandler: (() -> Void)?
     var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
     private var isDisposing = false
@@ -1668,8 +2001,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var lastBlankRecoverySummary = "无"
     private var lastNavigationStartedAt: Date?
     private var lastNavigationFinishedAt: Date?
+    private var firstNavigationFinishedAt: Date?
     private var loadingWatchdogGeneration = 0
     private var currentOverlayMode = BrowserStatusOverlayMode.hidden
+    private var isAssistantResponseInProgress = false
+    private var lastCompletionObservationSummary = "未运行"
+    private var lastBackgroundCompletionNotificationAt: Date?
     var toolbarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     var statusLabel: NSTextField?
     var statusContainer: NSView?
@@ -1839,6 +2176,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.url
     }
 
+    func notificationContextText() -> String {
+        if let title = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !title.isEmpty {
+            return title
+        }
+        return webView.url?.host ?? "ChatGPT"
+    }
+
     func diagnosticsReport() -> String {
         let frame = window.frame
         let currentItemURL = webView.backForwardList.currentItem?.url
@@ -1864,8 +2209,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("webContentProcessTerminationCount", "\(webContentProcessTerminationCount)"),
             ("navigationFailureCount", "\(navigationFailureCount)"),
             ("lastNavigationFailure", lastNavigationFailureDescription),
+            ("controllerCreatedAt", Self.diagnosticDateString(controllerCreatedAt)),
+            ("firstNavigationFinishedAt", Self.diagnosticDateString(firstNavigationFinishedAt)),
             ("lastNavigationStartedAt", Self.diagnosticDateString(lastNavigationStartedAt)),
             ("lastNavigationFinishedAt", Self.diagnosticDateString(lastNavigationFinishedAt)),
+            ("lastNavigationDuration", Self.diagnosticDurationString(from: lastNavigationStartedAt, to: lastNavigationFinishedAt)),
+            ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
+            ("lastCompletionObservation", lastCompletionObservationSummary),
+            ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
             ("userAgent override", webView.customUserAgent ?? "nil"),
         ]
         return Self.diagnosticSection("WebView", rows)
@@ -2089,7 +2440,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         switch currentOverlayMode {
         case .hidden, .failed, .blank:
             return
-        case .slowLoading, .recovering:
+        case .recovering:
             showStatusOverlay(.hidden)
         }
     }
@@ -2108,7 +2459,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             }
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             browserLogger.info("Navigation still loading after watchdog delay (\(reason, privacy: .public)); progress=\(percent, privacy: .public)")
-            self.showStatusOverlay(.slowLoading(progress: percent))
+            self.setStatus("加载偏慢 \(percent)%", showsProgress: true)
         }
     }
 
@@ -2291,6 +2642,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         lastNavigationFinishedAt = Date()
+        if firstNavigationFinishedAt == nil {
+            firstNavigationFinishedAt = lastNavigationFinishedAt
+        }
         stopLoadingWatchdog()
         hideStatusOverlayIfTransient()
         webView.pageZoom = currentZoom
@@ -2429,6 +2783,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
+        if message.name == "completionState" {
+            handleCompletionStateMessage(message)
+            return
+        }
+
         guard message.name == "downloadBlob",
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
@@ -2457,6 +2816,33 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         PromptDraftStore.saveDraft(rawText, profileID: profileID)
+    }
+
+    private func handleCompletionStateMessage(_ message: WKScriptMessage) {
+        guard persistent,
+              message.frameInfo.isMainFrame,
+              Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
+              let payload = message.body as? [String: Any]
+        else {
+            return
+        }
+
+        let isBusy = Self.boolValue(payload["busy"])
+        let reason = payload["reason"] as? String ?? "unknown"
+        let previous = isAssistantResponseInProgress
+        isAssistantResponseInProgress = isBusy
+        lastCompletionObservationSummary = "\(Self.diagnosticDateString(Date())) busy=\(isBusy), reason=\(reason)"
+
+        guard previous, !isBusy, BackgroundCompletionNotifications.isEnabled() else {
+            return
+        }
+
+        guard !NSApp.isActive || window.isKeyWindow == false else {
+            return
+        }
+
+        lastBackgroundCompletionNotificationAt = Date()
+        (NSApp.delegate as? AppDelegate)?.postBackgroundCompletionNotification(from: self)
     }
 
     private func saveImageDownloadPayload(_ payload: [String: Any]) {
@@ -3471,6 +3857,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return formatter.string(from: date)
     }
 
+    private static func diagnosticDurationString(from start: Date?, to end: Date?) -> String {
+        guard let start, let end else {
+            return "无"
+        }
+        return String(format: "%.3fs", max(0, end.timeIntervalSince(start)))
+    }
+
     private static func javascriptStringLiteral(_ value: String) -> String {
         guard let data = try? JSONEncoder().encode(value),
               let string = String(data: data, encoding: .utf8) else {
@@ -3607,6 +4000,78 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     })()
     """
 
+    private static let completionStateObserverScript = """
+    (() => {
+      const host = String(location.hostname || '').toLowerCase();
+      const isChatGPTPage = location.protocol === 'https:' && (
+        host === 'chatgpt.com' ||
+        host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' ||
+        host.endsWith('.chat.openai.com')
+      );
+      if (!isChatGPTPage || window.__chatgptSwiftCompletionObserverInstalled) return;
+      window.__chatgptSwiftCompletionObserverInstalled = true;
+
+      const visible = (element) => {
+        if (!element) return false;
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+      };
+      const textOf = (element) => String(
+        element?.getAttribute?.('aria-label') ||
+        element?.getAttribute?.('data-testid') ||
+        element?.innerText ||
+        element?.textContent ||
+        ''
+      ).toLowerCase();
+      const busyReason = () => {
+        const candidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-busy="true"], [data-testid]'))
+          .filter(visible);
+        for (const element of candidates) {
+          const text = textOf(element);
+          if (
+            text.includes('stop') ||
+            text.includes('停止') ||
+            text.includes('streaming') ||
+            text.includes('generating') ||
+            text.includes('回答中') ||
+            text.includes('生成中') ||
+            text.includes('stop-button')
+          ) {
+            return text.slice(0, 80) || 'busy-control';
+          }
+        }
+        if (document.querySelector('[aria-busy="true"]')) return 'aria-busy';
+        return '';
+      };
+
+      let lastBusy = null;
+      let publishTimer = 0;
+      const publish = () => {
+        window.clearTimeout(publishTimer);
+        publishTimer = window.setTimeout(() => {
+          const reason = busyReason();
+          const busy = reason.length > 0;
+          if (busy === lastBusy) return;
+          lastBusy = busy;
+          try {
+            window.webkit.messageHandlers.completionState.postMessage({ busy, reason });
+          } catch (_) {}
+        }, 500);
+      };
+
+      publish();
+      new MutationObserver(publish).observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ['aria-label', 'aria-busy', 'data-testid', 'disabled']
+      });
+      window.setInterval(publish, 3000);
+    })()
+    """
+
     private static func restorePromptDraftScript(text: String) -> String {
         let textLiteral = javascriptStringLiteral(text)
         return """
@@ -3667,6 +4132,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
         userContentController.add(messageHandler, name: "promptDraft")
+        userContentController.add(messageHandler, name: "completionState")
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
@@ -3681,6 +4147,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))

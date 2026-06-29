@@ -7,6 +7,8 @@ struct AppSettingsState {
     let homepage: String
     let promptDraftRestoreEnabled: Bool
     let promptDraftSummary: String
+    let backgroundCompletionNotificationsEnabled: Bool
+    let notificationPermissionStatus: String
     let profileIsolation: String
     let fingerprintName: String
     let enhancedPrivacyEnabled: Bool
@@ -19,6 +21,7 @@ struct AppSettingsState {
 
 struct AppSettingsCallbacks {
     let setPromptDraftRestore: (Bool) -> Void
+    let setBackgroundCompletionNotifications: (Bool) -> Void
     let setWebRTCProtection: (Bool) -> Void
     let setThirdPartyLinksInApp: (Bool) -> Void
     let setEnhancedPrivacy: (Bool) -> Void
@@ -213,6 +216,13 @@ final class AppSettingsWindowController: NSWindowController {
             action: #selector(togglePromptDraftRestore(_:))
         )
         addKeyValue("当前草稿", state.promptDraftSummary)
+        addToggle(
+            "后台完成通知",
+            detail: "窗口不在前台时，如果网页状态显示 ChatGPT 回复完成，则发送 macOS 通知。",
+            state: state.backgroundCompletionNotificationsEnabled,
+            action: #selector(toggleBackgroundCompletionNotifications(_:))
+        )
+        addKeyValue("通知权限", state.notificationPermissionStatus)
         addKeyValue("数据隔离", state.profileIsolation)
         addActionButton("打开诊断", action: #selector(showDiagnostics(_:)))
     }
@@ -345,6 +355,10 @@ final class AppSettingsWindowController: NSWindowController {
 
     @objc private func togglePromptDraftRestore(_ sender: NSButton) {
         callbacks.setPromptDraftRestore(sender.state == .on)
+    }
+
+    @objc private func toggleBackgroundCompletionNotifications(_ sender: NSButton) {
+        callbacks.setBackgroundCompletionNotifications(sender.state == .on)
     }
 
     @objc private func toggleThirdPartyLinks(_ sender: NSButton) {
