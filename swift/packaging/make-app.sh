@@ -11,6 +11,8 @@ MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
 ICON_SOURCE="$ROOT/../tauri/src-tauri/icons/icon.icns"
 SIGN_IDENTITY="${CHATGPT_SWIFT_CODESIGN_IDENTITY:-}"
+SIGN_TIMESTAMP="${CHATGPT_SWIFT_CODESIGN_TIMESTAMP:-0}"
+SIGN_ENTITLEMENTS="${CHATGPT_SWIFT_CODESIGN_ENTITLEMENTS:-}"
 
 cd "$ROOT"
 
@@ -34,7 +36,19 @@ fi
 
 chmod +x "$MACOS/$BINARY_NAME"
 
-/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$APP_DIR"
+codesign_args=(--force --deep --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_TIMESTAMP" == "1" ]]; then
+  codesign_args+=(--timestamp)
+fi
+if [[ -n "$SIGN_ENTITLEMENTS" ]]; then
+  if [[ ! -f "$SIGN_ENTITLEMENTS" ]]; then
+    echo "error: CHATGPT_SWIFT_CODESIGN_ENTITLEMENTS does not exist: $SIGN_ENTITLEMENTS" >&2
+    exit 2
+  fi
+  codesign_args+=(--entitlements "$SIGN_ENTITLEMENTS")
+fi
+
+/usr/bin/codesign "${codesign_args[@]}" "$APP_DIR"
 /usr/bin/codesign --verify --deep --strict "$APP_DIR"
 
 echo "$APP_DIR"
