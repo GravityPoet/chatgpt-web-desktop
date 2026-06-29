@@ -2,6 +2,7 @@ import AppKit
 import Darwin
 import Foundation
 import OSLog
+import Sparkle
 import UniformTypeIdentifiers
 import UserNotifications
 import WebKit
@@ -65,6 +66,154 @@ private struct ProcessRunResult {
     let exitCode: Int32
     let output: String
     let errorOutput: String
+}
+
+private struct PerformanceSample {
+    let timestamp: Date
+    let cpuPercent: Double
+    let residentBytes: UInt64
+    let footprintBytes: UInt64
+}
+
+private final class ProcessPerformanceMonitor {
+    private let lock = NSLock()
+    private var timer: Timer?
+    private var samples: [PerformanceSample] = []
+    private var lastCPUTime: TimeInterval?
+    private var lastWallTime: Date?
+    private let maximumSamples = 180
+
+    func start() {
+        recordSample()
+        timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
+            self?.recordSample()
+        }
+        timer?.tolerance = 2
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func diagnosticRows() -> [(String, String)] {
+        let snapshot = snapshotSamples()
+        guard !snapshot.isEmpty else {
+            return [("性能采样", "暂无样本")]
+        }
+
+        let latest = snapshot[snapshot.count - 1]
+        let cpuValues = snapshot.map(\.cpuPercent)
+        let residentValues = snapshot.map(\.residentBytes)
+        let footprintValues = snapshot.map(\.footprintBytes)
+        return [
+            ("性能采样窗口", "\(snapshot.count) 个样本，\(Self.dateText(snapshot[0].timestamp)) → \(Self.dateText(latest.timestamp))"),
+            ("CPU 当前 / 平均 / 峰值", "\(Self.percentText(latest.cpuPercent)) / \(Self.percentText(Self.average(cpuValues))) / \(Self.percentText(cpuValues.max() ?? 0))"),
+            ("RSS 当前 / 平均 / 峰值", "\(Self.bytesText(latest.residentBytes)) / \(Self.bytesText(Self.average(residentValues))) / \(Self.bytesText(residentValues.max() ?? 0))"),
+            ("Footprint 当前 / 平均 / 峰值", "\(Self.bytesText(latest.footprintBytes)) / \(Self.bytesText(Self.average(footprintValues))) / \(Self.bytesText(footprintValues.max() ?? 0))"),
+        ]
+    }
+
+    func csvText() -> String {
+        let snapshot = snapshotSamples()
+        let header = "timestamp,cpu_percent_one_core,resident_bytes,footprint_bytes"
+        let body = snapshot.map { sample in
+            "\(Self.dateText(sample.timestamp)),\(String(format: "%.2f", sample.cpuPercent)),\(sample.residentBytes),\(sample.footprintBytes)"
+        }
+        return ([header] + body).joined(separator: "\n") + "\n"
+    }
+
+    private func recordSample() {
+        let now = Date()
+        let cpuTime = Self.currentCPUTime()
+        let memory = Self.currentMemory()
+        let cpuPercent: Double
+        if let lastCPUTime, let lastWallTime {
+            let wallDelta = max(0.001, now.timeIntervalSince(lastWallTime))
+            cpuPercent = max(0, (cpuTime - lastCPUTime) / wallDelta * 100)
+        } else {
+            cpuPercent = 0
+        }
+
+        let sample = PerformanceSample(
+            timestamp: now,
+            cpuPercent: cpuPercent,
+            residentBytes: memory.residentBytes,
+            footprintBytes: memory.footprintBytes
+        )
+
+        lock.lock()
+        samples.append(sample)
+        if samples.count > maximumSamples {
+            samples.removeFirst(samples.count - maximumSamples)
+        }
+        lastCPUTime = cpuTime
+        lastWallTime = now
+        lock.unlock()
+    }
+
+    private func snapshotSamples() -> [PerformanceSample] {
+        lock.lock()
+        let snapshot = samples
+        lock.unlock()
+        return snapshot
+    }
+
+    private static func currentCPUTime() -> TimeInterval {
+        var usage = rusage()
+        guard getrusage(RUSAGE_SELF, &usage) == 0 else {
+            return 0
+        }
+        let user = TimeInterval(usage.ru_utime.tv_sec) + TimeInterval(usage.ru_utime.tv_usec) / 1_000_000
+        let system = TimeInterval(usage.ru_stime.tv_sec) + TimeInterval(usage.ru_stime.tv_usec) / 1_000_000
+        return user + system
+    }
+
+    private static func currentMemory() -> (residentBytes: UInt64, footprintBytes: UInt64) {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { reboundPointer in
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), reboundPointer, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else {
+            return (0, 0)
+        }
+        return (UInt64(info.resident_size), UInt64(info.phys_footprint))
+    }
+
+    private static func average(_ values: [Double]) -> Double {
+        guard !values.isEmpty else {
+            return 0
+        }
+        return values.reduce(0, +) / Double(values.count)
+    }
+
+    private static func average(_ values: [UInt64]) -> UInt64 {
+        guard !values.isEmpty else {
+            return 0
+        }
+        return values.reduce(UInt64(0), +) / UInt64(values.count)
+    }
+
+    private static func percentText(_ value: Double) -> String {
+        String(format: "%.1f%%", value)
+    }
+
+    private static func bytesText(_ bytes: UInt64) -> String {
+        guard bytes > 0 else {
+            return "未知"
+        }
+        let mib = Double(bytes) / 1_048_576
+        return String(format: "%.1f MiB", mib)
+    }
+
+    private static func dateText(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
 }
 
 private enum PromptDraftStore {
@@ -141,20 +290,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var enhancedPrivacyItem: NSMenuItem?
     private var settingsWindowController: AppSettingsWindowController?
     private var diagnosticsWindowController: DiagnosticsWindowController?
-    private var updateCheckStatus = "未检查；当前只提供 GitHub Releases 检查入口，完整自动更新需要 Sparkle appcast、EdDSA key 和签名发布流。"
+    private var updateCheckStatus = "未检查；未配置 Sparkle 时会回退到 GitHub Releases 检查。"
     private var didApplyLaunchGeoIP = false
     private var didFinishLaunchingAt: Date?
     private var previousRunSummary = "未记录"
     private var notificationPermissionStatus = "未检查"
+    private let performanceMonitor = ProcessPerformanceMonitor()
+    private var sparkleUpdaterController: SPUStandardUpdaterController?
+    private var sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         didFinishLaunchingAt = Date()
         capturePreviousRunState()
         markRunStarted()
+        performanceMonitor.start()
         UNUserNotificationCenter.current().delegate = self
         refreshNotificationPermissionStatus()
         NSApp.setActivationPolicy(.regular)
         buildMenu()
+        configureSparkleUpdaterIfAvailable()
         installKeyboardZoomShortcuts()
         let needsIsolationFallbackNotice = reconcileProfileIsolationOnLaunch()
         ProfileStore.applyStartupProfileIfAvailable()
@@ -219,6 +373,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     func applicationWillTerminate(_ notification: Notification) {
         markRunEndedCleanly()
+        performanceMonitor.stop()
         mainController?.persistMainWindowFrame()
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
@@ -289,6 +444,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         @unknown default:
             return "未知"
         }
+    }
+
+    private func configureSparkleUpdaterIfAvailable() {
+        guard Self.hasSparkleConfiguration() else {
+            sparkleUpdaterController = nil
+            sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
+            return
+        }
+
+        let controller = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+        sparkleUpdaterController = controller
+        sparkleStatus = "已启用：Sparkle 自动检查按自身调度执行"
+    }
+
+    private static func hasSparkleConfiguration() -> Bool {
+        guard let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String,
+              URL(string: feed)?.scheme?.lowercased() == "https",
+              let publicKey = Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") as? String,
+              !publicKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return false
+        }
+        return true
     }
 
     func postBackgroundCompletionNotification(from controller: BrowserWindowController) {
@@ -539,7 +721,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                         self?.showDiagnosticsWindow(nil)
                     },
                     checkForUpdates: { [weak self] in
-                        self?.checkForUpdates(showAlert: true)
+                        self?.checkForUpdatesFromUserAction(nil)
                     },
                     openReleasePage: { [weak self] in
                         self?.openReleasePage()
@@ -590,7 +772,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func checkForUpdatesAction(_ sender: Any?) {
-        checkForUpdates(showAlert: true)
+        checkForUpdatesFromUserAction(sender)
     }
 
     @objc private func openReleasePageAction(_ sender: Any?) {
@@ -674,6 +856,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         NSWorkspace.shared.open(releasePageURL)
     }
 
+    private func checkForUpdatesFromUserAction(_ sender: Any?) {
+        if let sparkleUpdaterController {
+            updateCheckStatus = "已交给 Sparkle 检查更新；\(sparkleStatus)。当前版本：\(Self.appVersionText())。"
+            refreshNativeUtilityWindows()
+            sparkleUpdaterController.checkForUpdates(sender)
+            return
+        }
+
+        checkForUpdates(showAlert: true)
+    }
+
     private func checkForUpdates(showAlert: Bool) {
         updateCheckStatus = "正在检查 GitHub Releases…"
         refreshNativeUtilityWindows()
@@ -711,7 +904,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
                     let title = release.name?.isEmpty == false ? release.name! : release.tagName
                     let date = release.publishedAt?.isEmpty == false ? "，发布时间 \(release.publishedAt!)" : ""
-                    self.updateCheckStatus = "最新发布：\(title)\(date)。当前版本：\(Self.appVersionText())。自动安装更新尚未启用。"
+                    self.updateCheckStatus = "最新发布：\(title)\(date)。当前版本：\(Self.appVersionText())。\(self.sparkleStatus)，GitHub Releases 仅用于手动查看。"
                     self.refreshNativeUtilityWindows()
                     if showAlert {
                         self.presentUpdateCheckResult(self.updateCheckStatus, canOpenReleasePage: release.htmlURL != nil)
@@ -772,7 +965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp(),
             notesAutomationStatus: "按需请求；首次插入备忘录上下文时由 macOS 弹出授权。",
             updateStatus: updateCheckStatus,
-            distributionStatus: "本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
+            distributionStatus: "\(sparkleStatus)。本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
         )
     }
 
@@ -821,6 +1014,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 """
                 try manifest.write(
                     to: packageDir.appendingPathComponent("manifest.txt"),
+                    atomically: true,
+                    encoding: .utf8
+                )
+
+                let performanceCSV = self?.performanceMonitor.csvText() ?? "timestamp,cpu_percent_one_core,resident_bytes,footprint_bytes\n"
+                try performanceCSV.write(
+                    to: packageDir.appendingPathComponent("performance-samples.csv"),
                     atomically: true,
                     encoding: .utf8
                 )
@@ -903,6 +1103,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("上次运行", previousRunSummary),
         ]))
 
+        sections.append(Self.diagnosticSection("性能趋势", performanceMonitor.diagnosticRows()))
+
         sections.append(Self.diagnosticSection("账号空间 / 隐私", [
             ("当前空间", profile.name),
             ("首页", ProfileStore.homepageURL(for: profile.id).absoluteString),
@@ -925,6 +1127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         sections.append(Self.diagnosticSection("分发", [
             ("更新检查", updateCheckStatus),
+            ("Sparkle", sparkleStatus),
             ("发行页", releasePageURL.absoluteString),
             ("notarization", "运行时不能证明 DMG 是否已 stapled；用 packaging/notarize-dmg.sh / spctl / stapler 验证。"),
         ]))
