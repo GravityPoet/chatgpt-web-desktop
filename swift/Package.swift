@@ -10,9 +10,15 @@ let package = Package(
     products: [
         .executable(name: "ChatGPTSwiftWeb", targets: ["ChatGPTSwiftWeb"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.3"),
+    ],
     targets: [
         .executableTarget(
             name: "ChatGPTSwiftWeb",
+            dependencies: [
+                .product(name: "Sparkle", package: "Sparkle"),
+            ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
                 .linkedFramework("WebKit"),

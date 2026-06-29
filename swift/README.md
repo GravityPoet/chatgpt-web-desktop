@@ -14,7 +14,7 @@
 - 可选后台完成通知：窗口不在前台时，检测到网页回复从生成中变为空闲后发送 macOS 通知
 - 可把 Apple Notes 当前选中的备忘录正文作为文本上下文插入 ChatGPT 输入框
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
-- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索和最近本 App 日志
+- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、CPU/RSS/footprint 采样趋势和最近本 App 日志
 - 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
@@ -49,7 +49,7 @@ dist/ChatGPT Swift.dmg
 
 ## Developer ID / Notarization
 
-本地构建会 codesign 并启用 hardened runtime。Developer ID 分发需要使用 Apple Developer 证书、timestamp 和 notarization：
+本地构建会 codesign 并启用 hardened runtime。由于本地自签名证书没有 Apple Team ID，脚本会自动使用 `packaging/local-debug.entitlements` 允许加载嵌入的 Sparkle framework。Developer ID 分发需要使用 Apple Developer 证书、timestamp 和 notarization：
 
 ```bash
 CHATGPT_SWIFT_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -70,9 +70,38 @@ CHATGPT_SWIFT_NOTARY_PROFILE="chatgpt-swift-notary" ./packaging/notarize-dmg.sh
 
 脚本会执行 `notarytool submit --wait`、`stapler staple`、`stapler validate` 和 `spctl --assess`。没有真实 Developer ID 证书和 Apple 凭据时，不会声称已完成 notarization。
 
-## 更新
+## 更新 / Sparkle
 
-App 菜单里的 `检查更新…` 会检查 GitHub Releases 并可打开发行页。完整自动安装更新还未启用；要做到官方级别的后台自动更新，需要接 Sparkle、生成 EdDSA key、发布 appcast，并把 DMG/zip 签名产物纳入 release 流程。
+App 菜单里的 `检查更新…` 优先使用 Sparkle；未配置 Sparkle 时回退到 GitHub Releases 并可打开发行页。本地默认构建不会启用自动安装更新，避免没有 feed/key 的开发构建进入半配置状态。
+
+生成 Sparkle EdDSA 公钥：
+
+```bash
+./packaging/generate-sparkle-keys.sh
+```
+
+默认 Keychain account 是 `chatgpt-swift`；如需换名，两个脚本都使用同一个环境变量：
+
+```bash
+CHATGPT_SWIFT_SPARKLE_KEY_ACCOUNT="your-account" ./packaging/generate-sparkle-keys.sh
+```
+
+用 HTTPS appcast feed 和公钥打包：
+
+```bash
+CHATGPT_SWIFT_SPARKLE_FEED_URL="https://example.com/appcast.xml" \
+CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY="YOUR_PUBLIC_EDDSA_KEY" \
+./packaging/make-dmg.sh
+```
+
+从签名后的 DMG 生成 appcast：
+
+```bash
+CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX="https://example.com/releases/" \
+./packaging/make-sparkle-appcast.sh
+```
+
+真实自动更新发布还需要：HTTPS 托管 `appcast.xml` 和 DMG、Developer ID 签名、notarization/stapler、Sparkle 私钥在 Keychain 或 CI secret 中可用。私钥不要提交到仓库。
 
 ## 安装到 Applications
 
