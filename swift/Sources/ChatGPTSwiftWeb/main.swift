@@ -7,6 +7,8 @@ import WebKit
 
 private let chatGPTURL = URL(string: "https://chatgpt.com/")!
 private let appBundleIdentifier = "local.chatgpt-web.swift"
+private let releasePageURL = URL(string: "https://github.com/GravityPoet/chatgpt-web-desktop/releases")!
+private let latestReleaseAPIURL = URL(string: "https://api.github.com/repos/GravityPoet/chatgpt-web-desktop/releases/latest")!
 private let browserLogger = Logger(subsystem: appBundleIdentifier, category: "Browser")
 private let mainFrameDefaultsKey = "ChatGPTSwiftWeb.MainWindowFrame"
 private let webZoomDefaultsKey = "ChatGPTSwiftWeb.WebViewZoom"
@@ -36,14 +38,31 @@ private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPart
 private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
 private var singleInstanceLockFileDescriptor: CInt = -1
 
+private struct GitHubRelease: Decodable {
+    let tagName: String
+    let name: String?
+    let htmlURL: String?
+    let publishedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case tagName = "tag_name"
+        case name
+        case htmlURL = "html_url"
+        case publishedAt = "published_at"
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
-    private var mainController: BrowserWindowController?
+    var mainController: BrowserWindowController?
     private var incognitoControllers: [BrowserWindowController] = []
     private var keyMonitor: Any?
     private var profilesMenu: NSMenu?
     private var privacyMenu: NSMenu?
     private var webRTCProtectionItem: NSMenuItem?
     private var enhancedPrivacyItem: NSMenuItem?
+    private var settingsWindowController: AppSettingsWindowController?
+    private var diagnosticsWindowController: DiagnosticsWindowController?
+    private var updateCheckStatus = "未检查；当前只提供 GitHub Releases 检查入口，完整自动更新需要 Sparkle appcast、EdDSA key 和签名发布流。"
     private var didApplyLaunchGeoIP = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -125,6 +144,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "关于 ChatGPT Swift", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
         appMenu.addItem(NSMenuItem.separator())
+        let settingsItem = appMenu.addItem(withTitle: "设置…", action: #selector(openAppSettingsAction(_:)), keyEquivalent: ",")
+        settingsItem.target = self
+        let updateItem = appMenu.addItem(withTitle: "检查更新…", action: #selector(checkForUpdatesAction(_:)), keyEquivalent: "")
+        updateItem.target = self
+        appMenu.addItem(NSMenuItem.separator())
         appMenu.addItem(withTitle: "退出 ChatGPT Swift", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         appItem.submenu = appMenu
         mainMenu.addItem(appItem)
@@ -166,11 +190,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
         editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(NSMenuItem.separator())
+        let notesContextItem = editMenu.addItem(withTitle: "插入备忘录上下文", action: #selector(insertNotesContextAction(_:)), keyEquivalent: "")
+        notesContextItem.target = self
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
 
         let navigationItem = NSMenuItem()
         let navigationMenu = NSMenu(title: "导航")
+        let focusPromptItem = navigationMenu.addItem(withTitle: "聚焦输入框", action: #selector(focusPromptAction(_:)), keyEquivalent: "")
+        focusPromptItem.target = self
+        navigationMenu.addItem(NSMenuItem.separator())
         let backItem = navigationMenu.addItem(withTitle: "后退", action: #selector(goBackAction(_:)), keyEquivalent: "[")
         backItem.target = self
         let forwardItem = navigationMenu.addItem(withTitle: "前进", action: #selector(goForwardAction(_:)), keyEquivalent: "]")
@@ -182,6 +212,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let reloadItem = navigationMenu.addItem(withTitle: "重新加载", action: #selector(reloadAction(_:)), keyEquivalent: "r")
         reloadItem.target = self
         navigationMenu.addItem(NSMenuItem.separator())
+        let openInBrowserItem = navigationMenu.addItem(withTitle: "在系统浏览器打开", action: #selector(openCurrentURLInBrowserAction(_:)), keyEquivalent: "o")
+        openInBrowserItem.keyEquivalentModifierMask = [.command, .option]
+        openInBrowserItem.target = self
         let copyURLItem = navigationMenu.addItem(withTitle: "复制当前页链接", action: #selector(copyCurrentURLAction(_:)), keyEquivalent: "c")
         copyURLItem.keyEquivalentModifierMask = [.command, .shift]
         copyURLItem.target = self
@@ -213,11 +246,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         mainMenu.addItem(windowItem)
         NSApp.windowsMenu = windowMenu
 
+        let helpItem = NSMenuItem()
+        let helpMenu = NSMenu(title: "帮助")
+        let diagnosticsItem = helpMenu.addItem(withTitle: "诊断…", action: #selector(showDiagnosticsWindow(_:)), keyEquivalent: "")
+        diagnosticsItem.target = self
+        let releaseItem = helpMenu.addItem(withTitle: "打开发行页", action: #selector(openReleasePageAction(_:)), keyEquivalent: "")
+        releaseItem.target = self
+        helpItem.submenu = helpMenu
+        mainMenu.addItem(helpItem)
+        NSApp.helpMenu = helpMenu
+
         NSApp.mainMenu = mainMenu
     }
 
     private func installKeyboardZoomShortcuts() {
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let controller = BrowserWindowController.keyWindowController() else {
                 return event
             }
@@ -233,6 +276,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             }
 
             switch event.charactersIgnoringModifiers {
+            case ",":
+                self?.openAppSettingsAction(nil)
+                return nil
             case "[":
                 controller.goBack(nil)
                 return nil
@@ -267,6 +313,297 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             && flags.contains(.shift)
             && !flags.contains(.control)
             && !flags.contains(.option)
+    }
+
+    @objc func openAppSettingsAction(_ sender: Any?) {
+        let controller: AppSettingsWindowController
+        if let existing = settingsWindowController {
+            controller = existing
+        } else {
+            controller = AppSettingsWindowController(
+                state: makeAppSettingsState(),
+                callbacks: AppSettingsCallbacks(
+                    setWebRTCProtection: { [weak self] enabled in
+                        self?.setWebRTCProtectionFromSettings(enabled)
+                    },
+                    setThirdPartyLinksInApp: { [weak self] enabled in
+                        self?.setThirdPartyLinksInAppFromSettings(enabled)
+                    },
+                    setEnhancedPrivacy: { [weak self] enabled in
+                        self?.setEnhancedPrivacyFromSettings(enabled)
+                    },
+                    openNotesAutomationPrivacy: { [weak self] in
+                        self?.openNotesAutomationPrivacy()
+                    },
+                    showDiagnostics: { [weak self] in
+                        self?.showDiagnosticsWindow(nil)
+                    },
+                    checkForUpdates: { [weak self] in
+                        self?.checkForUpdates(showAlert: true)
+                    },
+                    openReleasePage: { [weak self] in
+                        self?.openReleasePage()
+                    }
+                )
+            )
+            settingsWindowController = controller
+        }
+
+        controller.update(state: makeAppSettingsState())
+        if let window = controller.window {
+            if !window.isVisible {
+                window.center()
+            }
+            window.makeKeyAndOrderFront(sender)
+        } else {
+            controller.showWindow(sender)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc func showPreferencesWindow(_ sender: Any?) {
+        openAppSettingsAction(sender)
+    }
+
+    @objc private func showDiagnosticsWindow(_ sender: Any?) {
+        let controller: DiagnosticsWindowController
+        if let existing = diagnosticsWindowController {
+            controller = existing
+        } else {
+            controller = DiagnosticsWindowController(
+                state: makeDiagnosticsState(),
+                callbacks: AppDiagnosticsCallbacks { [weak self] in
+                    self?.makeDiagnosticsState() ?? AppDiagnosticsState(generatedAt: "unknown", report: "AppDelegate unavailable")
+                }
+            )
+            diagnosticsWindowController = controller
+        }
+
+        controller.update(state: makeDiagnosticsState())
+        controller.showWindow(sender)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    @objc private func checkForUpdatesAction(_ sender: Any?) {
+        checkForUpdates(showAlert: true)
+    }
+
+    @objc private func openReleasePageAction(_ sender: Any?) {
+        openReleasePage()
+    }
+
+    private func setWebRTCProtectionFromSettings(_ enabled: Bool) {
+        guard PrivacySettings.isWebRTCProtectionEnabled() != enabled else {
+            refreshNativeUtilityWindows()
+            return
+        }
+        PrivacySettings.setWebRTCProtectionEnabled(enabled)
+        updateWebRTCProtectionMenuItem()
+        rebuildMainController(initialURL: mainController?.currentURL())
+        refreshNativeUtilityWindows()
+    }
+
+    private func setThirdPartyLinksInAppFromSettings(_ enabled: Bool) {
+        PrivacySettings.setKeepThirdPartyLinksInApp(enabled)
+        refreshNativeUtilityWindows()
+    }
+
+    private func setEnhancedPrivacyFromSettings(_ enabled: Bool) {
+        let profileID = ProfileStore.currentProfileID()
+        guard ProfileStore.isEnhancedPrivacyEnabled(for: profileID) != enabled else {
+            refreshNativeUtilityWindows()
+            return
+        }
+        ProfileStore.setEnhancedPrivacyEnabled(enabled, for: profileID)
+        updateEnhancedPrivacyMenuItem()
+        rebuildMainController(initialURL: mainController?.currentURL())
+        refreshNativeUtilityWindows()
+    }
+
+    private func refreshNativeUtilityWindows() {
+        settingsWindowController?.update(state: makeAppSettingsState())
+        diagnosticsWindowController?.update(state: makeDiagnosticsState())
+    }
+
+    private func openNotesAutomationPrivacy() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    private func openReleasePage() {
+        NSWorkspace.shared.open(releasePageURL)
+    }
+
+    private func checkForUpdates(showAlert: Bool) {
+        updateCheckStatus = "正在检查 GitHub Releases…"
+        refreshNativeUtilityWindows()
+
+        var request = URLRequest(url: latestReleaseAPIURL)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        request.setValue("ChatGPTSwiftWeb", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+
+                if let error {
+                    self.updateCheckStatus = "检查失败：\(error.localizedDescription)"
+                    self.refreshNativeUtilityWindows()
+                    if showAlert {
+                        self.presentUpdateCheckResult(self.updateCheckStatus, canOpenReleasePage: true)
+                    }
+                    return
+                }
+
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                guard statusCode == 200, let data else {
+                    self.updateCheckStatus = "没有可读取的 GitHub Release feed（HTTP \(statusCode)）。"
+                    self.refreshNativeUtilityWindows()
+                    if showAlert {
+                        self.presentUpdateCheckResult(self.updateCheckStatus, canOpenReleasePage: true)
+                    }
+                    return
+                }
+
+                do {
+                    let release = try JSONDecoder().decode(GitHubRelease.self, from: data)
+                    let title = release.name?.isEmpty == false ? release.name! : release.tagName
+                    let date = release.publishedAt?.isEmpty == false ? "，发布时间 \(release.publishedAt!)" : ""
+                    self.updateCheckStatus = "最新发布：\(title)\(date)。当前版本：\(Self.appVersionText())。自动安装更新尚未启用。"
+                    self.refreshNativeUtilityWindows()
+                    if showAlert {
+                        self.presentUpdateCheckResult(self.updateCheckStatus, canOpenReleasePage: release.htmlURL != nil)
+                    }
+                } catch {
+                    self.updateCheckStatus = "Release feed 解析失败：\(error.localizedDescription)"
+                    self.refreshNativeUtilityWindows()
+                    if showAlert {
+                        self.presentUpdateCheckResult(self.updateCheckStatus, canOpenReleasePage: true)
+                    }
+                }
+            }
+        }.resume()
+    }
+
+    private func presentUpdateCheckResult(_ message: String, canOpenReleasePage: Bool) {
+        let alert = NSAlert()
+        alert.messageText = "检查更新"
+        alert.informativeText = message
+        alert.alertStyle = .informational
+        if canOpenReleasePage {
+            alert.addButton(withTitle: "打开发行页")
+            alert.addButton(withTitle: "关闭")
+            if alert.runModal() == .alertFirstButtonReturn {
+                openReleasePage()
+            }
+        } else {
+            alert.addButton(withTitle: "知道了")
+            alert.runModal()
+        }
+    }
+
+    private func makeAppSettingsState() -> AppSettingsState {
+        let profile = ProfileStore.currentProfile()
+        let startupID = ProfileStore.startupProfileID()
+        let startupName = ProfileStore.loadProfiles().first(where: { $0.id == startupID })?.name ?? "默认"
+        let fingerprintName = ProfileStore.fingerprint(for: profile.id)?.displayName ?? "默认 Safari（不混淆）"
+        let isolation: String
+        if #available(macOS 14.0, *) {
+            isolation = profile.id == defaultProfileID ? "内置 WebView 数据仓库" : "独立 WKWebsiteDataStore"
+        } else {
+            isolation = "当前系统不支持多账号持久数据仓库隔离"
+        }
+
+        return AppSettingsState(
+            appVersion: Self.appVersionText(),
+            currentProfileName: profile.name,
+            startupProfileName: startupName,
+            homepage: ProfileStore.homepageURL(for: profile.id).absoluteString,
+            profileIsolation: isolation,
+            fingerprintName: fingerprintName,
+            enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
+            webRTCProtectionEnabled: PrivacySettings.isWebRTCProtectionEnabled(),
+            keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp(),
+            notesAutomationStatus: "按需请求；首次插入备忘录上下文时由 macOS 弹出授权。",
+            updateStatus: updateCheckStatus,
+            distributionStatus: "本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
+        )
+    }
+
+    private func makeDiagnosticsState() -> AppDiagnosticsState {
+        let generatedAt = Self.timestampString(Date())
+        return AppDiagnosticsState(generatedAt: generatedAt, report: makeDiagnosticsReport(generatedAt: generatedAt))
+    }
+
+    private func makeDiagnosticsReport(generatedAt: String) -> String {
+        let profile = ProfileStore.currentProfile()
+        let fingerprintName = ProfileStore.fingerprint(for: profile.id)?.displayName ?? "默认 Safari（不混淆）"
+        let bundle = Bundle.main
+        let process = ProcessInfo.processInfo
+        var sections: [String] = []
+
+        sections.append(Self.diagnosticSection("App", [
+            ("生成时间", generatedAt),
+            ("Bundle ID", bundle.bundleIdentifier ?? appBundleIdentifier),
+            ("版本", Self.appVersionText()),
+            ("进程", "\(process.processName) / pid \(process.processIdentifier)"),
+            ("系统", process.operatingSystemVersionString),
+            ("Bundle 路径", bundle.bundlePath),
+        ]))
+
+        sections.append(Self.diagnosticSection("账号空间 / 隐私", [
+            ("当前空间", profile.name),
+            ("首页", ProfileStore.homepageURL(for: profile.id).absoluteString),
+            ("启动默认空间", ProfileStore.startupProfileID()),
+            ("指纹预设", fingerprintName),
+            ("增强隐私模式", ProfileStore.isEnhancedPrivacyEnabled(for: profile.id) ? "开启" : "关闭"),
+            ("WebRTC 防护", PrivacySettings.isWebRTCProtectionEnabled() ? "开启" : "关闭"),
+            ("第三方链接在 App 内打开", PrivacySettings.keepThirdPartyLinksInApp() ? "开启" : "关闭"),
+        ]))
+
+        if let controller = mainController {
+            sections.append(controller.diagnosticsReport())
+        } else {
+            sections.append(Self.diagnosticSection("WebView", [("状态", "mainController 不存在")]))
+        }
+
+        sections.append(Self.diagnosticSection("分发", [
+            ("更新检查", updateCheckStatus),
+            ("发行页", releasePageURL.absoluteString),
+            ("notarization", "运行时不能证明 DMG 是否已 stapled；用 packaging/notarize-dmg.sh / spctl / stapler 验证。"),
+        ]))
+
+        return sections.joined(separator: "\n\n")
+    }
+
+    private static func appVersionText() -> String {
+        let bundle = Bundle.main
+        let short = bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        let build = bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String
+        switch (short, build) {
+        case let (short?, build?):
+            return "\(short) (\(build))"
+        case let (short?, nil):
+            return short
+        default:
+            return "开发构建"
+        }
+    }
+
+    private static func timestampString(_ date: Date) -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
+    private static func diagnosticSection(_ title: String, _ rows: [(String, String)]) -> String {
+        let body = rows.map { key, value in
+            "\(key): \(value)"
+        }.joined(separator: "\n")
+        return "[\(title)]\n\(body)"
     }
 
     @objc private func importCookiesMenu(_ sender: Any?) {
@@ -386,19 +723,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
             return
         }
-        if controller.isShowingBlankContent {
-            // Blank or crashed view: webView.reload() has no back-forward item to refresh, so the page
-            // stays white. Rebuild the main window (fresh content process, clean Cloudflare retry) or
-            // hard-reload a popup so the page actually comes back — restoring the old recover-from-blank
-            // behavior while keeping lightweight, state-preserving reloads for healthy pages.
-            if controller === mainController {
-                rebuildMainController(initialURL: controller.currentURL())
-            } else {
-                controller.hardReload()
-            }
-        } else {
-            controller.reload(sender)
-        }
+        controller.reload(sender)
+    }
+
+    @objc private func openCurrentURLInBrowserAction(_ sender: Any?) {
+        (BrowserWindowController.keyWindowController() ?? mainController)?.openCurrentURLInSystemBrowser(sender)
     }
 
     @objc private func copyCurrentURLAction(_ sender: Any?) {
@@ -610,7 +939,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         - TLS 指纹（JA3 / JA4）：WKWebView 使用系统网络栈，App 无法逐站点修改。
         - HTTP/2 帧顺序和 WebKit 渲染细节：仍会暴露 Safari/WebKit 引擎特征。
         - Worker、字体、GPU、窗口尺寸、行为模式等强风控信号：只能降低暴露，不能保证隐藏。
-        - IP 地址：同一出口 IP 仍可能把不同账号关联到同一网络环境。
+        - 网络出口：同一出口网络仍可能把不同账号关联到同一环境。
 
         所以本 App 只做「Safari-only 一致性隐私指纹」，不做 Chrome / Firefox 跨引擎伪装。
         """
@@ -993,6 +1322,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         updateEnhancedPrivacyMenuItem()
     }
 
+    func recoverBlankContent(in controller: BrowserWindowController) {
+        if controller === mainController {
+            rebuildMainController(initialURL: controller.currentURL())
+        } else {
+            controller.hardReload(ignoringCache: true)
+        }
+    }
+
     private func mainWindowTitle(for profile: WebProfile) -> String {
         if profile.id == defaultProfileID && profile.name == "默认" {
             return "ChatGPT Swift"
@@ -1234,7 +1571,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 }
 
-final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
+final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     private static var controllers: [BrowserWindowController] = []
 
     private(set) var window: NSWindow!
@@ -1244,9 +1581,27 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     private let persistent: Bool
     private let profileID: String?
     private var closeHandler: (() -> Void)?
-    private var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
+    var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
     private var isDisposing = false
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    private var renderProbeGeneration = 0
+    var lastRenderProbeWasBlank = false
+    private var blankRecoveryAttempts = 0
+    private var webContentProcessTerminationCount = 0
+    private var navigationFailureCount = 0
+    private var lastNavigationFailureDescription = "无"
+    private var lastRenderProbeSummary = "未运行"
+    private var lastBlankRecoverySummary = "无"
+    private var lastNavigationStartedAt: Date?
+    private var lastNavigationFinishedAt: Date?
+    var toolbarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
+    var statusLabel: NSTextField?
+    var statusContainer: NSView?
+    var statusWidthConstraint: NSLayoutConstraint?
+    var statusProgressWidthConstraint: NSLayoutConstraint?
+    var statusProgressLabelSpacingConstraint: NSLayoutConstraint?
+    var progressIndicator: NSProgressIndicator?
+    var webViewObservations: [NSKeyValueObservation] = []
 
     init(
         initialURL: URL?,
@@ -1294,37 +1649,59 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 900, height: 640)
         window.tabbingMode = .disallowed
+        configureNativeToolbar()
         if isPopup || restoredFrame == nil {
             window.center()
         }
 
         webView.autoresizingMask = [.width, .height]
+        observeWebViewState()
 
         if let initialURL {
             webView.load(Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID))
         }
+
+        updateNativeChromeStatus()
     }
 
     func show() {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        scheduleRenderedContentProbe(reason: "window shown", delay: 1.5)
     }
 
     @objc func reload(_ sender: Any?) {
-        webView.reload()
+        if isShowingBlankContent {
+            setStatus("正在恢复空白页面…", showsProgress: true)
+            recoverFromBlankContent(reason: "reload action")
+            return
+        }
+
+        runRenderedContentProbe(reason: "reload action", recoverIfBlank: false) { [weak self] isBlank in
+            guard let self else {
+                return
+            }
+            if isBlank {
+                self.recoverFromBlankContent(reason: "reload action blank probe")
+            } else {
+                self.webView.reload()
+            }
+        }
     }
 
     /// True when the web view has no live, loaded content — the content process crashed, a provisional
     /// load failed, or nothing ever loaded. In these states `reload()` is a no-op and the view stays blank.
     var isShowingBlankContent: Bool {
-        webView.url == nil || webView.backForwardList.currentItem == nil
+        webView.url == nil || webView.backForwardList.currentItem == nil || lastRenderProbeWasBlank
     }
 
     /// Re-issue a full load (restarting a dead content process) instead of refreshing the back-forward
     /// list. Falls back to the profile homepage when there is no current URL to recover.
-    func hardReload() {
+    func hardReload(ignoringCache: Bool = false) {
         let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
-        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
+        let cachePolicy: URLRequest.CachePolicy = ignoringCache ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
+        webView.stopLoading()
+        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID, cachePolicy: cachePolicy))
     }
 
     var canGoBack: Bool {
@@ -1355,12 +1732,48 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
     }
 
+    @objc func openCurrentURLInSystemBrowser(_ sender: Any?) {
+        let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? ProfileStore.currentProfileID())
+        NSWorkspace.shared.open(target)
+    }
+
     func navigate(to url: URL) {
         webView.load(Self.privacyRequest(for: url, sourceURL: webView.url, profileID: profileID))
     }
 
     func currentURL() -> URL? {
         webView.url
+    }
+
+    func diagnosticsReport() -> String {
+        let frame = window.frame
+        let currentItemURL = webView.backForwardList.currentItem?.url
+        let rows = [
+            ("窗口标题", window.title),
+            ("窗口 frame", "x=\(Int(frame.origin.x)), y=\(Int(frame.origin.y)), w=\(Int(frame.size.width)), h=\(Int(frame.size.height))"),
+            ("窗口类型", isPopup ? "弹窗" : "主窗口"),
+            ("持久数据", persistent ? "是" : "否"),
+            ("空间", profileDisplayName() ?? (persistent ? "默认" : "无痕")),
+            ("当前 URL", webView.url.map(Self.loggableURL) ?? "nil"),
+            ("历史当前项", currentItemURL.map(Self.loggableURL) ?? "nil"),
+            ("标题", webView.title ?? "nil"),
+            ("isLoading", webView.isLoading ? "true" : "false"),
+            ("estimatedProgress", String(format: "%.3f", webView.estimatedProgress)),
+            ("canGoBack / canGoForward", "\(webView.canGoBack) / \(webView.canGoForward)"),
+            ("zoom", "\(Int(round(currentZoom * 100)))%"),
+            ("isShowingBlankContent", isShowingBlankContent ? "true" : "false"),
+            ("lastRenderProbeWasBlank", lastRenderProbeWasBlank ? "true" : "false"),
+            ("lastRenderProbe", lastRenderProbeSummary),
+            ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
+            ("lastBlankRecovery", lastBlankRecoverySummary),
+            ("webContentProcessTerminationCount", "\(webContentProcessTerminationCount)"),
+            ("navigationFailureCount", "\(navigationFailureCount)"),
+            ("lastNavigationFailure", lastNavigationFailureDescription),
+            ("lastNavigationStartedAt", Self.diagnosticDateString(lastNavigationStartedAt)),
+            ("lastNavigationFinishedAt", Self.diagnosticDateString(lastNavigationFinishedAt)),
+            ("userAgent override", webView.customUserAgent ?? "nil"),
+        ]
+        return Self.diagnosticSection("WebView", rows)
     }
 
     func loadFingerprintTestPage() {
@@ -1546,6 +1959,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func dispose() {
+        webViewObservations.removeAll()
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
         closeHandler = nil
@@ -1561,10 +1975,103 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         persistMainWindowFrame()
     }
 
+    func windowDidBecomeKey(_ notification: Notification) {
+        scheduleRenderedContentProbe(reason: "window activation", delay: 0.8)
+    }
+
     func windowWillClose(_ notification: Notification) {
         persistMainWindowFrame()
         Self.controllers.removeAll { $0 === self }
         closeHandler?()
+    }
+
+    private func invalidateRenderedContentProbes() {
+        renderProbeGeneration += 1
+    }
+
+    private func scheduleRenderedContentProbe(reason: String, delay: TimeInterval) {
+        invalidateRenderedContentProbes()
+        let generation = renderProbeGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak webView] in
+            guard let self,
+                  let webView,
+                  self.webView === webView,
+                  !self.isDisposing,
+                  generation == self.renderProbeGeneration else {
+                return
+            }
+            self.runRenderedContentProbe(reason: reason, generation: generation, recoverIfBlank: true)
+        }
+    }
+
+    private func runRenderedContentProbe(
+        reason: String,
+        generation: Int? = nil,
+        recoverIfBlank: Bool,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        webView.evaluateJavaScript(Self.renderedContentProbeScript) { [weak self] result, error in
+            guard let self, !self.isDisposing else {
+                return
+            }
+            if let generation, generation != self.renderProbeGeneration {
+                return
+            }
+            if let error {
+                browserLogger.debug("Rendered content probe failed (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
+                lastRenderProbeSummary = "probe failed: \(error.localizedDescription)"
+                completion?(false)
+                return
+            }
+            guard let report = result as? [String: Any] else {
+                browserLogger.debug("Rendered content probe returned an unexpected result (\(reason, privacy: .public))")
+                lastRenderProbeSummary = "probe returned unexpected result"
+                completion?(false)
+                return
+            }
+
+            let isBlank = Self.boolValue(report["blank"])
+            lastRenderProbeWasBlank = isBlank
+            let readyState = report["readyState"] as? String ?? "unknown"
+            let textLength = Self.intValue(report["textLength"])
+            let visibleElements = Self.intValue(report["visibleElements"])
+            let bodyChildren = Self.intValue(report["bodyChildren"])
+            lastRenderProbeSummary = "blank=\(isBlank), readyState=\(readyState), textLength=\(textLength), visibleElements=\(visibleElements), bodyChildren=\(bodyChildren)"
+            updateNativeChromeStatus()
+
+            if isBlank {
+                let urlText = Self.loggableURL(webView.url ?? chatGPTURL)
+                browserLogger.error("Rendered content probe found blank page (\(reason, privacy: .public)) at \(urlText, privacy: .public); textLength=\(textLength, privacy: .public), visibleElements=\(visibleElements, privacy: .public), bodyChildren=\(bodyChildren, privacy: .public)")
+                if recoverIfBlank {
+                    setStatus("页面空白，正在自动恢复…", showsProgress: true)
+                    recoverFromBlankContent(reason: reason)
+                }
+            } else {
+                blankRecoveryAttempts = 0
+            }
+
+            completion?(isBlank)
+        }
+    }
+
+    private func recoverFromBlankContent(reason: String) {
+        guard blankRecoveryAttempts < 2 else {
+            browserLogger.error("Blank page recovery suppressed after repeated attempts (\(reason, privacy: .public))")
+            setStatus("自动恢复已停止，请手动重新加载", showsProgress: false)
+            return
+        }
+
+        blankRecoveryAttempts += 1
+        let urlText = Self.loggableURL(webView.url ?? chatGPTURL)
+        lastBlankRecoverySummary = "\(Self.diagnosticDateString(Date())) reason=\(reason), url=\(urlText)"
+        browserLogger.error("Recovering blank WebView (\(reason, privacy: .public)) at \(urlText, privacy: .public)")
+        setStatus("正在恢复页面…", showsProgress: true)
+
+        if let appDelegate = NSApp.delegate as? AppDelegate {
+            appDelegate.recoverBlankContent(in: self)
+        } else {
+            hardReload(ignoringCache: true)
+        }
     }
 
     func persistMainWindowFrame() {
@@ -1580,6 +2087,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
             "height": frame.size.height,
         ], forKey: mainFrameDefaultsKey)
         UserDefaults.standard.synchronize()
+    }
+
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        lastNavigationStartedAt = Date()
+        lastRenderProbeWasBlank = false
+        invalidateRenderedContentProbes()
+        updateNativeChromeStatus()
     }
 
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
@@ -1633,21 +2147,38 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        lastNavigationFinishedAt = Date()
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
+        scheduleRenderedContentProbe(reason: "navigation finished", delay: 2.0)
+        updateNativeChromeStatus()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
         // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
         // window self-heals instead of stranding the user on a blank page.
+        webContentProcessTerminationCount += 1
         browserLogger.error("Web content process terminated; reloading to recover blank view")
+        setStatus("渲染进程已重启，正在恢复…", showsProgress: true)
         let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
         webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         // Surface the failure so a blank window after a failed load is diagnosable in the unified log.
+        navigationFailureCount += 1
+        lastNavigationFailureDescription = error.localizedDescription
+        lastRenderProbeWasBlank = true
+        setStatus("页面加载失败", showsProgress: false)
         browserLogger.error("Provisional navigation failed: \(error.localizedDescription, privacy: .public)")
+    }
+
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        navigationFailureCount += 1
+        lastNavigationFailureDescription = error.localizedDescription
+        lastRenderProbeWasBlank = true
+        setStatus("页面加载失败", showsProgress: false)
+        browserLogger.error("Navigation failed: \(error.localizedDescription, privacy: .public)")
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
@@ -2668,6 +3199,48 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         return cleaned.isEmpty ? "chatgpt-download" : cleaned
     }
 
+    private static func boolValue(_ value: Any?) -> Bool {
+        if let bool = value as? Bool {
+            return bool
+        }
+        if let number = value as? NSNumber {
+            return number.boolValue
+        }
+        if let string = value as? String {
+            return string == "true" || string == "1"
+        }
+        return false
+    }
+
+    private static func intValue(_ value: Any?) -> Int {
+        if let int = value as? Int {
+            return int
+        }
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String, let int = Int(string) {
+            return int
+        }
+        return 0
+    }
+
+    private static func diagnosticSection(_ title: String, _ rows: [(String, String)]) -> String {
+        let body = rows.map { key, value in
+            "\(key): \(value)"
+        }.joined(separator: "\n")
+        return "[\(title)]\n\(body)"
+    }
+
+    private static func diagnosticDateString(_ date: Date?) -> String {
+        guard let date else {
+            return "无"
+        }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: date)
+    }
+
     private static func javascriptStringLiteral(_ value: String) -> String {
         guard let data = try? JSONEncoder().encode(value),
               let string = String(data: data, encoding: .utf8) else {
@@ -2675,6 +3248,73 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, WKNavigationDel
         }
         return string
     }
+
+    private static let renderedContentProbeScript = """
+    (() => {
+      const host = String(location.hostname || '').toLowerCase();
+      const isChatGPTPage = location.protocol === 'https:' && (
+        host === 'chatgpt.com' ||
+        host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' ||
+        host.endsWith('.chat.openai.com')
+      );
+      if (!isChatGPTPage || document.readyState !== 'complete') {
+        return {
+          blank: false,
+          readyState: document.readyState,
+          href: location.href,
+          title: document.title,
+          textLength: 0,
+          visibleElements: 0,
+          bodyChildren: document.body ? document.body.children.length : 0
+        };
+      }
+
+      const body = document.body;
+      const text = body ? String(body.innerText || body.textContent || '').replace(/\\s+/g, ' ').trim() : '';
+      const selectors = [
+        'main',
+        '[role="main"]',
+        'form',
+        'textarea',
+        'input',
+        'button',
+        'nav',
+        'article',
+        'section',
+        'iframe',
+        'canvas',
+        'video',
+        'img',
+        'svg',
+        '[data-testid]',
+        '[contenteditable="true"]'
+      ].join(',');
+
+      let visibleElements = 0;
+      if (body) {
+        for (const element of body.querySelectorAll(selectors)) {
+          try {
+            const style = window.getComputedStyle(element);
+            if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
+            const rect = element.getBoundingClientRect();
+            if (rect.width > 1 && rect.height > 1) visibleElements += 1;
+          } catch (_) {}
+        }
+      }
+
+      const bodyChildren = body ? body.children.length : 0;
+      return {
+        blank: !body || (text.length < 8 && visibleElements === 0),
+        readyState: document.readyState,
+        href: location.href,
+        title: document.title,
+        textLength: text.length,
+        visibleElements,
+        bodyChildren
+      };
+    })()
+    """
 
     private static func makeConfiguration(messageHandler: WKScriptMessageHandler, persistent: Bool, profileID: String?) -> WKWebViewConfiguration {
         let userContentController = WKUserContentController()
@@ -4015,7 +4655,7 @@ private struct ExportedBrowserCookie: Codable {
             throw BrowserWindowController.cookieImportError("cookie path 不安全")
         }
 
-        var properties: [HTTPCookiePropertyKey: Any] = [
+        var cookieAttributes: [HTTPCookiePropertyKey: Any] = [
             .name: trimmedName,
             .value: value,
             .domain: trimmedDomain,
@@ -4024,23 +4664,27 @@ private struct ExportedBrowserCookie: Codable {
         ]
 
         if secure == true {
-            properties[.secure] = "TRUE"
+            cookieAttributes[.secure] = "TRUE"
         }
         if httpOnly == true {
-            properties[HTTPCookiePropertyKey("HttpOnly")] = "TRUE"
+            cookieAttributes[HTTPCookiePropertyKey("HttpOnly")] = "TRUE"
         }
         if let sameSiteValue = normalizedSameSiteValue(sameSite) {
-            properties[HTTPCookiePropertyKey("SameSite")] = sameSiteValue
+            cookieAttributes[HTTPCookiePropertyKey("SameSite")] = sameSiteValue
         }
         if session != true, let expirationDate {
-            properties[.expires] = Date(timeIntervalSince1970: expirationDate)
+            cookieAttributes[.expires] = Date(timeIntervalSince1970: expirationDate)
         }
 
-        guard let cookie = HTTPCookie(properties: properties) else {
+        guard let result = makeFoundationCookie(cookieAttributes) else {
             throw BrowserWindowController.cookieImportError("cookie 数据无法转换")
         }
 
-        return cookie
+        return result
+    }
+
+    private func makeFoundationCookie(_ attributes: [HTTPCookiePropertyKey: Any]) -> HTTPCookie? {
+        HTTPCookie(properties: attributes)
     }
 
     private func normalizedSameSiteValue(_ rawValue: String?) -> String? {
@@ -5441,18 +6085,13 @@ private let nativeShimScript = """
 })();
 """
 
-@main
-enum Main {
-    private static let delegate = AppDelegate()
+private let applicationDelegate = AppDelegate()
 
-    static func main() {
-        SingleInstance.activateExistingInstanceOrAcquireLock()
+SingleInstance.activateExistingInstanceOrAcquireLock()
 
-        let app = NSApplication.shared
-        app.delegate = delegate
-        app.run()
-    }
-}
+let app = NSApplication.shared
+app.delegate = applicationDelegate
+app.run()
 
 enum SingleInstance {
     static func activateExistingInstanceOrAcquireLock() {

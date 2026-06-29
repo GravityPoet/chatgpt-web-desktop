@@ -7,6 +7,8 @@ APP_NAME="ChatGPT Swift"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
 INSTALL_APP="/Applications/$APP_NAME.app"
 SIGN_IDENTITY="${CHATGPT_SWIFT_CODESIGN_IDENTITY:-}"
+SIGN_TIMESTAMP="${CHATGPT_SWIFT_CODESIGN_TIMESTAMP:-0}"
+SIGN_ENTITLEMENTS="${CHATGPT_SWIFT_CODESIGN_ENTITLEMENTS:-}"
 
 "$ROOT/packaging/make-app.sh" >/dev/null
 
@@ -17,7 +19,18 @@ fi
 /usr/bin/osascript -e "tell application \"$APP_NAME\" to quit" >/dev/null 2>&1 || true
 /bin/sleep 1
 /usr/bin/ditto "$APP_DIR" "$INSTALL_APP"
-/usr/bin/codesign --force --deep --sign "$SIGN_IDENTITY" "$INSTALL_APP"
+codesign_args=(--force --deep --options runtime --sign "$SIGN_IDENTITY")
+if [[ "$SIGN_TIMESTAMP" == "1" ]]; then
+  codesign_args+=(--timestamp)
+fi
+if [[ -n "$SIGN_ENTITLEMENTS" ]]; then
+  if [[ ! -f "$SIGN_ENTITLEMENTS" ]]; then
+    echo "error: CHATGPT_SWIFT_CODESIGN_ENTITLEMENTS does not exist: $SIGN_ENTITLEMENTS" >&2
+    exit 2
+  fi
+  codesign_args+=(--entitlements "$SIGN_ENTITLEMENTS")
+fi
+/usr/bin/codesign "${codesign_args[@]}" "$INSTALL_APP"
 /usr/bin/codesign --verify --deep --strict "$INSTALL_APP"
 /usr/bin/open -a "$APP_NAME"
 
