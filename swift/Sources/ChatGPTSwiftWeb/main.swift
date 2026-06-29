@@ -1010,7 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 bundleID: \(Bundle.main.bundleIdentifier ?? appBundleIdentifier)
                 version: \(Self.appVersionText())
                 process: \(ProcessInfo.processInfo.processName)
-                note: This package excludes cookies, localStorage, IndexedDB, and chat transcript content.
+                note: This package excludes cookies, localStorage, IndexedDB, and chat transcript content. It may include recent local crash reports for this app process.
                 """
                 try manifest.write(
                     to: packageDir.appendingPathComponent("manifest.txt"),
@@ -1024,6 +1024,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     atomically: true,
                     encoding: .utf8
                 )
+
+                let crashReports = Self.recentCrashReportURLs(limit: 5)
+                if !crashReports.isEmpty {
+                    let crashReportDir = packageDir.appendingPathComponent("crash-reports", isDirectory: true)
+                    try fileManager.createDirectory(at: crashReportDir, withIntermediateDirectories: true)
+                    for reportURL in crashReports {
+                        let destination = crashReportDir.appendingPathComponent(reportURL.lastPathComponent)
+                        if fileManager.fileExists(atPath: destination.path) {
+                            try fileManager.removeItem(at: destination)
+                        }
+                        try fileManager.copyItem(at: reportURL, to: destination)
+                    }
+                }
 
                 let logResult = Self.runProcess(
                     executable: "/usr/bin/log",
@@ -1101,6 +1114,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("启动到 didFinishLaunching", Self.durationString(from: processStartedAt, to: didFinishLaunchingAt)),
             ("当前运行时长", Self.durationString(from: processStartedAt, to: Date())),
             ("上次运行", previousRunSummary),
+            ("最近崩溃报告", Self.crashReportSummary(limit: 5)),
         ]))
 
         sections.append(Self.diagnosticSection("性能趋势", performanceMonitor.diagnosticRows()))
@@ -1194,6 +1208,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
         return ProcessRunResult(exitCode: process.terminationStatus, output: output, errorOutput: errorOutput)
+    }
+
+    private static func recentCrashReportURLs(limit: Int) -> [URL] {
+        let diagnosticReportsURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Logs/DiagnosticReports", isDirectory: true)
+        guard let reportURLs = try? FileManager.default.contentsOfDirectory(
+            at: diagnosticReportsURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return []
+        }
+
+        return reportURLs
+            .filter { url in
+                let name = url.lastPathComponent
+                return name.contains("ChatGPTSwiftWeb")
+                    && (name.hasSuffix(".ips") || name.hasSuffix(".crash"))
+            }
+            .sorted { lhs, rhs in
+                Self.fileModificationDate(lhs) > Self.fileModificationDate(rhs)
+            }
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    private static func crashReportSummary(limit: Int) -> String {
+        let reports = recentCrashReportURLs(limit: limit)
+        guard !reports.isEmpty else {
+            return "无"
+        }
+        return reports.map { url in
+            "\(url.lastPathComponent)（\(Self.timestampString(Self.fileModificationDate(url)))）"
+        }.joined(separator: "\n")
+    }
+
+    private static func fileModificationDate(_ url: URL) -> Date {
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        return values?.contentModificationDate ?? .distantPast
     }
 
     private static func diagnosticSection(_ title: String, _ rows: [(String, String)]) -> String {
