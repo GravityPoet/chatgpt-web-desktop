@@ -44,39 +44,11 @@ jobs:
           CHATGPT_SWIFT_CERTIFICATE_PASSWORD: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_PASSWORD }}
           CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
           CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY }}
+          CHATGPT_SWIFT_SPARKLE_FEED_URL: ${{ inputs.feed_url }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: |
-          missing=0
-          require_secret() {
-            name="$1"
-            value="$2"
-            if [[ -z "$value" ]]; then
-              echo "error: missing required secret: $name" >&2
-              missing=1
-            fi
-          }
-
-          require_secret CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 "$CHATGPT_SWIFT_CERTIFICATE_P12_BASE64"
-          require_secret CHATGPT_SWIFT_CERTIFICATE_PASSWORD "$CHATGPT_SWIFT_CERTIFICATE_PASSWORD"
-          require_secret CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY "$CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY"
-          require_secret CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY "$CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY"
-          require_secret APPLE_ID "$APPLE_ID"
-          require_secret APPLE_TEAM_ID "$APPLE_TEAM_ID"
-          require_secret APPLE_APP_SPECIFIC_PASSWORD "$APPLE_APP_SPECIFIC_PASSWORD"
-
-          case "${{ inputs.feed_url }}" in
-            https://*) ;;
-            *)
-              echo "error: feed_url must be an https:// URL." >&2
-              missing=1
-              ;;
-          esac
-
-          if [[ "$missing" != "0" ]]; then
-            exit 2
-          fi
+        run: ./packaging/check-release-readiness.sh --env
 
       - name: Import Developer ID certificate
         env:

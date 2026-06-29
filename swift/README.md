@@ -125,6 +125,12 @@ APPLE_TEAM_ID
 APPLE_APP_SPECIFIC_PASSWORD
 ```
 
+检查远端仓库是否已经配置这些 secret 名称：
+
+```bash
+./packaging/check-release-readiness.sh --github-secrets GravityPoet/chatgpt-web-desktop
+```
+
 推荐的 `feed_url` 是固定入口：
 
 ```text
@@ -132,6 +138,7 @@ https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appc
 ```
 
 发布某个 tag 时，workflow 会把 appcast 内的下载地址指向该 tag 的 release asset，例如 `https://github.com/GravityPoet/chatgpt-web-desktop/releases/download/v0.1.2/`。
+如果只想先检查产物，可以用 draft release；要让 Sparkle 客户端真正通过 `latest/download/appcast.xml` 自动发现更新，release 必须发布为非 draft。
 
 ## 安装到 Applications
 
