@@ -131,6 +131,22 @@ APPLE_APP_SPECIFIC_PASSWORD
 ./packaging/check-release-readiness.sh --github-secrets GravityPoet/chatgpt-web-desktop
 ```
 
+如果本机已经有 Developer ID `.p12`、Sparkle EdDSA key 和 Apple notarization 凭据，可以用脚本写入 GitHub Secrets：
+
+```bash
+./packaging/configure-release-credentials.sh \
+  --repo GravityPoet/chatgpt-web-desktop \
+  --certificate-p12 "/path/to/developer-id.p12" \
+  --certificate-password "p12-password" \
+  --sparkle-public-ed-key "sparkle-public-key" \
+  --sparkle-private-ed-key "sparkle-private-key" \
+  --apple-id "you@example.com" \
+  --apple-team-id "TEAMID" \
+  --apple-app-specific-password "xxxx-xxxx-xxxx-xxxx"
+```
+
+脚本通过 `gh secret set` 写入 GitHub，不会把 secret 值打印到终端；它适合在你自己的本机执行，不要在共享机器上用命令行参数传私钥。不要把 `.p12` 或 Sparkle 私钥提交到仓库。
+
 推荐的 `feed_url` 是固定入口：
 
 ```text
