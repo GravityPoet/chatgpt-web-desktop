@@ -2,18 +2,18 @@
 
 Languages: English | [简体中文](README.zh-CN.md)
 
-Use ChatGPT Web as a desktop app, so you can choose advanced/high thinking controls when the native app does not expose them.
+Use ChatGPT Web as a desktop app with isolated profiles, web-first feature parity, and lightweight native desktop integration.
 
-This project exists for one specific pain point: in the native ChatGPT desktop app, you may not be able to choose the higher thinking-strength mode available on ChatGPT Web. That means you can get stuck with a lighter reasoning mode when you actually want the model to spend more compute on a harder problem and produce a more accurate, more carefully reasoned answer.
+This project started from one specific pain point: ChatGPT Web sometimes exposed model or reasoning controls before the native desktop app did. OpenAI's official macOS app has since added more native capabilities, including model selection, Projects, Tasks, Canvas, Work with Apps, and IDE editing, and now targets macOS 14+ on Apple Silicon.
 
-This wrapper keeps the full ChatGPT Web experience available inside a dedicated desktop window, including the web model picker and thinking-time controls such as advanced/high-style reasoning choices.
+This wrapper is now best understood as a small, auditable WebView desktop shell: it keeps the full ChatGPT Web surface available inside a dedicated window, with separate WebView storage, predictable link/download handling, and optional privacy/profile controls.
 
 It does not bypass ChatGPT subscriptions, usage limits, or account permissions. It simply wraps the official ChatGPT web app in a desktop shell, using your own ChatGPT account.
 
 ## What This Solves
 
-- Restores the practical reason people open ChatGPT Web: choosing a higher thinking-strength mode when the native app does not offer the same control.
-- Keeps ChatGPT Web's model picker and advanced/high thinking controls in a desktop app.
+- Keeps ChatGPT Web's model picker and web-first controls in a desktop app.
+- Provides a macOS 12-compatible Swift implementation for machines that cannot run the current official macOS app requirements.
 - Lets you deliberately spend more reasoning effort on coding, analysis, writing, planning, research, and other high-stakes tasks.
 - Avoids losing web-only controls just because you prefer a desktop-window workflow.
 - Uses a dedicated app window instead of a normal browser tab.

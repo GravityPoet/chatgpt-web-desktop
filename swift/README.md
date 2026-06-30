@@ -1,6 +1,8 @@
 # ChatGPT Swift
 
-原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，用来在原生 ChatGPT 桌面 App 没有暴露更高思考强度选择时，把 ChatGPT Web 的模型选择器和进阶 / high thinking 控制保留在桌面窗口里，并和 Tauri/Rust 版并排对比。
+原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，把 ChatGPT Web 放进独立 macOS 桌面窗口，并保留独立 WebView 账号空间、macOS 12 兼容、网页优先的模型 / 工具体验、下载桥、诊断和隐私控制；也用于和 Tauri/Rust 版并排对比。
+
+OpenAI 官方 ChatGPT macOS App 已持续补齐模型选择、Projects、Tasks、Canvas、Work with Apps 和 IDE 编辑等能力，并要求 macOS 14 + Apple Silicon。本项目的价值不再是替代官方 App，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。
 
 ## 特点
 
