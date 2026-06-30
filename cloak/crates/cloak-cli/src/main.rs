@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cloak_core::{
-    build_launch_plan, create_account, delete_account, launch_account, list_accounts, read_account,
-    rename_account, self_check, set_proxy, set_region, toggle_locale, CloakConfig, LaunchOptions,
+    build_launch_plan, create_account, delete_account, launch_account, list_accounts,
+    list_trashed_accounts, read_account, rename_account, self_check, set_account_trashed,
+    set_proxy, set_region, toggle_locale, CloakConfig, LaunchOptions,
 };
 
 #[derive(Debug, Parser)]
@@ -31,6 +32,10 @@ enum AccountCommand {
         #[arg(long)]
         json: bool,
     },
+    ListTrashed {
+        #[arg(long)]
+        json: bool,
+    },
     Create {
         name: String,
         #[arg(long)]
@@ -44,6 +49,11 @@ enum AccountCommand {
     },
     Delete {
         name: String,
+    },
+    Restore {
+        name: String,
+        #[arg(long)]
+        json: bool,
     },
     SetProxy {
         name: String,
@@ -111,20 +121,11 @@ fn handle_account(command: AccountCommand, config: &CloakConfig) -> Result<()> {
     match command {
         AccountCommand::List { json } => {
             let accounts = list_accounts(config)?;
-            if json {
-                print_json(&accounts)?;
-            } else {
-                for account in accounts {
-                    println!(
-                        "{}\tseed {}\tregion {}\tlocale {}\tproxy {}",
-                        account.name,
-                        account.seed,
-                        account.region.unwrap_or_else(|| "-".to_string()),
-                        if account.locale_enabled { "on" } else { "off" },
-                        account.proxy_display
-                    );
-                }
-            }
+            print_account_list(accounts, json)?;
+        }
+        AccountCommand::ListTrashed { json } => {
+            let accounts = list_trashed_accounts(config)?;
+            print_account_list(accounts, json)?;
         }
         AccountCommand::Create { name, json } => {
             let account = create_account(config, &name)?;
@@ -136,7 +137,11 @@ fn handle_account(command: AccountCommand, config: &CloakConfig) -> Result<()> {
         }
         AccountCommand::Delete { name } => {
             delete_account(config, &name)?;
-            println!("deleted: {name}");
+            println!("moved to trash: {name}");
+        }
+        AccountCommand::Restore { name, json } => {
+            let account = set_account_trashed(config, &name, false)?;
+            print_account(account, json)?;
         }
         AccountCommand::SetProxy {
             name,
@@ -191,7 +196,9 @@ fn handle_launch(args: LaunchArgs, config: &CloakConfig) -> Result<()> {
             );
             println!(
                 "locale  : {}",
-                plan.locale.as_deref().unwrap_or("off (navigator.languages = browser default)")
+                plan.locale
+                    .as_deref()
+                    .unwrap_or("off (navigator.languages = browser default)")
             );
             println!("proxy   : {}", plan.proxy.display);
             if plan.extra_extension_paths.is_empty() {
@@ -245,12 +252,48 @@ fn print_account(account: cloak_core::Account, json: bool) -> Result<()> {
     } else {
         println!("account : {}", account.name);
         println!("seed    : {}", account.seed);
+        println!("status  : {}", account_status(&account));
         println!("profile : {}", account.profile_path.display());
-        println!("region  : {}", account.region.unwrap_or_else(|| "-".to_string()));
-        println!("locale  : {}", if account.locale_enabled { "on" } else { "off" });
+        println!(
+            "region  : {}",
+            account.region.unwrap_or_else(|| "-".to_string())
+        );
+        println!(
+            "locale  : {}",
+            if account.locale_enabled { "on" } else { "off" }
+        );
         println!("proxy   : {}", account.proxy_display);
     }
     Ok(())
+}
+
+fn print_account_list(accounts: Vec<cloak_core::Account>, json: bool) -> Result<()> {
+    if json {
+        print_json(&accounts)?;
+    } else {
+        for account in accounts {
+            println!(
+                "{}\tseed {}\tstatus {}\tregion {}\tlocale {}\tproxy {}",
+                account.name,
+                account.seed,
+                account_status(&account),
+                account.region.unwrap_or_else(|| "-".to_string()),
+                if account.locale_enabled { "on" } else { "off" },
+                account.proxy_display
+            );
+        }
+    }
+    Ok(())
+}
+
+fn account_status(account: &cloak_core::Account) -> &'static str {
+    if account.trashed {
+        "trashed"
+    } else if account.archived {
+        "archived"
+    } else {
+        "active"
+    }
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -259,10 +302,9 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
 }
 
 fn shell_escape(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b':' | b'=' | b'@'))
-    {
+    if value.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b':' | b'=' | b'@')
+    }) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))

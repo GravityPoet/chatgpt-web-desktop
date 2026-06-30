@@ -1,0 +1,19 @@
+[[permission]]
+identifier = "account-commands"
+description = "Allows the main Cloak Picker window to manage local account metadata and launch plans."
+commands.allow = [
+  "list_accounts",
+  "list_archived_accounts",
+  "list_trashed_accounts",
+  "create_account",
+  "rename_account",
+  "delete_account",
+  "restore_account",
+  "archive_account",
+  "set_proxy",
+  "set_region",
+  "toggle_locale",
+  "launch_dry_run",
+  "launch_preflight",
+  "launch_account",
+]

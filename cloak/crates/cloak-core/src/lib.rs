@@ -120,6 +120,8 @@ pub enum CloakError {
     AccountMissing(String),
     #[error("account is running: {0}")]
     AccountRunning(String),
+    #[error("account is in trash: {0}")]
+    AccountTrashed(String),
     #[error("unsupported proxy URL; use socks5://, http://, or https://")]
     InvalidProxy,
     #[error("CloakBrowser binary not found")]
@@ -185,6 +187,7 @@ pub struct Account {
     pub profile_path: PathBuf,
     pub created_at: u64,
     pub archived: bool,
+    pub trashed: bool,
     pub seed: String,
     pub region: Option<String>,
     pub locale_enabled: bool,
@@ -256,7 +259,10 @@ impl LaunchOptions {
         let allow_privacy_fail = truthy_env("CLOAK_ALLOW_PRIVACY_FAIL");
         let skip_geo = truthy_env("CLOAK_SKIP_GEO");
         let locale_override = env::var("LOCALE").ok().map(|v| truthy(&v));
-        let preflight = match env::var("CLOAK_PREFLIGHT").unwrap_or_else(|_| "async".to_string()).as_str() {
+        let preflight = match env::var("CLOAK_PREFLIGHT")
+            .unwrap_or_else(|_| "async".to_string())
+            .as_str()
+        {
             "0" | "off" | "false" => PreflightMode::Off,
             "strict" => PreflightMode::Strict,
             _ => PreflightMode::Async,
@@ -343,7 +349,24 @@ pub fn list_archived_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
     list_accounts_by_archive_state(config, true)
 }
 
+pub fn list_trashed_accounts(config: &CloakConfig) -> Result<Vec<Account>> {
+    list_accounts_by_trash_state(config, true)
+}
+
 fn list_accounts_by_archive_state(config: &CloakConfig, archived: bool) -> Result<Vec<Account>> {
+    collect_accounts(config, |account| {
+        !account.trashed && account.archived == archived
+    })
+}
+
+fn list_accounts_by_trash_state(config: &CloakConfig, trashed: bool) -> Result<Vec<Account>> {
+    collect_accounts(config, |account| account.trashed == trashed)
+}
+
+fn collect_accounts(
+    config: &CloakConfig,
+    mut keep: impl FnMut(&Account) -> bool,
+) -> Result<Vec<Account>> {
     fs::create_dir_all(&config.account_base)?;
     secure_dir(&config.account_base)?;
 
@@ -359,7 +382,7 @@ fn list_accounts_by_archive_state(config: &CloakConfig, archived: bool) -> Resul
             continue;
         }
         let account = read_account(config, &name)?;
-        if account.archived == archived {
+        if keep(&account) {
             accounts.push(account);
         }
     }
@@ -388,12 +411,14 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         .unwrap_or_else(|| "关".to_string());
     let created_at = account_created_at(&profile_path)?;
     let archived = profile_path.join(".cloak-archived").exists();
+    let trashed = profile_path.join(".cloak-trashed").exists();
 
     Ok(Account {
         name: name.to_string(),
         profile_path,
         created_at,
         archived,
+        trashed,
         seed,
         region: region.filter(|s| !s.is_empty()),
         locale_enabled,
@@ -438,15 +463,30 @@ pub fn rename_account(config: &CloakConfig, old_name: &str, new_name: &str) -> R
 }
 
 pub fn delete_account(config: &CloakConfig, name: &str) -> Result<()> {
+    set_account_trashed(config, name, true).map(|_| ())
+}
+
+pub fn set_account_trashed(config: &CloakConfig, name: &str, trashed: bool) -> Result<Account> {
     validate_account_name(name)?;
-    let path = config.profile_dir(name);
-    if path.exists() {
-        if account_profile_is_running(&path)? {
-            return Err(CloakError::AccountRunning(name.to_string()));
-        }
-        fs::remove_dir_all(path)?;
+    let profile = config.profile_dir(name);
+    if !profile.exists() {
+        return Err(CloakError::AccountMissing(name.to_string()));
     }
-    Ok(())
+    secure_account_dir(&profile)?;
+    if trashed && account_profile_is_running(&profile)? {
+        return Err(CloakError::AccountRunning(name.to_string()));
+    }
+
+    let trash_path = profile.join(".cloak-trashed");
+    let deleted_at_path = profile.join(".cloak-deleted-at");
+    if trashed {
+        write_secret_atomic(&trash_path, "")?;
+        write_secret_atomic(&deleted_at_path, &current_created_at().to_string())?;
+    } else {
+        remove_if_present(&trash_path)?;
+        remove_if_present(&deleted_at_path)?;
+    }
+    read_account(config, name)
 }
 
 pub fn set_account_archived(config: &CloakConfig, name: &str, archived: bool) -> Result<Account> {
@@ -494,13 +534,22 @@ pub fn toggle_locale(config: &CloakConfig, name: &str) -> Result<Account> {
     read_account(config, name)
 }
 
-pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptions) -> Result<LaunchPlan> {
+pub fn build_launch_plan(
+    config: &CloakConfig,
+    name: &str,
+    options: &LaunchOptions,
+) -> Result<LaunchPlan> {
     validate_account_name(name)?;
     if !config.extension_source.is_dir() {
-        return Err(CloakError::ExtensionMissing(config.extension_source.clone()));
+        return Err(CloakError::ExtensionMissing(
+            config.extension_source.clone(),
+        ));
     }
 
     let profile_path = config.profile_dir(name);
+    if profile_path.join(".cloak-trashed").exists() {
+        return Err(CloakError::AccountTrashed(name.to_string()));
+    }
     let seed = pinned_seed(&profile_path)?.unwrap_or_else(|| legacy_seed(name));
     let extension_runtime_path = profile_path.join(".cloak-companion");
     let extension_plan = discover_extra_extensions(config, &profile_path, &extension_runtime_path)?;
@@ -540,7 +589,10 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
     };
 
     if geo.exit_ip.is_none() && !options.skip_geo {
-        privacy_failures.push(format!("无法通过账号出口获取公网 IP（proxy={}）。", proxy_config.display));
+        privacy_failures.push(format!(
+            "无法通过账号出口获取公网 IP（proxy={}）。",
+            proxy_config.display
+        ));
     }
     if let Some(tz) = geo.timezone.as_deref() {
         if !valid_tz(tz) {
@@ -550,7 +602,11 @@ pub fn build_launch_plan(config: &CloakConfig, name: &str, options: &LaunchOptio
         privacy_failures.push("无法通过账号出口解析有效 timezone（got=empty）。".to_string());
     }
     if let Some(label) = region.as_deref() {
-        if !region_matches(label, geo.country.as_deref().unwrap_or(""), geo.timezone.as_deref().unwrap_or("")) {
+        if !region_matches(
+            label,
+            geo.country.as_deref().unwrap_or(""),
+            geo.timezone.as_deref().unwrap_or(""),
+        ) {
             privacy_failures.push(format!(
                 "区域标签「{}」与出口 country/timezone 不一致（country={}, timezone={}）。",
                 label,
@@ -660,7 +716,11 @@ pub fn launch_account(config: &CloakConfig, name: &str, options: &LaunchOptions)
 
     let mut argv = plan.argv.clone();
     if plan.proxy.relay_needed {
-        let raw = plan.proxy.raw_url.as_deref().ok_or_else(|| CloakError::Relay("missing relay upstream".to_string()))?;
+        let raw = plan
+            .proxy
+            .raw_url
+            .as_deref()
+            .ok_or_else(|| CloakError::Relay("missing relay upstream".to_string()))?;
         let relay_port = ensure_supervised_relay(&plan.profile_path, raw)?;
         let relay_arg = format!("socks5://127.0.0.1:{relay_port}");
         for arg in &mut argv {
@@ -707,7 +767,9 @@ pub fn maybe_run_relay_supervisor() -> Result<bool> {
         .next()
         .ok_or_else(|| CloakError::Relay("missing relay state path".to_string()))?;
     if args.next().is_some() {
-        return Err(CloakError::Relay("unexpected relay supervisor arguments".to_string()));
+        return Err(CloakError::Relay(
+            "unexpected relay supervisor arguments".to_string(),
+        ));
     }
     run_relay_supervisor(&PathBuf::from(request_path), &PathBuf::from(state_path))?;
     Ok(true)
@@ -920,7 +982,9 @@ fn prepare_companion_extension(
         &identity_script,
     )?;
     write_secret_atomic(
-        &plan.extension_runtime_path.join("browser-identity-worker.js"),
+        &plan
+            .extension_runtime_path
+            .join("browser-identity-worker.js"),
         &worker_identity_script,
     )?;
     write_secret_atomic(
@@ -939,7 +1003,9 @@ pub fn self_check(config: &CloakConfig) -> Result<String> {
     let accounts = list_accounts(config)?;
     let browser = resolve_browser_binary(config)?;
     if !config.extension_source.is_dir() {
-        return Err(CloakError::ExtensionMissing(config.extension_source.clone()));
+        return Err(CloakError::ExtensionMissing(
+            config.extension_source.clone(),
+        ));
     }
     Ok(format!(
         "cloak: ok ({} account(s)); browser={}; extension={}",
@@ -1174,7 +1240,10 @@ fn extra_extension_root_entries(root: &Path) -> Result<Vec<PathBuf>> {
 }
 
 fn optional_extra_extension_io_error(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied)
+    matches!(
+        err.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied
+    )
 }
 
 fn prepare_crx_extensions(_config: &CloakConfig, profile_path: &Path) -> Result<()> {
@@ -1216,13 +1285,15 @@ fn unpack_crx_extension(crx: &Path, dest: &Path) -> Result<()> {
             16usize
                 .checked_add(public_key_len)
                 .and_then(|offset| offset.checked_add(signature_len))
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CRX v2 header overflow"))?
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "CRX v2 header overflow")
+                })?
         }
         3 => {
             let header_len = read_le_u32(&data[8..12])? as usize;
-            12usize
-                .checked_add(header_len)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CRX v3 header overflow"))?
+            12usize.checked_add(header_len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "CRX v3 header overflow")
+            })?
         }
         _ => return Err(invalid_data("unsupported CRX version")),
     };
@@ -1280,7 +1351,8 @@ fn extra_extensions_root() -> Result<PathBuf> {
     if local_cache.is_dir() {
         return Ok(local_cache);
     }
-    Ok(home.join("Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"))
+    Ok(home
+        .join("Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"))
 }
 
 fn slug_for_path(path: &Path) -> String {
@@ -1335,7 +1407,10 @@ fn lookup_geo(proxy: &ProxyConfig) -> Result<GeoPlan> {
     let sources = [
         ("https://ipwho.is/", "ipwho"),
         ("https://ipinfo.io/json", "ipinfo"),
-        ("http://ip-api.com/json/?fields=status,message,countryCode,timezone,query", "ip-api"),
+        (
+            "http://ip-api.com/json/?fields=status,message,countryCode,timezone,query",
+            "ip-api",
+        ),
     ];
     for (url, source) in sources {
         if let Ok(response) = client.get(url).send() {
@@ -1362,7 +1437,7 @@ fn parse_geo_json(source: &str, body: &str) -> Option<GeoPlan> {
     let value: Value = serde_json::from_str(body).ok()?;
     let (ip, country, timezone) = match source {
         "ipwho" => {
-            if value.get("success")?.as_bool()? != true {
+            if !value.get("success")?.as_bool()? {
                 return None;
             }
             (
@@ -1387,7 +1462,10 @@ fn parse_geo_json(source: &str, body: &str) -> Option<GeoPlan> {
             }
             (
                 value.get("query")?.as_str()?,
-                value.get("countryCode").and_then(Value::as_str).unwrap_or(""),
+                value
+                    .get("countryCode")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
                 value.get("timezone")?.as_str()?,
             )
         }
@@ -1403,7 +1481,12 @@ fn parse_geo_json(source: &str, body: &str) -> Option<GeoPlan> {
     })
 }
 
-fn run_selftest(config: &CloakConfig, plan: &LaunchPlan, argv: &[String], strict: bool) -> Result<()> {
+fn run_selftest(
+    config: &CloakConfig,
+    plan: &LaunchPlan,
+    argv: &[String],
+    strict: bool,
+) -> Result<()> {
     let selftest = config.repo_root.join("selftest/run-selftest.mjs");
     if !selftest.exists() {
         return Ok(());
@@ -1449,7 +1532,11 @@ fn run_selftest(config: &CloakConfig, plan: &LaunchPlan, argv: &[String], strict
     let mut cmd = Command::new("node");
     cmd.args(args);
     cmd.stdout(Stdio::null());
-    cmd.stderr(if strict { Stdio::piped() } else { Stdio::null() });
+    cmd.stderr(if strict {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
     if strict {
         let output = cmd.output()?;
         if !output.status.success() {
@@ -1469,7 +1556,9 @@ fn resolve_browser_binary(config: &CloakConfig) -> Result<PathBuf> {
             return Ok(path);
         }
     }
-    let current = config.cloakbrowser_root.join(current_browser_relative_path());
+    let current = config
+        .cloakbrowser_root
+        .join(current_browser_relative_path());
     if is_executable(&current) {
         return Ok(current);
     }
@@ -1579,7 +1668,13 @@ fn primary_locale_from_accept_language(accept_language: &str) -> &str {
         .trim()
 }
 
-fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale: Option<&str>, engine: &EngineVersion, seed: &str) {
+fn append_native_fingerprint_args(
+    argv: &mut Vec<String>,
+    geo: &GeoPlan,
+    locale: Option<&str>,
+    engine: &EngineVersion,
+    seed: &str,
+) {
     // Existing: timezone + locale + webrtc
     if let Some(tz) = geo.timezone.as_deref().filter(|value| !value.is_empty()) {
         argv.push(format!("--fingerprint-timezone={tz}"));
@@ -1594,10 +1689,19 @@ fn append_native_fingerprint_args(argv: &mut Vec<String>, geo: &GeoPlan, locale:
         argv.push(format!("--fingerprint-webrtc-ip={exit_ip}"));
     }
     // New: brand-version, platform-version, GPU vendor/renderer (C2+C3)
-    argv.push(format!("--fingerprint-brand-version={full}", full = engine.full));
-    argv.push(format!("--fingerprint-platform-version={pv}", pv = CLOAK_MAC_PLATFORM_VERSION));
+    argv.push(format!(
+        "--fingerprint-brand-version={full}",
+        full = engine.full
+    ));
+    argv.push(format!(
+        "--fingerprint-platform-version={pv}",
+        pv = CLOAK_MAC_PLATFORM_VERSION
+    ));
     argv.push("--fingerprint-gpu-vendor=Google Inc. (Apple)".to_string());
-    argv.push(format!("--fingerprint-gpu-renderer={renderer}", renderer = gpu_renderer_for_seed(seed)));
+    argv.push(format!(
+        "--fingerprint-gpu-renderer={renderer}",
+        renderer = gpu_renderer_for_seed(seed)
+    ));
 }
 
 fn valid_tz(tz: &str) -> bool {
@@ -1761,28 +1865,23 @@ fn region_matches(label: &str, country: &str, tz: &str) -> bool {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let mut checked = false;
     for token in label
         .to_ascii_lowercase()
         .split(|c: char| !c.is_ascii_alphanumeric())
         .filter(|s| s.len() >= 2)
     {
-        checked = true;
         if !hay.contains(token) {
             return false;
         }
     }
-    !checked || checked
+    true
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     fs::create_dir_all(dst)?;
     for entry in WalkDir::new(src) {
-        let entry = entry.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
-        let rel = entry
-            .path()
-            .strip_prefix(src)
-            .map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let entry = entry.map_err(io::Error::other)?;
+        let rel = entry.path().strip_prefix(src).map_err(io::Error::other)?;
         let target = dst.join(rel);
         if entry.file_type().is_dir() {
             fs::create_dir_all(&target)?;
@@ -1825,7 +1924,11 @@ fn read_first_line(path: &Path) -> Result<Option<String>> {
         return Ok(None);
     }
     let content = fs::read_to_string(path)?;
-    Ok(content.lines().next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+    Ok(content
+        .lines()
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
 }
 
 fn write_secret_atomic(path: &Path, value: &str) -> Result<()> {
@@ -1834,7 +1937,14 @@ fn write_secret_atomic(path: &Path, value: &str) -> Result<()> {
         secure_dir(parent)?;
     }
     let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    fs::write(&tmp, if value.ends_with('\n') { value.to_string() } else { format!("{value}\n") })?;
+    fs::write(
+        &tmp,
+        if value.ends_with('\n') {
+            value.to_string()
+        } else {
+            format!("{value}\n")
+        },
+    )?;
     secure_file(&tmp)?;
     fs::rename(tmp, path)?;
     secure_file(path)?;
@@ -1855,6 +1965,8 @@ fn secure_account_dir(path: &Path) -> Result<()> {
         ".cloak-seed",
         ".cloak-created-at",
         ".cloak-archived",
+        ".cloak-trashed",
+        ".cloak-deleted-at",
         ".cloak-proxy",
         ".cloak-locale",
         ".cloak-region",
@@ -1869,7 +1981,7 @@ fn secure_account_dir(path: &Path) -> Result<()> {
 
 fn secure_dir_recursive(path: &Path) -> Result<()> {
     for entry in WalkDir::new(path) {
-        let entry = entry.map_err(|err| io::Error::new(io::ErrorKind::Other, err))?;
+        let entry = entry.map_err(io::Error::other)?;
         if entry.file_type().is_dir() {
             secure_dir(entry.path())?;
         } else if entry.file_type().is_file() {
@@ -2007,7 +2119,10 @@ mod tests {
     fn proxy_masking_and_mode_match_current_contract() {
         let socks = proxy_config("socks5://user:pass@example.net:1080").unwrap();
         assert_eq!(socks.mode, ProxyMode::Relay);
-        assert_eq!(socks.display, "socks5://example.net:1080  (via local SOCKS5 relay)");
+        assert_eq!(
+            socks.display,
+            "socks5://example.net:1080  (via local SOCKS5 relay)"
+        );
         assert_eq!(socks.browser_arg.as_deref(), Some(RELAY_PLACEHOLDER));
 
         let http = proxy_config("http://example.net:8080").unwrap();
@@ -2093,9 +2208,44 @@ mod tests {
     }
 
     #[test]
+    fn deleted_accounts_move_to_trash_and_restore_with_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        let account = create_account(&config, "work").unwrap();
+        delete_account(&config, "work").unwrap();
+
+        assert!(list_accounts(&config).unwrap().is_empty());
+        let trashed = list_trashed_accounts(&config).unwrap();
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].trashed);
+        assert_eq!(trashed[0].seed, account.seed);
+        assert!(config.profile_dir("work").join(".cloak-trashed").exists());
+        assert!(config
+            .profile_dir("work")
+            .join(".cloak-deleted-at")
+            .exists());
+
+        let restored = set_account_trashed(&config, "work", false).unwrap();
+        assert!(!restored.trashed);
+        assert_eq!(restored.seed, account.seed);
+        assert_eq!(list_accounts(&config).unwrap().len(), 1);
+        assert!(list_trashed_accounts(&config).unwrap().is_empty());
+    }
+
+    #[test]
     fn locale_mapping_matches_script_table() {
         assert_eq!(language_for_country("JP"), "ja-JP");
-        assert_eq!(accept_language("ja-JP"), "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7");
+        assert_eq!(
+            accept_language("ja-JP"),
+            "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7"
+        );
         assert_eq!(accept_language("en-US"), "en-US,en;q=0.9");
     }
 
@@ -2200,7 +2350,9 @@ mod tests {
     fn extra_extension_slug_matches_bash_contract() {
         assert_eq!(slug_for_path(Path::new("删除Cookies.crx")), "Cookies.crx");
         assert_eq!(
-            slug_for_path(Path::new("沉浸式翻译 - AI 双语网页翻译 _ PDF翻译 _ 视频翻译 _ 漫画翻译 1.30.1.crx")),
+            slug_for_path(Path::new(
+                "沉浸式翻译 - AI 双语网页翻译 _ PDF翻译 _ 视频翻译 _ 漫画翻译 1.30.1.crx"
+            )),
             "-_AI_PDF_1.30.1.crx"
         );
     }
@@ -2234,7 +2386,8 @@ mod tests {
 
     #[test]
     fn extract_version_from_path_finds_chromium_dir() {
-        let path = Path::new("/home/user/.cloakbrowser/chromium-145/Chromium.app/Contents/MacOS/Chromium");
+        let path =
+            Path::new("/home/user/.cloakbrowser/chromium-145/Chromium.app/Contents/MacOS/Chromium");
         let v = extract_version_from_path(path).unwrap();
         assert_eq!(v.major, "145");
 
@@ -2255,7 +2408,11 @@ mod tests {
         for seed in &["11111", "22222", "33333", "44444", "54321"] {
             seen.insert(gpu_renderer_for_seed(seed));
         }
-        assert!(seen.len() >= 2, "GPU pool collision too high: only {} unique from 5 seeds", seen.len());
+        assert!(
+            seen.len() >= 2,
+            "GPU pool collision too high: only {} unique from 5 seeds",
+            seen.len()
+        );
 
         // All renderers use the real Apple-Silicon Metal format (not the Intel-Mac
         // OpenGL backend) — matching what the live binary actually reports.
@@ -2326,9 +2483,11 @@ mod tests {
             fs::read_to_string(plan.extension_runtime_path.join("account-seed-main.js")).unwrap(),
             "window.__cloakAccountSeed = \"28041\";\n"
         );
-        assert!(fs::read_to_string(plan.extension_runtime_path.join("browser-identity-main.js"))
-            .unwrap()
-            .contains("Chrome/145.0.0.0"));
+        assert!(
+            fs::read_to_string(plan.extension_runtime_path.join("browser-identity-main.js"))
+                .unwrap()
+                .contains("Chrome/145.0.0.0")
+        );
         let header_rules: Value = serde_json::from_str(
             &fs::read_to_string(
                 plan.extension_runtime_path
@@ -2338,9 +2497,10 @@ mod tests {
         )
         .unwrap();
         assert!(header_rules.to_string().contains("Sec-CH-UA"));
-        let manifest: Value =
-            serde_json::from_str(&fs::read_to_string(plan.extension_runtime_path.join("manifest.json")).unwrap())
-                .unwrap();
+        let manifest: Value = serde_json::from_str(
+            &fs::read_to_string(plan.extension_runtime_path.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
         assert!(manifest.get("content_scripts").is_some());
         assert!(manifest.get("host_permissions").is_some());
         assert!(manifest.get("background").is_some());
@@ -2364,12 +2524,16 @@ mod tests {
         .unwrap();
 
         strip_companion_page_scripts(&manifest).unwrap();
-        let stripped: Value = serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
+        let stripped: Value =
+            serde_json::from_str(&fs::read_to_string(&manifest).unwrap()).unwrap();
         assert!(stripped.get("content_scripts").is_none());
         assert!(stripped.get("host_permissions").is_none());
         assert!(stripped.get("background").is_none());
         assert!(stripped.get("declarative_net_request").is_none());
-        assert_eq!(stripped.get("permissions").unwrap(), &Value::Array(vec![Value::String("storage".to_string())]));
+        assert_eq!(
+            stripped.get("permissions").unwrap(),
+            &Value::Array(vec![Value::String("storage".to_string())])
+        );
     }
 
     #[test]
@@ -2379,7 +2543,11 @@ mod tests {
         fs::create_dir_all(root.join("Chromium Web Store 插件")).unwrap();
         fs::write(root.join("Chromium Web Store 插件/manifest.json"), "{}").unwrap();
         fs::create_dir_all(root.join("get-cookies.txt-locally_v0.7.2_chrome")).unwrap();
-        fs::write(root.join("get-cookies.txt-locally_v0.7.2_chrome/manifest.json"), "{}").unwrap();
+        fs::write(
+            root.join("get-cookies.txt-locally_v0.7.2_chrome/manifest.json"),
+            "{}",
+        )
+        .unwrap();
         fs::write(root.join("删除Cookies.crx"), "placeholder").unwrap();
         fs::write(
             root.join("沉浸式翻译 - AI 双语网页翻译 _ PDF翻译 _ 视频翻译 _ 漫画翻译 1.30.1.crx"),
