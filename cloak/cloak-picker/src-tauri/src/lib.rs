@@ -2,9 +2,11 @@ use cloak_core::{
     build_launch_plan, create_account as core_create_account,
     delete_account as core_delete_account, launch_account as core_launch_account,
     list_accounts as core_list_accounts, list_archived_accounts as core_list_archived_accounts,
-    rename_account as core_rename_account, set_account_archived as core_set_account_archived,
-    set_proxy as core_set_proxy, set_region as core_set_region,
-    toggle_locale as core_toggle_locale, Account, CloakConfig, LaunchOptions, LaunchPlan,
+    list_trashed_accounts as core_list_trashed_accounts, rename_account as core_rename_account,
+    set_account_archived as core_set_account_archived,
+    set_account_trashed as core_set_account_trashed, set_proxy as core_set_proxy,
+    set_region as core_set_region, toggle_locale as core_toggle_locale, Account, CloakConfig,
+    LaunchOptions, LaunchPlan,
 };
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -23,6 +25,11 @@ fn list_archived_accounts() -> Result<Vec<Account>, String> {
 }
 
 #[tauri::command]
+fn list_trashed_accounts() -> Result<Vec<Account>, String> {
+    core_list_trashed_accounts(&config()?).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
 fn create_account(name: String) -> Result<Account, String> {
     core_create_account(&config()?, &name).map_err(|err| err.to_string())
 }
@@ -35,6 +42,11 @@ fn rename_account(old_name: String, new_name: String) -> Result<Account, String>
 #[tauri::command]
 fn delete_account(name: String) -> Result<(), String> {
     core_delete_account(&config()?, &name).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn restore_account(name: String) -> Result<Account, String> {
+    core_set_account_trashed(&config()?, &name, false).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -62,6 +74,14 @@ fn launch_dry_run(name: String) -> Result<LaunchPlan, String> {
     let mut options = LaunchOptions::from_env(true);
     options.dry_run = true;
     options.skip_geo = true;
+    build_launch_plan(&config()?, &name, &options).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn launch_preflight(name: String) -> Result<LaunchPlan, String> {
+    let mut options = LaunchOptions::from_env(true);
+    options.dry_run = true;
+    options.skip_geo = false;
     build_launch_plan(&config()?, &name, &options).map_err(|err| err.to_string())
 }
 
@@ -98,14 +118,17 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_accounts,
             list_archived_accounts,
+            list_trashed_accounts,
             create_account,
             rename_account,
             delete_account,
+            restore_account,
             archive_account,
             set_proxy,
             set_region,
             toggle_locale,
             launch_dry_run,
+            launch_preflight,
             launch_account
         ])
         .run(tauri::generate_context!())

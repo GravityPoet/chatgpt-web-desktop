@@ -140,7 +140,7 @@ button {
 
 .viewSwitch {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
   gap: 4px;
   min-width: 0;
@@ -360,10 +360,36 @@ h2 {
   font-weight: 510;
 }
 
+.statusStrip span {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .statusStrip.warn {
   border-color: var(--warning-border);
   background: var(--warning-bg);
   color: #8a5a12;
+}
+
+.stripButton {
+  flex: 0 0 auto;
+  height: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid currentColor;
+  border-radius: 6px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 590;
+}
+
+.stripButton:hover {
+  background: rgba(255, 255, 255, 0.48);
 }
 
 .inspector {

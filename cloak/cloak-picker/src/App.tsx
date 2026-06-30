@@ -24,6 +24,7 @@ type Account = {
   profile_path: string;
   created_at: number;
   archived: boolean;
+  trashed: boolean;
   seed: string;
   region: string | null;
   locale_enabled: boolean;
@@ -65,7 +66,7 @@ type DialogState =
   | { kind: "delete"; account: Account };
 
 const emptyAccounts: Account[] = [];
-type AccountView = "active" | "archived";
+type AccountView = "active" | "archived" | "trash";
 
 export default function App() {
   const [accounts, setAccounts] = useState<Account[]>(emptyAccounts);
@@ -85,7 +86,8 @@ export default function App() {
 
   async function refresh(preferredName?: string, view: AccountView = accountView) {
     setError("");
-    const command = view === "archived" ? "list_archived_accounts" : "list_accounts";
+    const command =
+      view === "archived" ? "list_archived_accounts" : view === "trash" ? "list_trashed_accounts" : "list_accounts";
     const next = await call<Account[]>(command);
     setAccounts(next);
     setSelectedName((current) => {
@@ -126,6 +128,10 @@ export default function App() {
       setPlan(null);
       return;
     }
+    if (selected.trashed) {
+      setPlan(null);
+      return;
+    }
 
     let cancelled = false;
     setPlanLoading(true);
@@ -146,7 +152,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [selected?.name]);
+  }, [selected?.name, selected?.trashed]);
 
   async function submitDialog(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -222,7 +228,31 @@ export default function App() {
   }
 
   async function launchAccount(account: Account) {
+    if (account.trashed) return;
+    const checked = await runFullPreflight(account);
+    if (!checked) return;
+    if (checked.privacy_failures.length > 0) {
+      setError("完整预检未通过，已停止启动。");
+      return;
+    }
     await run(() => call<void>("launch_account", { name: account.name }));
+  }
+
+  async function runFullPreflight(account: Account): Promise<LaunchPlan | null> {
+    setPlanLoading(true);
+    setError("");
+    try {
+      const checked = await call<LaunchPlan>("launch_preflight", { name: account.name });
+      setPlan(checked);
+      return checked;
+    } catch (caught) {
+      const message = errorMessage(caught);
+      setPlan(null);
+      setError(message);
+      return null;
+    } finally {
+      setPlanLoading(false);
+    }
   }
 
   async function setArchived(account: Account, archived: boolean) {
@@ -245,7 +275,7 @@ export default function App() {
       await call<void>("delete_account", { name: account.name });
       setDialog(null);
       setPlan(null);
-      await refresh();
+      await refresh(undefined, accountView);
     } catch (caught) {
       const message = errorMessage(caught);
       setDialogError(message);
@@ -255,20 +285,34 @@ export default function App() {
     }
   }
 
-  const accountCountLabel = `${accounts.length} ${accountView === "archived" ? "archived" : "active"} account${accounts.length === 1 ? "" : "s"}`;
-  const emptyTitle = accountView === "archived" ? "暂无归档账号" : "暂无活跃账号";
-  const emptyAction = accountView === "archived" ? "查看活跃" : "新建账号";
+  async function restoreAccount(account: Account) {
+    const restored = await run(() => call<Account>("restore_account", { name: account.name }));
+    if (!restored) return;
+    setPlan(null);
+    const nextView = restored.archived ? "archived" : "active";
+    setAccountView(nextView);
+    await refresh(restored.name, nextView);
+  }
+
+  const viewLabel = accountView === "archived" ? "archived" : accountView === "trash" ? "trashed" : "active";
+  const accountCountLabel = `${accounts.length} ${viewLabel} account${accounts.length === 1 ? "" : "s"}`;
+  const emptyTitle =
+    accountView === "archived" ? "暂无归档账号" : accountView === "trash" ? "回收站为空" : "暂无活跃账号";
+  const emptyAction = accountView === "active" ? "新建账号" : "查看活跃";
   const proxyLabel = selected ? middleTruncate(selected.proxy_display, 48) : "";
   const planHasGeo = Boolean(plan?.geo.exit_ip && plan.geo.timezone);
   const planStatusLabel = planLoading
     ? "检查中"
     : plan?.privacy_failures.length
-      ? "隐私门禁有警告"
+      ? planHasGeo
+        ? "完整预检有警告"
+        : "隐私门禁有警告"
       : plan
         ? planHasGeo
-          ? "启动参数已就绪"
+          ? "完整预检通过"
           : "快速参数已就绪"
         : "启动参数未解析";
+  const statusLabel = selected?.trashed ? "已移入回收站" : selected?.archived ? "已归档" : "活跃";
 
   return (
     <main className="shell">
@@ -316,18 +360,27 @@ export default function App() {
             >
               归档
             </button>
+            <button
+              className={accountView === "trash" ? "active" : ""}
+              type="button"
+              role="tab"
+              aria-selected={accountView === "trash"}
+              onClick={() => setAccountView("trash")}
+            >
+              回收站
+            </button>
           </div>
 
           <div className="accountList">
             {accounts.length === 0 ? (
               <div className="emptyState">
-                {accountView === "archived" ? <Archive size={24} /> : <ShieldCheck size={24} />}
+                {accountView === "active" ? <ShieldCheck size={24} /> : accountView === "trash" ? <Trash2 size={24} /> : <Archive size={24} />}
                 <strong>{emptyTitle}</strong>
                 <button
                   className="subtleButton"
-                  onClick={accountView === "archived" ? () => setAccountView("active") : openCreateDialog}
+                  onClick={accountView === "active" ? openCreateDialog : () => setAccountView("active")}
                 >
-                  {accountView === "archived" ? <ArchiveRestore size={14} /> : <Plus size={14} />}
+                  {accountView === "active" ? <Plus size={14} /> : <ArchiveRestore size={14} />}
                   {emptyAction}
                 </button>
               </div>
@@ -337,7 +390,13 @@ export default function App() {
                   className={`accountRow ${account.name === selected?.name ? "selected" : ""}`}
                   key={account.name}
                   onClick={() => setSelectedName(account.name)}
-                  onDoubleClick={() => void launchAccount(account)}
+                  onDoubleClick={() => {
+                    if (account.trashed) {
+                      void restoreAccount(account);
+                    } else {
+                      void launchAccount(account);
+                    }
+                  }}
                 >
                   <span className="accountRail" />
                   <span className="accountMain">
@@ -366,23 +425,35 @@ export default function App() {
                   <span className="eyebrow">Isolated identity</span>
                   <h1 title={selected.name}>{middleTruncate(selected.name, 44)}</h1>
                 </div>
-                <button className="launchButton" disabled={busy} onClick={() => void launchAccount(selected)}>
-                  <Play size={16} />
-                  启动
-                </button>
+                {selected.trashed ? (
+                  <button className="launchButton" disabled={busy} onClick={() => void restoreAccount(selected)}>
+                    <ArchiveRestore size={16} />
+                    恢复
+                  </button>
+                ) : (
+                  <button className="launchButton" disabled={busy || planLoading} onClick={() => void launchAccount(selected)}>
+                    <Play size={16} />
+                    启动
+                  </button>
+                )}
               </header>
 
               <div className="detailScroll">
                 <div className={`statusStrip ${plan?.privacy_failures.length || !plan ? "warn" : "ok"}`}>
                   {planLoading ? <Loader2 className="spin" size={15} /> : plan?.privacy_failures.length || !plan ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
                   <span>{planStatusLabel}</span>
+                  {!selected.trashed ? (
+                    <button className="stripButton" disabled={busy || planLoading} onClick={() => void runFullPreflight(selected)}>
+                      完整检查
+                    </button>
+                  ) : null}
                 </div>
 
                 <section className="inspector">
                   <InspectorGroup title="Identity">
                     <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
                     <InfoRow icon={<CalendarClock size={15} />} label="创建时间" value={formatCreatedAt(selected.created_at)} />
-                    <InfoRow icon={selected.archived ? <Archive size={15} /> : <ShieldCheck size={15} />} label="状态" value={selected.archived ? "已归档" : "活跃"} />
+                    <InfoRow icon={selected.trashed ? <Trash2 size={15} /> : selected.archived ? <Archive size={15} /> : <ShieldCheck size={15} />} label="状态" value={statusLabel} />
                     <InfoRow label="Profile" value={selected.profile_path} mono />
                   </InspectorGroup>
 
@@ -417,16 +488,23 @@ export default function App() {
 
               <footer className="detailFooter">
                 <div className="actionBar">
-                  <ActionButton icon={<Network size={15} />} label="代理" onClick={() => setDialog({ kind: "proxy", account: selected, value: "" })} />
-                  <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
-                  <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
-                  <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
-                  <ActionButton
-                    icon={selected.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
-                    label={selected.archived ? "恢复" : "归档"}
-                    onClick={() => void setArchived(selected, !selected.archived)}
-                  />
-                  <ActionButton danger icon={<Trash2 size={15} />} label="删除" onClick={() => setDialog({ kind: "delete", account: selected })} />
+                  {selected.trashed ? (
+                    <ActionButton icon={<ArchiveRestore size={15} />} label="恢复账号" onClick={() => void restoreAccount(selected)} />
+                  ) : (
+                    <>
+                      <ActionButton icon={<ShieldCheck size={15} />} label="完整检查" onClick={() => void runFullPreflight(selected)} />
+                      <ActionButton icon={<Network size={15} />} label="代理" onClick={() => setDialog({ kind: "proxy", account: selected, value: "" })} />
+                      <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
+                      <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
+                      <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
+                      <ActionButton
+                        icon={selected.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
+                        label={selected.archived ? "恢复" : "归档"}
+                        onClick={() => void setArchived(selected, !selected.archived)}
+                      />
+                      <ActionButton danger icon={<Trash2 size={15} />} label="移入回收站" onClick={() => setDialog({ kind: "delete", account: selected })} />
+                    </>
+                  )}
                 </div>
               </footer>
             </>
@@ -485,17 +563,17 @@ function EditorDialog({
           <button className="modalClose" type="button" aria-label="关闭" onClick={onClose}>
             <X size={15} />
           </button>
-          <h2 title={`删除「${dialog.account.name}」？`}>
-            删除「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
+          <h2 title={`移入回收站「${dialog.account.name}」？`}>
+            移入回收站「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
           </h2>
-          <p>Profile、cookie 和登录状态会被清除。</p>
+          <p>Profile、cookie 和登录状态会保留，可在回收站恢复。</p>
           {error ? <p className="modalError">{error}</p> : null}
           <div className="modalActions">
             <button autoFocus className="secondaryButton" disabled={busy} type="button" onClick={onClose}>
               取消
             </button>
             <button className="dangerButton" disabled={busy} type="button" onClick={() => onConfirmDelete(dialog.account)}>
-              {busy ? "删除中..." : "删除"}
+              {busy ? "移动中..." : "移入回收站"}
             </button>
           </div>
         </div>
@@ -631,18 +709,20 @@ function shouldUseMockTauri() {
 async function mockInvoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   await new Promise((resolve) => window.setTimeout(resolve, 80));
   const accounts = mockAccounts();
-  if (command === "list_accounts") return accounts.filter((account) => !account.archived) as T;
-  if (command === "list_archived_accounts") return accounts.filter((account) => account.archived) as T;
-  if (command === "launch_dry_run") {
+  if (command === "list_accounts") return accounts.filter((account) => !account.archived && !account.trashed) as T;
+  if (command === "list_archived_accounts") return accounts.filter((account) => account.archived && !account.trashed) as T;
+  if (command === "list_trashed_accounts") return accounts.filter((account) => account.trashed) as T;
+  if (command === "launch_dry_run" || command === "launch_preflight") {
     const name = String(args?.name ?? accounts[0].name);
     const account = accounts.find((item) => item.name === name) ?? accounts[0];
-    return mockLaunchPlan(account) as T;
+    return mockLaunchPlan(account, command === "launch_preflight") as T;
   }
   if (command === "create_account") {
-    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, seed: "68122" } as T;
+    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, trashed: false, seed: "68122" } as T;
   }
   if (command === "rename_account") return { ...accounts[0], name: String(args?.newName ?? "renamed") } as T;
   if (command === "archive_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), archived: Boolean(args?.archived) } as T;
+  if (command === "restore_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), trashed: false } as T;
   if (command === "set_proxy" || command === "set_region" || command === "toggle_locale") return accounts[0] as T;
   return undefined as T;
 }
@@ -654,6 +734,7 @@ function mockAccounts(): Account[] {
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-alpha@example.test",
       created_at: 1_700_000_001_000_000,
       archived: false,
+      trashed: false,
       seed: "48366",
       region: null,
       locale_enabled: false,
@@ -665,6 +746,7 @@ function mockAccounts(): Account[] {
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-beta",
       created_at: 1_700_000_002_000_000,
       archived: false,
+      trashed: false,
       seed: "77296",
       region: "JP",
       locale_enabled: true,
@@ -676,16 +758,29 @@ function mockAccounts(): Account[] {
       profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-gamma",
       created_at: 1_700_000_003_000_000,
       archived: true,
+      trashed: false,
       seed: "68098",
       region: "US",
       locale_enabled: false,
       proxy_display: "socks5://proxy.example.net:1080  (via local SOCKS5 relay)",
       has_proxy: true,
     },
+    {
+      name: "old-lab",
+      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/old-lab",
+      created_at: 1_700_000_004_000_000,
+      archived: false,
+      trashed: true,
+      seed: "51024",
+      region: "NL",
+      locale_enabled: false,
+      proxy_display: "off (system VPN / direct)",
+      has_proxy: false,
+    },
   ];
 }
 
-function mockLaunchPlan(account: Account): LaunchPlan {
+function mockLaunchPlan(account: Account, full: boolean): LaunchPlan {
   return {
     account: account.name,
     seed: account.seed,
@@ -714,7 +809,9 @@ function mockLaunchPlan(account: Account): LaunchPlan {
       relay_needed: account.has_proxy,
       raw_url: null,
     },
-    geo: { exit_ip: "185.200.65.192", country: account.region, timezone: account.region === "JP" ? "Asia/Tokyo" : "America/Los_Angeles" },
+    geo: full
+      ? { exit_ip: "185.200.65.192", country: account.region, timezone: account.region === "JP" ? "Asia/Tokyo" : "America/Los_Angeles" }
+      : { exit_ip: null, country: null, timezone: null },
     locale: account.locale_enabled ? "ja-JP,ja;q=0.9,en-US;q=0.8,en;q=0.7" : null,
     argv: [
       `--user-data-dir=${account.profile_path}`,
@@ -761,6 +858,7 @@ function errorMessage(caught: unknown) {
   const alreadyExistsPrefix = "account already exists: ";
   const doesNotExistPrefix = "account does not exist: ";
   const runningPrefix = "account is running: ";
+  const trashedPrefix = "account is in trash: ";
   if (raw.startsWith(alreadyExistsPrefix)) {
     return `账号已存在：${raw.slice(alreadyExistsPrefix.length)}`;
   }
@@ -768,7 +866,10 @@ function errorMessage(caught: unknown) {
     return `账号不存在：${raw.slice(doesNotExistPrefix.length)}`;
   }
   if (raw.startsWith(runningPrefix)) {
-    return `账号正在运行：${raw.slice(runningPrefix.length)}。请先关闭这个浏览器窗口，再删除。`;
+    return `账号正在运行：${raw.slice(runningPrefix.length)}。请先关闭这个浏览器窗口，再移动或恢复。`;
+  }
+  if (raw.startsWith(trashedPrefix)) {
+    return `账号已在回收站：${raw.slice(trashedPrefix.length)}。请先恢复再启动。`;
   }
   if (raw.includes("account name is invalid")) {
     return "名字无效：可用字母、数字、.、@、+、-、_；不能叫 main，不能以 . 开头/结尾，不能含 /、\\ 或连续 ..。";
