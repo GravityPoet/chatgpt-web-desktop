@@ -7,9 +7,22 @@ on:
         description: Release tag to create or update, for example v0.1.2
         required: true
         type: string
-      feed_url:
-        description: Stable HTTPS Sparkle appcast URL embedded in the app
+      distribution:
+        description: github uses local self-signing; developer-id also notarizes
         required: true
+        default: github
+        type: choice
+        options:
+          - github
+          - developer-id
+      enable_sparkle:
+        description: Generate appcast and embed Sparkle feed/key
+        required: true
+        default: false
+        type: boolean
+      feed_url:
+        description: Stable HTTPS Sparkle appcast URL, only used when enable_sparkle is true
+        required: false
         default: https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appcast.xml
         type: string
       draft:
@@ -28,7 +41,7 @@ permissions:
 
 jobs:
   release:
-    name: Build, notarize, and publish Swift macOS app
+    name: Build and publish Swift macOS app
     runs-on: macos-latest
     defaults:
       run:
@@ -38,8 +51,10 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Validate release secrets
+      - name: Validate release prerequisites
         env:
+          CHATGPT_SWIFT_DISTRIBUTION: ${{ inputs.distribution }}
+          CHATGPT_SWIFT_ENABLE_SPARKLE: ${{ inputs.enable_sparkle }}
           CHATGPT_SWIFT_CERTIFICATE_P12_BASE64: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 }}
           CHATGPT_SWIFT_CERTIFICATE_PASSWORD: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_PASSWORD }}
           CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
@@ -48,9 +63,15 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
-        run: ./packaging/check-release-readiness.sh --env
+        run: |
+          sparkle="off"
+          if [[ "$CHATGPT_SWIFT_ENABLE_SPARKLE" == "true" ]]; then
+            sparkle="on"
+          fi
+          ./packaging/check-release-readiness.sh --env --distribution "$CHATGPT_SWIFT_DISTRIBUTION" --sparkle "$sparkle"
 
       - name: Import Developer ID certificate
+        if: ${{ inputs.distribution == 'developer-id' }}
         env:
           CHATGPT_SWIFT_CERTIFICATE_P12_BASE64: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_P12_BASE64 }}
           CHATGPT_SWIFT_CERTIFICATE_PASSWORD: ${{ secrets.CHATGPT_SWIFT_CERTIFICATE_PASSWORD }}
@@ -63,11 +84,18 @@ jobs:
 
       - name: Build signed DMG with Sparkle configuration
         env:
-          CHATGPT_SWIFT_SPARKLE_FEED_URL: ${{ inputs.feed_url }}
-          CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
-        run: ./packaging/make-dmg.sh
+          ENABLE_SPARKLE: ${{ inputs.enable_sparkle }}
+          RELEASE_FEED_URL: ${{ inputs.feed_url }}
+          RELEASE_SPARKLE_PUBLIC_ED_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY }}
+        run: |
+          if [[ "$ENABLE_SPARKLE" == "true" ]]; then
+            export CHATGPT_SWIFT_SPARKLE_FEED_URL="$RELEASE_FEED_URL"
+            export CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY="$RELEASE_SPARKLE_PUBLIC_ED_KEY"
+          fi
+          ./packaging/make-dmg.sh
 
       - name: Notarize and staple DMG
+        if: ${{ inputs.distribution == 'developer-id' }}
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -75,6 +103,7 @@ jobs:
         run: ./packaging/notarize-dmg.sh
 
       - name: Generate signed Sparkle appcast
+        if: ${{ inputs.enable_sparkle }}
         env:
           CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX: https://github.com/${{ github.repository }}/releases/download/${{ inputs.tag }}/
           CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY: ${{ secrets.CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY }}
@@ -82,6 +111,8 @@ jobs:
 
       - name: Verify release artifacts
         env:
+          DISTRIBUTION: ${{ inputs.distribution }}
+          ENABLE_SPARKLE: ${{ inputs.enable_sparkle }}
           FEED_URL: ${{ inputs.feed_url }}
         run: |
           app_path="dist/ChatGPT Swift.app"
@@ -90,27 +121,39 @@ jobs:
 
           test -d "$app_path"
           test -f "$dmg_path"
-          test -f "$appcast_path"
-          test "$(plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist")" = "$FEED_URL"
-          test -n "$(plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist")"
           /usr/bin/codesign --verify --deep --strict "$app_path"
-          /usr/bin/xcrun stapler validate "$dmg_path"
-          /usr/bin/xmllint --noout "$appcast_path"
-          /usr/bin/grep -q 'sparkle:edSignature=' "$appcast_path"
+          if [[ "$DISTRIBUTION" == "developer-id" ]]; then
+            /usr/bin/xcrun stapler validate "$dmg_path"
+          fi
+          if [[ "$ENABLE_SPARKLE" == "true" ]]; then
+            test -f "$appcast_path"
+            test "$(plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist")" = "$FEED_URL"
+            test -n "$(plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist")"
+            /usr/bin/xmllint --noout "$appcast_path"
+            /usr/bin/grep -q 'sparkle:edSignature=' "$appcast_path"
+          else
+            ! plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
+            ! plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
+          fi
 
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
           DRAFT: ${{ inputs.draft }}
+          ENABLE_SPARKLE: ${{ inputs.enable_sparkle }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           dmg_path="dist/ChatGPT Swift.dmg"
           appcast_path="dist/sparkle-appcast/appcast.xml"
           title="ChatGPT Swift $TAG"
+          assets=("$dmg_path")
+          if [[ "$ENABLE_SPARKLE" == "true" ]]; then
+            assets+=("$appcast_path")
+          fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$dmg_path" "$appcast_path" --clobber
+            gh release upload "$TAG" "${assets[@]}" --clobber
             exit 0
           fi
 
@@ -122,4 +165,4 @@ jobs:
             release_args+=(--prerelease)
           fi
 
-          gh release create "$TAG" "$dmg_path" "$appcast_path" "${release_args[@]}"
+          gh release create "$TAG" "${assets[@]}" "${release_args[@]}"
