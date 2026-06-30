@@ -101,37 +101,52 @@ CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX="https://example.com/releases/" \
 ./packaging/make-sparkle-appcast.sh
 ```
 
-真实自动更新发布还需要：HTTPS 托管 `appcast.xml` 和 DMG、Developer ID 签名、notarization/stapler、Sparkle 私钥在 Keychain 或 CI secret 中可用。私钥不要提交到仓库。
+Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA 私钥在 Keychain 或 CI secret 中可用。Developer ID 签名和 notarization 不是 GitHub-only 分发的硬要求，但能减少 Gatekeeper 提示。私钥不要提交到仓库。
 
 ## GitHub Release CI
 
 仓库提供手动触发的 GitHub Actions workflow：`.github/workflows/swift-macos-release.yml`。它会：
 
-- 导入 Developer ID Application `.p12` 证书
-- 构建带 Sparkle feed/key 的 DMG
-- notarize 并 staple DMG
-- 生成带 EdDSA 签名的 `appcast.xml`
-- 上传 `ChatGPT Swift.dmg` 和 `appcast.xml` 到指定 GitHub Release
+- 默认用本地自签名构建 GitHub Release DMG，不需要 Apple Developer 账号
+- 如果选择 `distribution=developer-id`，才导入 Developer ID Application `.p12`、notarize 并 staple DMG
+- 如果开启 `enable_sparkle=true`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`
+- 上传 `ChatGPT Swift.dmg` 到指定 GitHub Release；开启 Sparkle 时额外上传 `appcast.xml`
 
-需要配置这些 GitHub Secrets：
+默认 GitHub-only 分发不需要配置额外 secrets；它会上传自签名 DMG，用户首次打开时可能遇到 macOS Gatekeeper 提示，需要右键打开或手动允许。
+
+如果选择 `distribution=developer-id`，需要配置这些 GitHub Secrets：
 
 ```text
 CHATGPT_SWIFT_CERTIFICATE_P12_BASE64
 CHATGPT_SWIFT_CERTIFICATE_PASSWORD
-CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY
-CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY
 APPLE_ID
 APPLE_TEAM_ID
 APPLE_APP_SPECIFIC_PASSWORD
 ```
 
-检查远端仓库是否已经配置这些 secret 名称：
+如果开启 `enable_sparkle=true`，还需要配置这些 GitHub Secrets：
+
+```text
+CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY
+CHATGPT_SWIFT_SPARKLE_ED_PRIVATE_KEY
+```
+
+检查 GitHub-only 默认分发是否可运行：
 
 ```bash
 ./packaging/check-release-readiness.sh --github-secrets GravityPoet/chatgpt-web-desktop
 ```
 
-如果本机已经有 Developer ID `.p12`、Sparkle EdDSA key 和 Apple notarization 凭据，可以用脚本写入 GitHub Secrets：
+检查 Developer ID + Sparkle 完整分发所需 secrets：
+
+```bash
+./packaging/check-release-readiness.sh \
+  --github-secrets GravityPoet/chatgpt-web-desktop \
+  --distribution developer-id \
+  --sparkle on
+```
+
+如果本机已经有 Developer ID `.p12`、Sparkle EdDSA key 和 Apple notarization 凭据，并且你确实要做 notarized/Sparkle 分发，可以用脚本写入 GitHub Secrets：
 
 ```bash
 ./packaging/configure-release-credentials.sh \
@@ -147,7 +162,7 @@ APPLE_APP_SPECIFIC_PASSWORD
 
 脚本通过 `gh secret set` 写入 GitHub，不会把 secret 值打印到终端；它适合在你自己的本机执行，不要在共享机器上用命令行参数传私钥。不要把 `.p12` 或 Sparkle 私钥提交到仓库。
 
-推荐的 `feed_url` 是固定入口：
+开启 Sparkle 时推荐的 `feed_url` 是固定入口：
 
 ```text
 https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appcast.xml
