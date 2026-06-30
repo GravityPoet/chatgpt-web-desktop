@@ -1,4 +1,5 @@
 import AppKit
+import ChatGPTSwiftWebCore
 import Darwin
 import Foundation
 import OSLog
@@ -28,8 +29,6 @@ private let maximumCookieImportBytes = 2 * 1024 * 1024
 private let maximumChatGPTCookieHeaderBytes = 6 * 1024
 private let maximumBridgeDownloadBytes = 200 * 1024 * 1024
 private let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
-private let cookieImportErrorDomain = "ChatGPTSwiftWeb.CookieImport"
-private let defaultHeaderCookieImportDomain = ".chatgpt.com"
 private let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"
 private let currentProfileDefaultsKey = "ChatGPTSwiftWeb.CurrentProfileID"
 private let startupProfileDefaultsKey = "ChatGPTSwiftWeb.StartupProfileID"
@@ -40,6 +39,8 @@ private let profileFingerprintDisabledDefaultsPrefix = "ChatGPTSwiftWeb.ProfileF
 private let profileEnhancedPrivacyDefaultsPrefix = "ChatGPTSwiftWeb.ProfileEnhancedPrivacy."
 private let webRTCProtectionDefaultsKey = "ChatGPTSwiftWeb.WebRTCProtectionEnabled"
 private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPartyLinksInApp"
+private let smokeReportPathEnvironmentKey = "CHATGPT_SWIFT_SMOKE_REPORT_PATH"
+private let smokeTimeoutEnvironmentKey = "CHATGPT_SWIFT_SMOKE_TIMEOUT_SECONDS"
 // WKWebView's native user agent stops at "(KHTML, like Gecko)" with no "Version/.. Safari/.."
 // token. Cloudflare reads that truncated UA as a non-standard client and issues repeated
 // challenges. This is the complete, engine-consistent Safari UA used when no fingerprint preset
@@ -47,6 +48,18 @@ private let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPart
 private let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
 private let processStartedAt = Date()
 private var singleInstanceLockFileDescriptor: CInt = -1
+
+private enum SmokeTestEnvironment {
+    static var reportPath: String? {
+        let rawPath = ProcessInfo.processInfo.environment[smokeReportPathEnvironmentKey] ?? ""
+        let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmedPath.isEmpty ? nil : trimmedPath
+    }
+
+    static var isEnabled: Bool {
+        reportPath != nil
+    }
+}
 
 private struct GitHubRelease: Decodable {
     let tagName: String
@@ -300,9 +313,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        let smokeTestRun = SmokeTestEnvironment.isEnabled
         didFinishLaunchingAt = Date()
-        capturePreviousRunState()
-        markRunStarted()
+        if smokeTestRun {
+            previousRunSummary = "smoke test run"
+        } else {
+            capturePreviousRunState()
+            markRunStarted()
+        }
         performanceMonitor.start()
         UNUserNotificationCenter.current().delegate = self
         refreshNotificationPermissionStatus()
@@ -310,23 +328,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         buildMenu()
         configureSparkleUpdaterIfAvailable()
         installKeyboardZoomShortcuts()
-        let needsIsolationFallbackNotice = reconcileProfileIsolationOnLaunch()
-        ProfileStore.applyStartupProfileIfAvailable()
-        ProfileStore.ensurePrivacyBaseline()
+        let needsIsolationFallbackNotice = smokeTestRun ? false : reconcileProfileIsolationOnLaunch()
+        if !smokeTestRun {
+            ProfileStore.applyStartupProfileIfAvailable()
+            ProfileStore.ensurePrivacyBaseline()
+        }
 
-        let profile = ProfileStore.currentProfile()
+        let profile = smokeTestRun ? nil : ProfileStore.currentProfile()
         let controller = BrowserWindowController(
-            initialURL: ProfileStore.homepageURL(for: profile.id),
-            title: mainWindowTitle(for: profile),
+            initialURL: smokeTestRun ? chatGPTURL : ProfileStore.homepageURL(for: profile?.id ?? defaultProfileID),
+            title: profile.map(mainWindowTitle(for:)) ?? "ChatGPT Swift Smoke Test",
             isPopup: false,
-            persistent: true,
-            profileID: profile.id
+            persistent: !smokeTestRun,
+            profileID: profile?.id
         )
         mainController = controller
         controller.show()
         NSApp.activate(ignoringOtherApps: true)
+        scheduleSmokeTestIfRequested()
 
-        primeExitTimezoneAlignment()
+        if !smokeTestRun {
+            primeExitTimezoneAlignment()
+        }
 
         if needsIsolationFallbackNotice {
             DispatchQueue.main.async { [weak self] in
@@ -844,6 +867,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func refreshNativeUtilityWindows() {
         settingsWindowController?.update(state: makeAppSettingsState())
         diagnosticsWindowController?.update(state: makeDiagnosticsState())
+    }
+
+    private func scheduleSmokeTestIfRequested() {
+        guard let rawPath = SmokeTestEnvironment.reportPath else {
+            return
+        }
+
+        let timeout = ProcessInfo.processInfo.environment[smokeTimeoutEnvironmentKey].flatMap(Double.init) ?? 25
+        let boundedTimeout = min(max(timeout, 5), 120)
+        let reportURL = URL(fileURLWithPath: rawPath)
+        let deadline = Date().addingTimeInterval(boundedTimeout)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            self?.runSmokeTestAttempt(reportURL: reportURL, deadline: deadline)
+        }
+    }
+
+    private func runSmokeTestAttempt(reportURL: URL, deadline: Date) {
+        guard let controller = mainController else {
+            finishSmokeTest(reportURL: reportURL, passed: false, report: "mainController=nil")
+            return
+        }
+
+        controller.runSmokeTestProbe { [weak self] passed, report in
+            guard let self else {
+                return
+            }
+            if passed || Date() >= deadline {
+                self.finishSmokeTest(reportURL: reportURL, passed: passed, report: report)
+                return
+            }
+
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+                self?.runSmokeTestAttempt(reportURL: reportURL, deadline: deadline)
+            }
+        }
+    }
+
+    private func finishSmokeTest(reportURL: URL, passed: Bool, report: String) {
+        let status = passed ? "pass" : "fail"
+        let body = """
+        SMOKE_STATUS=\(status)
+        generatedAt=\(Self.timestampString(Date()))
+        \(report)
+        """
+
+        do {
+            try FileManager.default.createDirectory(at: reportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try body.write(to: reportURL, atomically: true, encoding: .utf8)
+        } catch {
+            browserLogger.error("Failed to write smoke test report: \(error.localizedDescription, privacy: .public)")
+        }
+
+        NSApp.terminate(nil)
     }
 
     private func openNotesAutomationPrivacy() {
@@ -2174,29 +2251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private static func validatedExternalURL(_ raw: String) -> URL? {
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return nil
-        }
-        let lower = trimmed.lowercased()
-        if lower.hasPrefix("http://") {
-            return nil
-        }
-        let candidate: String
-        if lower.hasPrefix("https://") {
-            candidate = trimmed
-        } else if lower.contains("://") {
-            return nil
-        } else {
-            candidate = "https://" + trimmed
-        }
-        guard let url = URL(string: candidate),
-              url.scheme?.lowercased() == "https",
-              let host = url.host, !host.isEmpty,
-              host.contains(".") else {
-            return nil
-        }
-        return url
+        NavigationRules.validatedExternalURL(raw)
     }
 
     private func promptForName(title: String, initial: String, completion: @escaping (String?) -> Void) {
@@ -2476,6 +2531,60 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("userAgent override", webView.customUserAgent ?? "nil"),
         ]
         return Self.diagnosticSection("WebView", rows)
+    }
+
+    func runSmokeTestProbe(completion: @escaping (Bool, String) -> Void) {
+        runRenderedContentProbe(reason: "smoke test", recoverIfBlank: false) { [weak self] _ in
+            guard let self else {
+                completion(false, "controller=deallocated")
+                return
+            }
+            let snapshot = self.smokeTestSnapshot()
+            completion(snapshot.passed, snapshot.report)
+        }
+    }
+
+    private func smokeTestSnapshot() -> (passed: Bool, report: String) {
+        let overlayHealthy: Bool
+        switch currentOverlayMode {
+        case .hidden:
+            overlayHealthy = true
+        case .recovering, .failed, .blank:
+            overlayHealthy = false
+        }
+
+        let windowVisible = window?.isVisible == true
+        let currentItemURL = webView.backForwardList.currentItem?.url
+        let hasContentAddress = webView.url != nil || currentItemURL != nil
+        let renderProbeSucceeded = lastRenderProbeSummary.hasPrefix("blank=")
+        let renderProbeNonBlank = renderProbeSucceeded && !lastRenderProbeWasBlank
+        let diagnosticsHealthy = navigationFailureCount == 0
+            && webContentProcessTerminationCount == 0
+            && overlayHealthy
+        let passed = windowVisible
+            && hasContentAddress
+            && !webView.isLoading
+            && renderProbeNonBlank
+            && diagnosticsHealthy
+
+        let rows = [
+            "windowVisible=\(windowVisible)",
+            "currentURL=\(webView.url.map(Self.loggableURL) ?? "nil")",
+            "historyCurrentURL=\(currentItemURL.map(Self.loggableURL) ?? "nil")",
+            "title=\(webView.title ?? "nil")",
+            "isLoading=\(webView.isLoading)",
+            "estimatedProgress=\(String(format: "%.3f", webView.estimatedProgress))",
+            "renderProbeSucceeded=\(renderProbeSucceeded)",
+            "renderProbeNonBlank=\(renderProbeNonBlank)",
+            "lastRenderProbeWasBlank=\(lastRenderProbeWasBlank)",
+            "lastRenderProbe=\(lastRenderProbeSummary)",
+            "diagnosticsHealthy=\(diagnosticsHealthy)",
+            "nativeStatusOverlay=\(currentOverlayMode.diagnosticDescription)",
+            "navigationFailureCount=\(navigationFailureCount)",
+            "lastNavigationFailure=\(lastNavigationFailureDescription)",
+            "webContentProcessTerminationCount=\(webContentProcessTerminationCount)",
+        ]
+        return (passed, rows.joined(separator: "\n"))
     }
 
     func loadFingerprintTestPage() {
@@ -3467,27 +3576,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     fileprivate static func isAllowedCookieDomain(_ domain: String) -> Bool {
-        var normalized = domain
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        while normalized.hasPrefix(".") {
-            normalized.removeFirst()
-        }
-        return normalized == "chatgpt.com"
-            || normalized.hasSuffix(".chatgpt.com")
-            || normalized == "openai.com"
-            || normalized.hasSuffix(".openai.com")
+        CookieImportParser.isAllowedDomain(domain)
     }
 
     fileprivate static func isChatGPTEssentialCookieName(_ name: String) -> Bool {
-        name.hasPrefix("__Secure-next-auth.session-token")
-            || name == "cf_clearance"
-            || name == "__Secure-oai-is"
-            || name == "oai-sc"
+        CookieImportParser.isEssentialCookieName(name)
     }
 
     fileprivate static func isChatGPTSessionCookieName(_ name: String) -> Bool {
-        name.hasPrefix("__Secure-next-auth.session-token")
+        CookieImportParser.isSessionCookieName(name)
     }
 
     private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
@@ -3572,10 +3669,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 return
             }
 
-            do {
-                try self.copyImageDataToPasteboard(data)
-            } catch {
-                DispatchQueue.main.async {
+            DispatchQueue.main.async {
+                do {
+                    try self.copyImageDataToPasteboard(data)
+                } catch {
                     self.presentError("拷贝图像失败：\(error.localizedDescription)")
                 }
             }
@@ -3583,47 +3680,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func remoteImageFilename(suggestedFilename: String?, sourceURL: URL, mimeType: String?) -> String {
-        imageFilename(
-            suggestedFilename: suggestedFilename,
-            fallback: sourceURL.lastPathComponent.isEmpty ? "chatgpt-image" : sourceURL.lastPathComponent,
-            mimeType: mimeType
-        )
+        DownloadFilename.remoteImageFilename(suggestedFilename: suggestedFilename, sourceURL: sourceURL, mimeType: mimeType)
     }
 
     private static func imageFilename(suggestedFilename: String?, fallback: String, mimeType: String?) -> String {
-        let rawName = suggestedFilename?.trimmingCharacters(in: .whitespacesAndNewlines)
-        var filename = rawName?.isEmpty == false ? rawName! : fallback
-        if filename.isEmpty || filename == "/" {
-            filename = "chatgpt-image"
-        }
-
-        if URL(fileURLWithPath: filename).pathExtension.isEmpty,
-           let ext = fileExtension(forMIMEType: mimeType) {
-            filename += ".\(ext)"
-        }
-
-        return filename
+        DownloadFilename.imageFilename(suggestedFilename: suggestedFilename, fallback: fallback, mimeType: mimeType)
     }
 
     private static func fileExtension(forMIMEType mimeType: String?) -> String? {
-        switch mimeType?.lowercased() {
-        case "image/png":
-            return "png"
-        case "image/jpeg", "image/jpg":
-            return "jpg"
-        case "image/webp":
-            return "webp"
-        case "image/gif":
-            return "gif"
-        case "image/svg+xml":
-            return "svg"
-        case "image/avif":
-            return "avif"
-        case "image/heic":
-            return "heic"
-        default:
-            return nil
-        }
+        DownloadFilename.fileExtension(forMIMEType: mimeType)
     }
 
     private func burnWebsiteData(completion: @escaping () -> Void) {
@@ -3654,338 +3719,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func parseCookieImport(data: Data) throws -> [HTTPCookie] {
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw cookieImportError("Cookie 文件必须是 UTF-8 文本")
-        }
-
-        let normalizedText = text.removingUTF8ByteOrderMark()
-        let trimmedText = normalizedText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedText.isEmpty else {
-            throw cookieImportError("没有可导入的 cookie")
-        }
-
-        let exportedCookies: [ExportedBrowserCookie]
-        if trimmedText.hasPrefix("[") || trimmedText.hasPrefix("{") {
-            exportedCookies = try JSONDecoder().decode(CookieImportDocument.self, from: Data(trimmedText.utf8)).cookies
-        } else if looksLikeNetscapeCookieText(trimmedText) {
-            exportedCookies = try parseNetscapeCookieText(trimmedText)
-        } else {
-            exportedCookies = try parseHeaderCookieText(trimmedText)
-        }
-
-        let cookies = try exportedCookies.map { try $0.makeCookie() }
-        guard !cookies.isEmpty else {
-            throw cookieImportError("没有可导入的 cookie")
-        }
-        return cookies
-    }
-
-    private static func looksLikeNetscapeCookieText(_ text: String) -> Bool {
-        if text.localizedCaseInsensitiveContains("Netscape HTTP Cookie File") {
-            return true
-        }
-
-        for rawLine in text.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty {
-                continue
-            }
-            if line.hasPrefix("#") && !line.hasPrefix("#HttpOnly_") {
-                continue
-            }
-            let fields = splitCookieFields(line, maxSplits: 6)
-            return fields.count >= 7 && isNetscapeBoolean(fields[1]) && isNetscapeBoolean(fields[3]) && Int(fields[4]) != nil
-        }
-
-        return false
-    }
-
-    private static func parseNetscapeCookieText(_ text: String) throws -> [ExportedBrowserCookie] {
-        var cookies: [ExportedBrowserCookie] = []
-
-        for (lineIndex, rawLine) in text.components(separatedBy: .newlines).enumerated() {
-            var line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty {
-                continue
-            }
-
-            var httpOnly = false
-            if line.hasPrefix("#HttpOnly_") {
-                httpOnly = true
-                line.removeFirst("#HttpOnly_".count)
-            } else if line.hasPrefix("#") {
-                continue
-            }
-
-            let fields = splitCookieFields(line, maxSplits: 6)
-            guard fields.count >= 7 else {
-                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行字段不足")
-            }
-            guard let includeSubdomains = parseNetscapeBoolean(fields[1]) else {
-                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 includeSubdomains 无效")
-            }
-            guard let secure = parseNetscapeBoolean(fields[3]) else {
-                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 secure 无效")
-            }
-            guard let expires = Double(fields[4]) else {
-                throw cookieImportError("Netscape 第 \(lineIndex + 1) 行 expires 无效")
-            }
-
-            let isSession = expires <= 0
-            cookies.append(
-                ExportedBrowserCookie(
-                    domain: fields[0],
-                    expirationDate: isSession ? nil : expires,
-                    hostOnly: !includeSubdomains,
-                    httpOnly: httpOnly,
-                    name: fields[5],
-                    path: fields[2].isEmpty ? "/" : fields[2],
-                    sameSite: nil,
-                    secure: secure,
-                    session: isSession,
-                    value: fields[6]
-                )
-            )
-        }
-
-        guard !cookies.isEmpty else {
-            throw cookieImportError("没有可导入的 cookie")
-        }
-        return cookies
-    }
-
-    private static func parseHeaderCookieText(_ text: String) throws -> [ExportedBrowserCookie] {
-        var cookies: [ExportedBrowserCookie] = []
-
-        for rawLine in text.components(separatedBy: .newlines) {
-            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-            if line.isEmpty {
-                continue
-            }
-
-            if let value = stripHeaderPrefix(line, prefix: "Set-Cookie:") {
-                cookies.append(try parseSetCookieLine(value))
-            } else if let value = stripHeaderPrefix(line, prefix: "Cookie:") {
-                cookies.append(contentsOf: try parseCookieHeaderPairs(value))
-            } else if looksLikeSetCookieLine(line) {
-                cookies.append(try parseSetCookieLine(line))
-            } else {
-                cookies.append(contentsOf: try parseCookieHeaderPairs(line))
-            }
-        }
-
-        guard !cookies.isEmpty else {
-            throw cookieImportError("没有可导入的 cookie")
-        }
-        return cookies
-    }
-
-    private static func parseCookieHeaderPairs(_ header: String) throws -> [ExportedBrowserCookie] {
-        var cookies: [ExportedBrowserCookie] = []
-
-        for segment in header.split(separator: ";", omittingEmptySubsequences: true) {
-            let pair = segment.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard let separator = pair.firstIndex(of: "=") else {
-                continue
-            }
-
-            let name = String(pair[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let value = String(pair[pair.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !name.isEmpty, !isSetCookieAttribute(name) else {
-                continue
-            }
-
-            cookies.append(headerCookie(name: name, value: value))
-        }
-
-        guard !cookies.isEmpty else {
-            throw cookieImportError("Header String 没有可导入的 cookie")
-        }
-        return cookies
-    }
-
-    private static func parseSetCookieLine(_ line: String) throws -> ExportedBrowserCookie {
-        let segments = line.split(separator: ";", omittingEmptySubsequences: true)
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-        guard let first = segments.first, let separator = first.firstIndex(of: "=") else {
-            throw cookieImportError("Set-Cookie Header 无效")
-        }
-
-        let name = String(first[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
-        let value = String(first[first.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty else {
-            throw cookieImportError("Set-Cookie Header cookie 名称为空")
-        }
-
-        var domain = defaultHeaderCookieImportDomain
-        var path = "/"
-        var secure = false
-        var httpOnly = false
-        var sameSite: String?
-        var session = true
-        var expirationDate: Double?
-
-        for attribute in segments.dropFirst() {
-            let lower = attribute.lowercased()
-            if lower == "secure" {
-                secure = true
-            } else if lower == "httponly" {
-                httpOnly = true
-            } else if let separator = attribute.firstIndex(of: "=") {
-                let key = String(attribute[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-                let value = String(attribute[attribute.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                switch key {
-                case "domain":
-                    domain = value
-                case "path":
-                    path = value.isEmpty ? "/" : value
-                case "expires":
-                    if let date = parseCookieExpiresDate(value) {
-                        expirationDate = date.timeIntervalSince1970
-                        session = false
-                    }
-                case "max-age":
-                    if let maxAge = Double(value), maxAge > 0 {
-                        expirationDate = Date().addingTimeInterval(maxAge).timeIntervalSince1970
-                        session = false
-                    }
-                case "samesite":
-                    sameSite = value
-                default:
-                    break
-                }
-            }
-        }
-
-        return ExportedBrowserCookie(
-            domain: domain,
-            expirationDate: expirationDate,
-            hostOnly: !domain.hasPrefix("."),
-            httpOnly: httpOnly,
-            name: name,
-            path: path,
-            sameSite: sameSite,
-            secure: secure,
-            session: session,
-            value: value
-        )
-    }
-
-    private static func headerCookie(name: String, value: String) -> ExportedBrowserCookie {
-        ExportedBrowserCookie(
-            domain: defaultHeaderCookieImportDomain,
-            expirationDate: nil,
-            hostOnly: false,
-            httpOnly: false,
-            name: name,
-            path: "/",
-            sameSite: nil,
-            secure: true,
-            session: true,
-            value: value
-        )
-    }
-
-    private static func splitCookieFields(_ line: String, maxSplits: Int) -> [String] {
-        line.split(
-            maxSplits: maxSplits,
-            omittingEmptySubsequences: true,
-            whereSeparator: { $0 == " " || $0 == "\t" }
-        ).map(String.init)
-    }
-
-    private static func stripHeaderPrefix(_ line: String, prefix: String) -> String? {
-        guard line.range(of: prefix, options: [.caseInsensitive, .anchored]) != nil else {
-            return nil
-        }
-        return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func looksLikeSetCookieLine(_ line: String) -> Bool {
-        let lowerSegments = line.split(separator: ";").map {
-            $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        }
-        guard lowerSegments.count > 1, lowerSegments.first?.contains("=") == true else {
-            return false
-        }
-        return lowerSegments.dropFirst().contains { segment in
-            segment == "secure"
-                || segment == "httponly"
-                || segment.hasPrefix("domain=")
-                || segment.hasPrefix("path=")
-                || segment.hasPrefix("expires=")
-                || segment.hasPrefix("max-age=")
-                || segment.hasPrefix("samesite=")
-        }
-    }
-
-    private static func isSetCookieAttribute(_ name: String) -> Bool {
-        switch name.lowercased() {
-        case "domain", "path", "expires", "max-age", "samesite", "secure", "httponly":
-            return true
-        default:
-            return false
-        }
-    }
-
-    private static func isNetscapeBoolean(_ value: String) -> Bool {
-        parseNetscapeBoolean(value) != nil
-    }
-
-    private static func parseNetscapeBoolean(_ value: String) -> Bool? {
-        switch value.uppercased() {
-        case "TRUE":
-            return true
-        case "FALSE":
-            return false
-        default:
-            return nil
-        }
-    }
-
-    private static func parseCookieExpiresDate(_ value: String) -> Date? {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone(secondsFromGMT: 0)
-
-        for format in [
-            "EEE, dd MMM yyyy HH:mm:ss zzz",
-            "EEE, dd-MMM-yyyy HH:mm:ss zzz",
-            "EEE MMM dd HH:mm:ss yyyy",
-        ] {
-            formatter.dateFormat = format
-            if let date = formatter.date(from: value) {
-                return date
-            }
-        }
-
-        return nil
+        try CookieImportParser.parse(data: data)
     }
 
     private static func safeCookieImportMessage(_ error: Error) -> String {
-        if let decodingError = error as? DecodingError {
-            switch decodingError {
-            case .dataCorrupted:
-                return "JSON 内容无效"
-            case .keyNotFound:
-                return "JSON 缺少必要字段"
-            case .typeMismatch, .valueNotFound:
-                return "JSON 字段类型不匹配"
-            @unknown default:
-                return "JSON 解析失败"
-            }
-        }
-
-        let nsError = error as NSError
-        if nsError.domain == cookieImportErrorDomain, let message = nsError.userInfo[NSLocalizedDescriptionKey] as? String {
-            return message
-        }
-
-        return error.localizedDescription
+        CookieImportParser.safeMessage(error)
     }
 
     fileprivate static func cookieImportError(_ message: String) -> NSError {
-        NSError(domain: cookieImportErrorDomain, code: 1, userInfo: [NSLocalizedDescriptionKey: message])
+        CookieImportParser.cookieImportError(message)
     }
 
     private func decodeDataURL(_ dataURL: String) throws -> Data {
@@ -4041,29 +3783,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private func uniqueDownloadURL(suggestedFilename: String) -> URL {
         let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
-        let sanitized = sanitizeFilename(suggestedFilename)
-        let ext = URL(fileURLWithPath: sanitized).pathExtension
-        let stem = URL(fileURLWithPath: sanitized).deletingPathExtension().lastPathComponent
-        var candidate = downloads.appendingPathComponent(sanitized)
-        var index = 1
-
-        while FileManager.default.fileExists(atPath: candidate.path) {
-            let nextName = ext.isEmpty ? "\(stem)-\(index)" : "\(stem)-\(index).\(ext)"
-            candidate = downloads.appendingPathComponent(nextName)
-            index += 1
-        }
-
-        return candidate
+        return DownloadFilename.uniqueDownloadURL(
+            suggestedFilename: suggestedFilename,
+            in: downloads,
+            fileExists: FileManager.default.fileExists(atPath:)
+        )
     }
 
     private func sanitizeFilename(_ filename: String) -> String {
-        let cleaned = filename
-            .replacingOccurrences(of: "/", with: "-")
-            .replacingOccurrences(of: "\\", with: "-")
-            .replacingOccurrences(of: ":", with: "-")
-            .trimmingCharacters(in: CharacterSet.controlCharacters)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return cleaned.isEmpty ? "chatgpt-download" : cleaned
+        DownloadFilename.sanitize(filename)
     }
 
     private static func boolValue(_ value: Any?) -> Bool {
@@ -4449,17 +4177,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func isChatGPTHost(_ host: String) -> Bool {
-        host == "chatgpt.com" || host.hasSuffix(".chatgpt.com") || host == "chat.openai.com" || host.hasSuffix(".chat.openai.com")
+        NavigationRules.isChatGPTHost(host)
     }
 
     private static func isOpenAIAuthHost(_ host: String) -> Bool {
-        host == "auth.openai.com" || host.hasSuffix(".auth.openai.com")
-            || host == "auth0.openai.com" || host.hasSuffix(".auth0.openai.com")
-            || host == "login.openai.com" || host.hasSuffix(".login.openai.com")
+        NavigationRules.isOpenAIAuthHost(host)
     }
 
     private static func isOpenAISentinelHost(_ host: String) -> Bool {
-        host == "sentinel.openai.com"
+        NavigationRules.isOpenAISentinelHost(host)
     }
 
     private static func isCloudflareChallengeURL(_ url: URL) -> Bool {
@@ -4470,17 +4196,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func isOpenAIFamilyHost(_ host: String) -> Bool {
-        host == "openai.com" || host.hasSuffix(".openai.com")
+        NavigationRules.isOpenAIFamilyHost(host)
     }
 
     /// OpenAI's own surfaces beyond the bare ChatGPT host: the marketing/help/platform sites, the
     /// static and user-content CDNs, and Sora. They belong to the same product family, so links into
     /// them open in-app instead of bouncing to the system browser.
     private static func isOpenAIEcosystemHost(_ host: String) -> Bool {
-        isOpenAIFamilyHost(host)
-            || host == "oaistatic.com" || host.hasSuffix(".oaistatic.com")
-            || host == "oaiusercontent.com" || host.hasSuffix(".oaiusercontent.com")
-            || host == "sora.com" || host.hasSuffix(".sora.com")
+        NavigationRules.isOpenAIEcosystemHost(host)
     }
 
     private static func isTrustedAuthSourceHost(_ host: String) -> Bool {
@@ -4491,125 +4214,52 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func isOAuthProviderHost(_ host: String) -> Bool {
-        host == "accounts.google.com"
-            || host.hasPrefix("accounts.google.")
-            || host == "appleid.apple.com"
-            || host == "login.microsoftonline.com"
-            || host == "login.live.com"
-            || host == "github.com"
-            || host == "facebook.com"
-            || host.hasSuffix(".facebook.com")
-            || host == "twitter.com"
-            || host == "x.com"
+        NavigationRules.isOAuthProviderHost(host)
     }
 
     private static func isAuthLikeURL(_ url: URL, expanded: Bool = false) -> Bool {
-        let path = url.path.lowercased()
-        let query = url.query?.lowercased() ?? ""
-        let combined = path + "?" + query
-        var markers = [
-            "oauth",
-            "auth",
-            "authorize",
-            "signin",
-            "login",
-            "account",
-        ]
-        if expanded {
-            markers.append(contentsOf: [
-                "callback",
-                "continue",
-                "credential",
-                "passkey",
-                "webauthn",
-                "challenge",
-                "verify",
-                "mfa",
-                "sso",
-            ])
-        }
-        return markers.contains { combined.contains($0) }
+        NavigationRules.isAuthLikeURL(url, expanded: expanded)
     }
 
     private static func isOAuthContinuationHost(_ url: URL) -> Bool {
-        guard let host = url.host?.lowercased() else {
-            return false
-        }
-        guard isOAuthProviderHost(host) else {
-            return false
-        }
-        return isAuthLikeURL(url)
+        NavigationRules.isOAuthContinuationHost(url)
     }
 
     private static func isAuthContinuationFromTrustedSource(_ url: URL, sourceURL: URL?) -> Bool {
-        guard let host = url.host?.lowercased(),
-              let sourceHost = sourceURL?.host?.lowercased(),
-              isTrustedAuthSourceHost(sourceHost),
-              isAuthLikeURL(url, expanded: true)
-        else {
-            return false
-        }
-
-        return isOpenAIFamilyHost(host) || isOAuthProviderHost(host)
+        NavigationRules.isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
     }
 
     private static func isTrustedChatGPTBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
         guard origin.protocol == "https" else {
             return false
         }
-        return isChatGPTHost(origin.host.lowercased())
+        return NavigationRules.isChatGPTHost(origin.host.lowercased())
     }
 
     private static func shouldOpenInsideApp(_ url: URL, sourceURL: URL? = nil) -> Bool {
-        guard let scheme = url.scheme?.lowercased() else {
-            return false
-        }
-
-        if ["about", "blob", "data"].contains(scheme) {
-            return true
-        }
-
-        guard scheme == "https",
-              let host = url.host?.lowercased()
-        else {
-            return false
-        }
-
-        return isChatGPTHost(host)
-            || isOpenAIEcosystemHost(host)
-            || isOpenAIAuthHost(host)
-            || isOpenAISentinelHost(host)
-            || isCloudflareChallengeURL(url)
-            || isOAuthContinuationHost(url)
-            || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
+        NavigationRules.shouldOpenInsideApp(url, sourceURL: sourceURL)
     }
 
     /// Only a deliberate user click on a genuine third-party https link should leave the app for the
     /// system browser. Automatic redirects, script-driven navigations, and ChatGPT's own popups stay
     /// in-app, so the user is never bounced to the default browser unexpectedly mid-session.
     private static func shouldOpenInSystemBrowser(_ url: URL, sourceURL: URL? = nil, navigationType: WKNavigationType) -> Bool {
-        if PrivacySettings.keepThirdPartyLinksInApp() {
-            return false
-        }
-        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
-            return false
-        }
-        if shouldOpenInsideApp(url, sourceURL: sourceURL) {
-            return false
-        }
-        return navigationType == .linkActivated
+        NavigationRules.shouldOpenInSystemBrowser(
+            url,
+            sourceURL: sourceURL,
+            navigationType: navigationType == .linkActivated ? .linkActivated : .other,
+            keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp()
+        )
     }
 
     /// WebKit often reports JS-mediated target=_blank/window.open as `.other`, even when it came from
     /// a user click. For new-window requests the menu setting is the source of truth.
     private static func shouldOpenNewWindowInSystemBrowser(_ url: URL, sourceURL: URL? = nil) -> Bool {
-        if PrivacySettings.keepThirdPartyLinksInApp() {
-            return false
-        }
-        guard let scheme = url.scheme?.lowercased(), scheme == "https" || scheme == "http" else {
-            return false
-        }
-        return !shouldOpenInsideApp(url, sourceURL: sourceURL)
+        NavigationRules.shouldOpenNewWindowInSystemBrowser(
+            url,
+            sourceURL: sourceURL,
+            keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp()
+        )
     }
 
     private static func loggableURL(_ url: URL) -> String {
@@ -4716,53 +4366,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func cleanTrackingParameters(from url: URL) -> URL {
-        guard ["http", "https"].contains(url.scheme?.lowercased() ?? ""),
-              var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let queryItems = components.queryItems,
-              !queryItems.isEmpty
-        else {
-            return url
-        }
-
-        let filteredItems = queryItems.filter { !isTrackingQueryParameter($0.name) }
-        if filteredItems.count == queryItems.count {
-            return url
-        }
-
-        components.queryItems = filteredItems.isEmpty ? nil : filteredItems
-        return components.url ?? url
+        NavigationRules.cleanTrackingParameters(from: url)
     }
 
     private static func isTrackingQueryParameter(_ name: String) -> Bool {
-        let normalized = name.lowercased()
-        if normalized.hasPrefix("utm_") {
-            return true
-        }
-
-        let knownTrackingParameters: Set<String> = [
-            "_hsenc",
-            "_hsmi",
-            "dclid",
-            "fbclid",
-            "gbraid",
-            "gclid",
-            "igshid",
-            "li_fat_id",
-            "mc_cid",
-            "mc_eid",
-            "mkt_tok",
-            "msclkid",
-            "oly_anon_id",
-            "oly_enc_id",
-            "rb_clickid",
-            "scid",
-            "ttclid",
-            "twclid",
-            "vero_id",
-            "wbraid",
-            "yclid",
-        ]
-        return knownTrackingParameters.contains(normalized)
+        NavigationRules.isTrackingQueryParameter(name)
     }
 
     private static func restoredMainWindowFrame() -> NSRect? {
@@ -5583,29 +5191,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     """
 }
 
-private struct CookieImportDocument: Decodable {
-    let cookies: [ExportedBrowserCookie]
-
-    enum CodingKeys: String, CodingKey {
-        case cookies
-    }
-
-    init(from decoder: Decoder) throws {
-        let singleValue = try decoder.singleValueContainer()
-        if let cookies = try? singleValue.decode([ExportedBrowserCookie].self) {
-            self.cookies = cookies
-            return
-        }
-        if let cookie = try? singleValue.decode(ExportedBrowserCookie.self) {
-            self.cookies = [cookie]
-            return
-        }
-
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        self.cookies = try container.decode([ExportedBrowserCookie].self, forKey: .cookies)
-    }
-}
-
 private struct CookieIdentity: Hashable {
     let name: String
     let domain: String
@@ -5705,81 +5290,6 @@ private struct ExportedBrowserCookie: Codable {
         return nil
     }
 
-    func makeCookie() throws -> HTTPCookie {
-        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedDomain = domain.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let cookiePath = path.isEmpty ? "/" : path
-
-        guard !trimmedName.isEmpty else {
-            throw BrowserWindowController.cookieImportError("cookie 名称为空")
-        }
-        guard !trimmedDomain.isEmpty else {
-            throw BrowserWindowController.cookieImportError("cookie 域名为空")
-        }
-        guard BrowserWindowController.isAllowedCookieDomain(trimmedDomain) else {
-            throw BrowserWindowController.cookieImportError("cookie 域名不在 ChatGPT/OpenAI 白名单中：\(trimmedDomain)")
-        }
-        guard cookiePath.hasPrefix("/") else {
-            throw BrowserWindowController.cookieImportError("cookie path 无效")
-        }
-        guard !cookiePath.utf8.contains(0),
-              !cookiePath.split(separator: "/").contains(where: { $0 == ".." }) else {
-            throw BrowserWindowController.cookieImportError("cookie path 不安全")
-        }
-
-        var cookieAttributes: [HTTPCookiePropertyKey: Any] = [
-            .name: trimmedName,
-            .value: value,
-            .domain: trimmedDomain,
-            .path: cookiePath,
-            .version: "0",
-        ]
-
-        if secure == true {
-            cookieAttributes[.secure] = "TRUE"
-        }
-        if httpOnly == true {
-            cookieAttributes[HTTPCookiePropertyKey("HttpOnly")] = "TRUE"
-        }
-        if let sameSiteValue = normalizedSameSiteValue(sameSite) {
-            cookieAttributes[HTTPCookiePropertyKey("SameSite")] = sameSiteValue
-        }
-        if session != true, let expirationDate {
-            cookieAttributes[.expires] = Date(timeIntervalSince1970: expirationDate)
-        }
-
-        guard let result = makeFoundationCookie(cookieAttributes) else {
-            throw BrowserWindowController.cookieImportError("cookie 数据无法转换")
-        }
-
-        return result
-    }
-
-    private func makeFoundationCookie(_ attributes: [HTTPCookiePropertyKey: Any]) -> HTTPCookie? {
-        HTTPCookie(properties: attributes)
-    }
-
-    private func normalizedSameSiteValue(_ rawValue: String?) -> String? {
-        switch rawValue?.lowercased() {
-        case "lax":
-            return "Lax"
-        case "strict":
-            return "Strict"
-        case "none", "no_restriction":
-            return "None"
-        default:
-            return nil
-        }
-    }
-}
-
-private extension String {
-    func removingUTF8ByteOrderMark() -> String {
-        if hasPrefix("\u{feff}") {
-            return String(dropFirst())
-        }
-        return self
-    }
 }
 
 private struct WebProfile: Codable {
@@ -7159,7 +6669,9 @@ private let nativeShimScript = """
 
 private let applicationDelegate = AppDelegate()
 
-SingleInstance.activateExistingInstanceOrAcquireLock()
+if !SmokeTestEnvironment.isEnabled {
+    SingleInstance.activateExistingInstanceOrAcquireLock()
+}
 
 let app = NSApplication.shared
 app.delegate = applicationDelegate
