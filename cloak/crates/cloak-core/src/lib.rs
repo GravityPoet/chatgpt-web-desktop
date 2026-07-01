@@ -122,6 +122,8 @@ pub enum CloakError {
     AccountRunning(String),
     #[error("account is in trash: {0}")]
     AccountTrashed(String),
+    #[error("account is not in trash: {0}")]
+    AccountNotTrashed(String),
     #[error("unsupported proxy URL; use socks5://, http://, or https://")]
     InvalidProxy,
     #[error("CloakBrowser binary not found")]
@@ -189,6 +191,7 @@ pub struct Account {
     pub archived: bool,
     pub trashed: bool,
     pub seed: String,
+    pub group: Option<String>,
     pub region: Option<String>,
     pub locale_enabled: bool,
     pub proxy_display: String,
@@ -401,6 +404,7 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         secure_account_dir(&profile_path)?;
     }
     let seed = pinned_seed(&profile_path)?.unwrap_or_else(|| legacy_seed(name));
+    let group = read_first_line(&profile_path.join(".cloak-group"))?;
     let region = read_first_line(&profile_path.join(".cloak-region"))?;
     let locale_enabled = profile_path.join(".cloak-locale").exists();
     let proxy_raw = read_first_line(&profile_path.join(".cloak-proxy"))?;
@@ -411,7 +415,7 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         .unwrap_or_else(|| "关".to_string());
     let created_at = account_created_at(&profile_path)?;
     let archived = profile_path.join(".cloak-archived").exists();
-    let trashed = profile_path.join(".cloak-trashed").exists();
+    let trashed = profile_path.join(".cloak-trashed").exists() || archived;
 
     Ok(Account {
         name: name.to_string(),
@@ -420,6 +424,7 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
         archived,
         trashed,
         seed,
+        group: group.filter(|s| !s.is_empty()),
         region: region.filter(|s| !s.is_empty()),
         locale_enabled,
         proxy_display,
@@ -466,6 +471,23 @@ pub fn delete_account(config: &CloakConfig, name: &str) -> Result<()> {
     set_account_trashed(config, name, true).map(|_| ())
 }
 
+pub fn permanently_delete_account(config: &CloakConfig, name: &str) -> Result<()> {
+    validate_account_name(name)?;
+    let profile = config.profile_dir(name);
+    if !profile.exists() {
+        return Err(CloakError::AccountMissing(name.to_string()));
+    }
+    if !profile.join(".cloak-trashed").exists() && !profile.join(".cloak-archived").exists() {
+        return Err(CloakError::AccountNotTrashed(name.to_string()));
+    }
+    if account_profile_is_running(&profile)? {
+        return Err(CloakError::AccountRunning(name.to_string()));
+    }
+
+    fs::remove_dir_all(profile)?;
+    Ok(())
+}
+
 pub fn set_account_trashed(config: &CloakConfig, name: &str, trashed: bool) -> Result<Account> {
     validate_account_name(name)?;
     let profile = config.profile_dir(name);
@@ -479,12 +501,15 @@ pub fn set_account_trashed(config: &CloakConfig, name: &str, trashed: bool) -> R
 
     let trash_path = profile.join(".cloak-trashed");
     let deleted_at_path = profile.join(".cloak-deleted-at");
+    let archived_path = profile.join(".cloak-archived");
     if trashed {
         write_secret_atomic(&trash_path, "")?;
         write_secret_atomic(&deleted_at_path, &current_created_at().to_string())?;
+        remove_if_present(&archived_path)?;
     } else {
         remove_if_present(&trash_path)?;
         remove_if_present(&deleted_at_path)?;
+        remove_if_present(&archived_path)?;
     }
     read_account(config, name)
 }
@@ -523,6 +548,16 @@ pub fn set_region(config: &CloakConfig, name: &str, value: Option<&str>) -> Resu
     read_account(config, name)
 }
 
+pub fn set_group(config: &CloakConfig, name: &str, value: Option<&str>) -> Result<Account> {
+    let profile = ensure_profile(config, name)?;
+    let path = profile.join(".cloak-group");
+    match value.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(raw) => write_secret_atomic(&path, raw)?,
+        None => remove_if_present(&path)?,
+    }
+    read_account(config, name)
+}
+
 pub fn toggle_locale(config: &CloakConfig, name: &str) -> Result<Account> {
     let profile = ensure_profile(config, name)?;
     let path = profile.join(".cloak-locale");
@@ -547,7 +582,8 @@ pub fn build_launch_plan(
     }
 
     let profile_path = config.profile_dir(name);
-    if profile_path.join(".cloak-trashed").exists() {
+    if profile_path.join(".cloak-trashed").exists() || profile_path.join(".cloak-archived").exists()
+    {
         return Err(CloakError::AccountTrashed(name.to_string()));
     }
     let seed = pinned_seed(&profile_path)?.unwrap_or_else(|| legacy_seed(name));
@@ -1088,7 +1124,7 @@ fn proxy_config(raw: &str) -> Result<ProxyConfig> {
         Some(raw.to_string())
     };
     let display = if relay_needed {
-        format!("{scheme}://{hostport}  (via local SOCKS5 relay)")
+        format!("{scheme}://{hostport}（经本机 SOCKS5 中继）")
     } else {
         format!("{scheme}://{hostport}")
     };
@@ -1106,7 +1142,7 @@ fn no_proxy_config() -> ProxyConfig {
     ProxyConfig {
         raw_url: None,
         mode: ProxyMode::None,
-        display: "off (system VPN / direct)".to_string(),
+        display: "关（系统 VPN / 直连）".to_string(),
         browser_arg: None,
         relay_needed: false,
         reqwest_proxy_url: None,
@@ -1970,6 +2006,7 @@ fn secure_account_dir(path: &Path) -> Result<()> {
         ".cloak-proxy",
         ".cloak-locale",
         ".cloak-region",
+        ".cloak-group",
     ] {
         let path = path.join(file);
         if path.exists() {
@@ -2121,7 +2158,7 @@ mod tests {
         assert_eq!(socks.mode, ProxyMode::Relay);
         assert_eq!(
             socks.display,
-            "socks5://example.net:1080  (via local SOCKS5 relay)"
+            "socks5://example.net:1080（经本机 SOCKS5 中继）"
         );
         assert_eq!(socks.browser_arg.as_deref(), Some(RELAY_PLACEHOLDER));
 
@@ -2146,6 +2183,36 @@ mod tests {
         assert_eq!(account.created_at, renamed.created_at);
         assert!(renamed.profile_path.join(".cloak-seed").exists());
         assert!(renamed.profile_path.join(".cloak-created-at").exists());
+    }
+
+    #[test]
+    fn account_group_persists_clears_and_survives_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        create_account(&config, "work").unwrap();
+        let grouped = set_group(&config, "work", Some(" codex ")).unwrap();
+        assert_eq!(grouped.group.as_deref(), Some("codex"));
+        assert_eq!(
+            read_first_line(&config.profile_dir("work").join(".cloak-group"))
+                .unwrap()
+                .as_deref(),
+            Some("codex")
+        );
+
+        let renamed = rename_account(&config, "work", "work2").unwrap();
+        assert_eq!(renamed.group.as_deref(), Some("codex"));
+        assert!(renamed.profile_path.join(".cloak-group").exists());
+
+        let cleared = set_group(&config, "work2", None).unwrap();
+        assert_eq!(cleared.group, None);
+        assert!(!config.profile_dir("work2").join(".cloak-group").exists());
     }
 
     #[test]
@@ -2178,7 +2245,7 @@ mod tests {
     }
 
     #[test]
-    fn archived_accounts_are_hidden_until_restored() {
+    fn legacy_archived_accounts_are_treated_as_trash_until_restored() {
         let dir = tempfile::tempdir().unwrap();
         let config = CloakConfig {
             repo_root: dir.path().to_path_buf(),
@@ -2192,18 +2259,28 @@ mod tests {
         create_account(&config, "parked").unwrap();
         let archived = set_account_archived(&config, "parked", true).unwrap();
         assert!(archived.archived);
+        assert!(archived.trashed);
 
         let active_accounts = list_accounts(&config).unwrap();
         assert_eq!(active_accounts.len(), 1);
         assert_eq!(active_accounts[0].name, "active");
 
         let archived_accounts = list_archived_accounts(&config).unwrap();
-        assert_eq!(archived_accounts.len(), 1);
-        assert_eq!(archived_accounts[0].name, "parked");
+        assert!(archived_accounts.is_empty());
 
-        let restored = set_account_archived(&config, "parked", false).unwrap();
+        let trashed_accounts = list_trashed_accounts(&config).unwrap();
+        assert_eq!(trashed_accounts.len(), 1);
+        assert_eq!(trashed_accounts[0].name, "parked");
+
+        let restored = set_account_trashed(&config, "parked", false).unwrap();
         assert!(!restored.archived);
+        assert!(!restored.trashed);
+        assert!(!config
+            .profile_dir("parked")
+            .join(".cloak-archived")
+            .exists());
         assert_eq!(list_archived_accounts(&config).unwrap().len(), 0);
+        assert_eq!(list_trashed_accounts(&config).unwrap().len(), 0);
         assert_eq!(list_accounts(&config).unwrap().len(), 2);
     }
 
@@ -2237,6 +2314,36 @@ mod tests {
         assert_eq!(restored.seed, account.seed);
         assert_eq!(list_accounts(&config).unwrap().len(), 1);
         assert!(list_trashed_accounts(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn permanent_delete_only_removes_trashed_accounts() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        create_account(&config, "active").unwrap();
+        let error = permanently_delete_account(&config, "active").unwrap_err();
+        assert!(matches!(error, CloakError::AccountNotTrashed(name) if name == "active"));
+        assert!(config.profile_dir("active").exists());
+
+        create_account(&config, "trashed").unwrap();
+        delete_account(&config, "trashed").unwrap();
+        assert!(config.profile_dir("trashed").exists());
+
+        permanently_delete_account(&config, "trashed").unwrap();
+        assert!(!config.profile_dir("trashed").exists());
+        assert!(list_trashed_accounts(&config).unwrap().is_empty());
+
+        create_account(&config, "legacy-archived").unwrap();
+        set_account_archived(&config, "legacy-archived", true).unwrap();
+        permanently_delete_account(&config, "legacy-archived").unwrap();
+        assert!(!config.profile_dir("legacy-archived").exists());
     }
 
     #[test]

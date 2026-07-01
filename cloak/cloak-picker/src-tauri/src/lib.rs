@@ -1,12 +1,11 @@
 use cloak_core::{
     build_launch_plan, create_account as core_create_account,
     delete_account as core_delete_account, launch_account as core_launch_account,
-    list_accounts as core_list_accounts, list_archived_accounts as core_list_archived_accounts,
-    list_trashed_accounts as core_list_trashed_accounts, rename_account as core_rename_account,
-    set_account_archived as core_set_account_archived,
-    set_account_trashed as core_set_account_trashed, set_proxy as core_set_proxy,
-    set_region as core_set_region, toggle_locale as core_toggle_locale, Account, CloakConfig,
-    LaunchOptions, LaunchPlan,
+    list_accounts as core_list_accounts, list_trashed_accounts as core_list_trashed_accounts,
+    permanently_delete_account as core_permanently_delete_account,
+    rename_account as core_rename_account, set_account_trashed as core_set_account_trashed,
+    set_group as core_set_group, set_proxy as core_set_proxy, set_region as core_set_region,
+    toggle_locale as core_toggle_locale, Account, CloakConfig, LaunchOptions, LaunchPlan,
 };
 use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
 
@@ -17,11 +16,6 @@ fn config() -> Result<CloakConfig, String> {
 #[tauri::command]
 fn list_accounts() -> Result<Vec<Account>, String> {
     core_list_accounts(&config()?).map_err(|err| err.to_string())
-}
-
-#[tauri::command]
-fn list_archived_accounts() -> Result<Vec<Account>, String> {
-    core_list_archived_accounts(&config()?).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -45,13 +39,13 @@ fn delete_account(name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn restore_account(name: String) -> Result<Account, String> {
-    core_set_account_trashed(&config()?, &name, false).map_err(|err| err.to_string())
+fn permanently_delete_account(name: String) -> Result<(), String> {
+    core_permanently_delete_account(&config()?, &name).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
-fn archive_account(name: String, archived: bool) -> Result<Account, String> {
-    core_set_account_archived(&config()?, &name, archived).map_err(|err| err.to_string())
+fn restore_account(name: String) -> Result<Account, String> {
+    core_set_account_trashed(&config()?, &name, false).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -62,6 +56,11 @@ fn set_proxy(name: String, value: Option<String>) -> Result<Account, String> {
 #[tauri::command]
 fn set_region(name: String, value: Option<String>) -> Result<Account, String> {
     core_set_region(&config()?, &name, value.as_deref()).map_err(|err| err.to_string())
+}
+
+#[tauri::command]
+fn set_group(name: String, value: Option<String>) -> Result<Account, String> {
+    core_set_group(&config()?, &name, value.as_deref()).map_err(|err| err.to_string())
 }
 
 #[tauri::command]
@@ -101,7 +100,7 @@ pub fn run() {
                 window
             } else {
                 WebviewWindowBuilder::new(app, "main", WebviewUrl::App("index.html".into()))
-                    .title("Cloak Picker")
+                    .title("Cloak 账号管理")
                     .inner_size(920.0, 620.0)
                     .min_inner_size(760.0, 540.0)
                     .visible(true)
@@ -109,7 +108,7 @@ pub fn run() {
                     .build()?
             };
             let _ = window.unminimize();
-            let _ = window.center();
+            let _ = window.maximize();
             window.show()?;
             window.set_focus()?;
             focus_main_window_after_launch(app.handle().clone());
@@ -117,15 +116,15 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             list_accounts,
-            list_archived_accounts,
             list_trashed_accounts,
             create_account,
             rename_account,
             delete_account,
+            permanently_delete_account,
             restore_account,
-            archive_account,
             set_proxy,
             set_region,
+            set_group,
             toggle_locale,
             launch_dry_run,
             launch_preflight,
@@ -145,6 +144,7 @@ fn focus_main_window_after_launch(app: tauri::AppHandle) {
             if let Some(window) = app_for_main_thread.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
+                let _ = window.maximize();
                 let _ = window.set_focus();
             }
         });
