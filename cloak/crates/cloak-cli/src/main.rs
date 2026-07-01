@@ -2,8 +2,9 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use cloak_core::{
     build_launch_plan, create_account, delete_account, launch_account, list_accounts,
-    list_trashed_accounts, read_account, rename_account, self_check, set_account_trashed,
-    set_proxy, set_region, toggle_locale, CloakConfig, LaunchOptions,
+    list_trashed_accounts, permanently_delete_account, read_account, rename_account, self_check,
+    set_account_trashed, set_group, set_proxy, set_region, toggle_locale, CloakConfig,
+    LaunchOptions,
 };
 
 #[derive(Debug, Parser)]
@@ -50,6 +51,9 @@ enum AccountCommand {
     Delete {
         name: String,
     },
+    Purge {
+        name: String,
+    },
     Restore {
         name: String,
         #[arg(long)]
@@ -64,6 +68,14 @@ enum AccountCommand {
         json: bool,
     },
     SetRegion {
+        name: String,
+        value: Option<String>,
+        #[arg(long)]
+        clear: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    SetGroup {
         name: String,
         value: Option<String>,
         #[arg(long)]
@@ -139,6 +151,10 @@ fn handle_account(command: AccountCommand, config: &CloakConfig) -> Result<()> {
             delete_account(config, &name)?;
             println!("moved to trash: {name}");
         }
+        AccountCommand::Purge { name } => {
+            permanently_delete_account(config, &name)?;
+            println!("permanently deleted: {name}");
+        }
         AccountCommand::Restore { name, json } => {
             let account = set_account_trashed(config, &name, false)?;
             print_account(account, json)?;
@@ -159,6 +175,15 @@ fn handle_account(command: AccountCommand, config: &CloakConfig) -> Result<()> {
             json,
         } => {
             let account = set_region(config, &name, if clear { None } else { value.as_deref() })?;
+            print_account(account, json)?;
+        }
+        AccountCommand::SetGroup {
+            name,
+            value,
+            clear,
+            json,
+        } => {
+            let account = set_group(config, &name, if clear { None } else { value.as_deref() })?;
             print_account(account, json)?;
         }
         AccountCommand::ToggleLocale { name, json } => {
@@ -253,6 +278,10 @@ fn print_account(account: cloak_core::Account, json: bool) -> Result<()> {
         println!("account : {}", account.name);
         println!("seed    : {}", account.seed);
         println!("status  : {}", account_status(&account));
+        println!(
+            "group   : {}",
+            account.group.unwrap_or_else(|| "-".to_string())
+        );
         println!("profile : {}", account.profile_path.display());
         println!(
             "region  : {}",
@@ -273,10 +302,11 @@ fn print_account_list(accounts: Vec<cloak_core::Account>, json: bool) -> Result<
     } else {
         for account in accounts {
             println!(
-                "{}\tseed {}\tstatus {}\tregion {}\tlocale {}\tproxy {}",
+                "{}\tseed {}\tstatus {}\tgroup {}\tregion {}\tlocale {}\tproxy {}",
                 account.name,
                 account.seed,
                 account_status(&account),
+                account.group.unwrap_or_else(|| "-".to_string()),
                 account.region.unwrap_or_else(|| "-".to_string()),
                 if account.locale_enabled { "on" } else { "off" },
                 account.proxy_display

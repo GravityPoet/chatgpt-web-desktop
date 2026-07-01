@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Cloak Picker",
+        "title": "Cloak 账号管理",
         "width": 920,
         "height": 620,
         "minWidth": 760,

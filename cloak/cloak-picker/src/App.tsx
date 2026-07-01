@@ -1,9 +1,12 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
-  AlertTriangle,
-  Archive,
   ArchiveRestore,
   CalendarClock,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Folder,
+  GripVertical,
   Globe2,
   KeyRound,
   Loader2,
@@ -17,7 +20,7 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
 
 type Account = {
   name: string;
@@ -26,6 +29,7 @@ type Account = {
   archived: boolean;
   trashed: boolean;
   seed: string;
+  group: string | null;
   region: string | null;
   locale_enabled: boolean;
   proxy_display: string;
@@ -63,15 +67,40 @@ type DialogState =
   | { kind: "rename"; account: Account; value: string }
   | { kind: "proxy"; account: Account; value: string }
   | { kind: "region"; account: Account; value: string }
-  | { kind: "delete"; account: Account };
+  | { kind: "group"; account: Account; value: string }
+  | { kind: "delete"; account: Account }
+  | { kind: "permanentDelete"; account: Account };
 
 const emptyAccounts: Account[] = [];
-type AccountView = "active" | "archived" | "trash";
+type AccountView = "active" | "trash";
+const allGroupsValue = "__all__";
+const allGroupsLabel = "全部";
+const ungroupedLabel = "未分组";
+const commonGroups = ["codex", "antigravity", "claude"];
+const groupOrderStorageKey = "cloak-picker.groupOrder.v1";
+const collapsedGroupsStorageKey = "cloak-picker.collapsedGroups.v1";
+
+type GroupOption = {
+  label: string;
+  value: string;
+};
+
+type GroupFilter = GroupOption & {
+  count: number;
+};
 
 export default function App() {
   const [accounts, setAccounts] = useState<Account[]>(emptyAccounts);
   const [accountView, setAccountView] = useState<AccountView>("active");
   const [selectedName, setSelectedName] = useState<string>("");
+  const [selectedGroup, setSelectedGroup] = useState<string>(allGroupsValue);
+  const [draggingAccountName, setDraggingAccountName] = useState<string>("");
+  const [draggingGroupLabel, setDraggingGroupLabel] = useState<string>("");
+  const [dropTargetGroup, setDropTargetGroup] = useState<string>("");
+  const [groupOrder, setGroupOrder] = useState<string[]>(() => readStoredStringArray(groupOrderStorageKey));
+  const [collapsedGroups, setCollapsedGroups] = useState<string[]>(() =>
+    readStoredStringArray(collapsedGroupsStorageKey),
+  );
   const [busy, setBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
   const [error, setError] = useState<string>("");
@@ -79,15 +108,24 @@ export default function App() {
   const [plan, setPlan] = useState<LaunchPlan | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
 
-  const selected = useMemo(
-    () => accounts.find((account) => account.name === selectedName) ?? accounts[0] ?? null,
-    [accounts, selectedName],
+  const groupFilters = useMemo(() => buildGroupFilters(accounts, groupOrder), [accounts, groupOrder]);
+  const visibleAccounts = useMemo(
+    () =>
+      selectedGroup === allGroupsValue
+        ? accounts
+        : accounts.filter((account) => accountGroupLabel(account) === selectedGroup),
+    [accounts, selectedGroup],
   );
+  const selected = useMemo(
+    () => visibleAccounts.find((account) => account.name === selectedName) ?? visibleAccounts[0] ?? null,
+    [visibleAccounts, selectedName],
+  );
+  const groupedAccounts = useMemo(() => orderAccountGroups(groupAccounts(visibleAccounts), groupOrder), [visibleAccounts, groupOrder]);
+  const groupOptions = useMemo(() => buildGroupOptions(accounts), [accounts]);
 
   async function refresh(preferredName?: string, view: AccountView = accountView) {
     setError("");
-    const command =
-      view === "archived" ? "list_archived_accounts" : view === "trash" ? "list_trashed_accounts" : "list_accounts";
+    const command = view === "trash" ? "list_trashed_accounts" : "list_accounts";
     const next = await call<Account[]>(command);
     setAccounts(next);
     setSelectedName((current) => {
@@ -116,6 +154,21 @@ export default function App() {
   useEffect(() => {
     void run(() => refresh(undefined, accountView));
   }, [accountView]);
+
+  useEffect(() => {
+    if (selectedGroup === allGroupsValue) return;
+    if (!groupFilters.some((group) => group.value === selectedGroup)) {
+      setSelectedGroup(allGroupsValue);
+    }
+  }, [groupFilters, selectedGroup]);
+
+  useEffect(() => {
+    writeStoredStringArray(groupOrderStorageKey, groupOrder);
+  }, [groupOrder]);
+
+  useEffect(() => {
+    writeStoredStringArray(collapsedGroupsStorageKey, collapsedGroups);
+  }, [collapsedGroups]);
 
   useEffect(() => {
     if (!error) return;
@@ -163,6 +216,11 @@ export default function App() {
       return;
     }
 
+    if (dialog.kind === "permanentDelete") {
+      await confirmPermanentDeleteAccount(dialog.account);
+      return;
+    }
+
     const value = dialog.value.trim();
     if (dialog.kind === "create") {
       if (!value) return;
@@ -204,6 +262,11 @@ export default function App() {
       return;
     }
 
+    if (dialog.kind === "group") {
+      await assignAccountGroup(dialog.account, value || null, true);
+      return;
+    }
+
     const updated = await run(() =>
       call<Account>("set_region", {
         name: dialog.account.name,
@@ -222,6 +285,108 @@ export default function App() {
     setDialog({ kind: "create", value: "" });
   }
 
+  async function assignAccountGroup(account: Account, value: string | null, closeDialog: boolean) {
+    const nextGroup = value?.trim() || null;
+    const currentGroup = account.group?.trim() || null;
+    if (currentGroup === nextGroup) {
+      if (closeDialog) setDialog(null);
+      return;
+    }
+
+    const updated = await run(() =>
+      call<Account>("set_group", {
+        name: account.name,
+        value: nextGroup,
+      }),
+    );
+    if (!updated) return;
+    if (closeDialog) setDialog(null);
+    await refresh(updated.name);
+  }
+
+  function startAccountDrag(event: DragEvent<HTMLButtonElement>, account: Account) {
+    if (account.trashed) return;
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", account.name);
+    setDraggingAccountName(account.name);
+    setSelectedName(account.name);
+  }
+
+  function allowGroupDrop(event: DragEvent<HTMLElement>, groupLabel: string) {
+    if (!draggingAccountName) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDropTargetGroup(groupLabel);
+  }
+
+  async function dropAccountOnGroup(event: DragEvent<HTMLElement>, groupLabel: string) {
+    event.preventDefault();
+    const accountName = event.dataTransfer.getData("text/plain") || draggingAccountName;
+    setDraggingAccountName("");
+    setDropTargetGroup("");
+    const account = accounts.find((item) => item.name === accountName);
+    if (!account) return;
+    await assignAccountGroup(account, groupLabel === ungroupedLabel ? null : groupLabel, false);
+    setSelectedGroup(groupLabel);
+  }
+
+  function startGroupDrag(event: DragEvent<HTMLElement>, group: GroupFilter) {
+    if (group.value === allGroupsValue) return;
+    event.stopPropagation();
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("application/x-cloak-group", group.label);
+    setDraggingGroupLabel(group.label);
+  }
+
+  function allowGroupReorder(event: DragEvent<HTMLElement>, group: GroupFilter) {
+    if (!draggingGroupLabel || group.value === allGroupsValue) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    setDropTargetGroup(group.label);
+  }
+
+  function dropGroupOnGroup(event: DragEvent<HTMLElement>, group: GroupFilter) {
+    event.preventDefault();
+    if (!draggingGroupLabel || group.value === allGroupsValue) return;
+    setGroupOrder((current) => reorderGroupLabels(current, groupFilters, draggingGroupLabel, group.label));
+    setDraggingGroupLabel("");
+    setDropTargetGroup("");
+  }
+
+  function handleGroupFilterClick(group: GroupFilter) {
+    if (group.value === allGroupsValue && selectedGroup === allGroupsValue) {
+      toggleAllGroupsCollapsed();
+      return;
+    }
+    setSelectedGroup(group.value);
+  }
+
+  function moveGroupFilter(group: GroupFilter, direction: -1 | 1) {
+    if (group.value === allGroupsValue) return;
+    setGroupOrder((current) => moveGroupLabel(current, groupFilters, group.label, direction));
+  }
+
+  function toggleGroupCollapse(groupLabel: string) {
+    setCollapsedGroups((current) => toggleStringInArray(current, groupLabel));
+  }
+
+  function toggleAllGroupsCollapsed() {
+    const labels = groupedAccounts.map((group) => group.label);
+    if (labels.length === 0) return;
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      const allCollapsed = labels.every((label) => next.has(label));
+      for (const label of labels) {
+        if (allCollapsed) {
+          next.delete(label);
+        } else {
+          next.add(label);
+        }
+      }
+      return [...next];
+    });
+  }
+
   async function toggleLocale(account: Account) {
     const updated = await run(() => call<Account>("toggle_locale", { name: account.name }));
     if (updated) await refresh(updated.name);
@@ -232,7 +397,7 @@ export default function App() {
     const checked = await runFullPreflight(account);
     if (!checked) return;
     if (checked.privacy_failures.length > 0) {
-      setError("完整预检未通过，已停止启动。");
+      setError("启动检查未通过，已停止启动。");
       return;
     }
     await run(() => call<void>("launch_account", { name: account.name }));
@@ -255,18 +420,6 @@ export default function App() {
     }
   }
 
-  async function setArchived(account: Account, archived: boolean) {
-    const updated = await run(() => call<Account>("archive_account", { name: account.name, archived }));
-    if (!updated) return;
-    setPlan(null);
-    if (archived) {
-      await refresh(undefined, "active");
-    } else {
-      setAccountView("active");
-      await refresh(updated.name, "active");
-    }
-  }
-
   async function confirmDeleteAccount(account: Account) {
     setBusy(true);
     setError("");
@@ -285,34 +438,44 @@ export default function App() {
     }
   }
 
+  async function confirmPermanentDeleteAccount(account: Account) {
+    setBusy(true);
+    setError("");
+    setDialogError("");
+    try {
+      await call<void>("permanently_delete_account", { name: account.name });
+      setDialog(null);
+      setPlan(null);
+      await refresh(undefined, "trash");
+    } catch (caught) {
+      const message = errorMessage(caught);
+      setDialogError(message);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function restoreAccount(account: Account) {
     const restored = await run(() => call<Account>("restore_account", { name: account.name }));
     if (!restored) return;
     setPlan(null);
-    const nextView = restored.archived ? "archived" : "active";
-    setAccountView(nextView);
-    await refresh(restored.name, nextView);
+    setAccountView("active");
+    await refresh(restored.name, "active");
   }
 
-  const viewLabel = accountView === "archived" ? "archived" : accountView === "trash" ? "trashed" : "active";
-  const accountCountLabel = `${accounts.length} ${viewLabel} account${accounts.length === 1 ? "" : "s"}`;
-  const emptyTitle =
-    accountView === "archived" ? "暂无归档账号" : accountView === "trash" ? "回收站为空" : "暂无活跃账号";
+  const selectedGroupLabel = selectedGroup === allGroupsValue ? "" : `${selectedGroup} 分组 · `;
+  const accountCountLabel =
+    accountView === "trash"
+      ? `${selectedGroupLabel}${visibleAccounts.length} 个回收站账号`
+      : `${selectedGroupLabel}${visibleAccounts.length} 个活跃账号`;
+  const emptyTitle = accountView === "trash" ? "回收站为空" : "暂无活跃账号";
   const emptyAction = accountView === "active" ? "新建账号" : "查看活跃";
   const proxyLabel = selected ? middleTruncate(selected.proxy_display, 48) : "";
-  const planHasGeo = Boolean(plan?.geo.exit_ip && plan.geo.timezone);
-  const planStatusLabel = planLoading
-    ? "检查中"
-    : plan?.privacy_failures.length
-      ? planHasGeo
-        ? "完整预检有警告"
-        : "隐私门禁有警告"
-      : plan
-        ? planHasGeo
-          ? "完整预检通过"
-          : "快速参数已就绪"
-        : "启动参数未解析";
-  const statusLabel = selected?.trashed ? "已移入回收站" : selected?.archived ? "已归档" : "活跃";
+  const statusLabel = selected?.trashed ? "已移入回收站" : "活跃";
+  const reorderableGroupLabels = groupFilters
+    .filter((group) => group.value !== allGroupsValue)
+    .map((group) => group.label);
 
   return (
     <main className="shell">
@@ -320,7 +483,7 @@ export default function App() {
         <div className="brand">
           <span className="mark" />
           <div>
-            <strong>Cloak Picker</strong>
+            <strong>Cloak 账号管理</strong>
             <span>{accountCountLabel}</span>
           </div>
         </div>
@@ -338,7 +501,7 @@ export default function App() {
       <section className="workspace">
         <aside className="sidebar">
           <div className="sidebarHeader">
-            <span>Accounts</span>
+            <span>账号</span>
             {busy ? <Loader2 className="spin" size={14} /> : null}
           </div>
           <div className="viewSwitch" role="tablist" aria-label="账号视图">
@@ -352,15 +515,6 @@ export default function App() {
               活跃
             </button>
             <button
-              className={accountView === "archived" ? "active" : ""}
-              type="button"
-              role="tab"
-              aria-selected={accountView === "archived"}
-              onClick={() => setAccountView("archived")}
-            >
-              归档
-            </button>
-            <button
               className={accountView === "trash" ? "active" : ""}
               type="button"
               role="tab"
@@ -371,10 +525,91 @@ export default function App() {
             </button>
           </div>
 
+          <div className="groupFilter" aria-label="分组筛选">
+            {groupFilters.map((group) => {
+              const isAll = group.value === allGroupsValue;
+              const isActive = selectedGroup === group.value;
+              const groupIndex = reorderableGroupLabels.indexOf(group.label);
+              const canMoveBackward = groupIndex > 0;
+              const canMoveForward = groupIndex >= 0 && groupIndex < reorderableGroupLabels.length - 1;
+              return (
+                <div
+                  className={`groupFilterButton ${isActive ? "active" : ""} ${dropTargetGroup === group.label ? "dropTarget" : ""}`}
+                  key={group.value}
+                  onDragEnd={() => {
+                    setDraggingGroupLabel("");
+                    setDropTargetGroup("");
+                  }}
+                  onDragLeave={() => setDropTargetGroup((current) => (current === group.label ? "" : current))}
+                  onDragOver={(event) => {
+                    if (draggingGroupLabel) {
+                      allowGroupReorder(event, group);
+                    } else if (!isAll) {
+                      allowGroupDrop(event, group.label);
+                    }
+                  }}
+                  onDrop={(event) => {
+                    if (draggingGroupLabel) {
+                      dropGroupOnGroup(event, group);
+                    } else if (!isAll) {
+                      void dropAccountOnGroup(event, group.label);
+                    }
+                  }}
+                >
+                  <button
+                    className="groupFilterSelect"
+                    type="button"
+                    aria-pressed={isActive}
+                    title={isAll ? "再次点击可折叠或展开全部分组" : "点击查看该分组；拖动抓手或点箭头调整顺序"}
+                    onClick={() => handleGroupFilterClick(group)}
+                  >
+                    {isAll ? null : (
+                      <span
+                        className="groupDragHandle"
+                        draggable
+                        title="拖动调整分组顺序"
+                        onDragStart={(event) => startGroupDrag(event, group)}
+                      >
+                        <GripVertical size={12} />
+                      </span>
+                    )}
+                    {isAll ? null : <Folder className="groupIcon" size={12} />}
+                    <span className="groupFilterLabel">{group.label}</span>
+                    <small>{group.count}</small>
+                  </button>
+                  {isAll ? null : (
+                    <span className="groupMoveControls" aria-label={`${group.label} 分组排序`}>
+                      <button
+                        className="groupMoveButton"
+                        type="button"
+                        aria-label={`${group.label} 前移`}
+                        title="前移分组"
+                        disabled={!canMoveBackward}
+                        onClick={() => moveGroupFilter(group, -1)}
+                      >
+                        <ChevronLeft size={12} />
+                      </button>
+                      <button
+                        className="groupMoveButton"
+                        type="button"
+                        aria-label={`${group.label} 后移`}
+                        title="后移分组"
+                        disabled={!canMoveForward}
+                        onClick={() => moveGroupFilter(group, 1)}
+                      >
+                        <ChevronRight size={12} />
+                      </button>
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+
           <div className="accountList">
-            {accounts.length === 0 ? (
+            {visibleAccounts.length === 0 ? (
               <div className="emptyState">
-                {accountView === "active" ? <ShieldCheck size={24} /> : accountView === "trash" ? <Trash2 size={24} /> : <Archive size={24} />}
+                {accountView === "active" ? <ShieldCheck size={24} /> : <Trash2 size={24} />}
                 <strong>{emptyTitle}</strong>
                 <button
                   className="subtleButton"
@@ -385,33 +620,24 @@ export default function App() {
                 </button>
               </div>
             ) : (
-              accounts.map((account) => (
-                <button
-                  className={`accountRow ${account.name === selected?.name ? "selected" : ""}`}
-                  key={account.name}
-                  onClick={() => setSelectedName(account.name)}
-                  onDoubleClick={() => {
-                    if (account.trashed) {
-                      void restoreAccount(account);
-                    } else {
-                      void launchAccount(account);
-                    }
-                  }}
-                >
-                  <span className="accountRail" />
-                  <span className="accountMain">
-                    <span className="accountTitle">
-                      <strong title={account.name}>{middleTruncate(account.name, 34)}</strong>
-                      <code>{account.seed}</code>
-                    </span>
-                    <span className="accountMeta">
-                      <StatusDot active={account.has_proxy} />
-                      <span>{account.region ?? "未设区域"}</span>
-                      <span>{account.locale_enabled ? "语言开" : "语言关"}</span>
-                      <span>{middleTruncate(account.proxy_display, 30)}</span>
-                    </span>
-                  </span>
-                </button>
+              groupedAccounts.map((group) => (
+                <AccountGroupSection
+                  collapsed={selectedGroup === allGroupsValue && collapsedGroups.includes(group.label)}
+                  canCollapse={selectedGroup === allGroupsValue}
+                  dropTarget={dropTargetGroup === group.label}
+                  group={group}
+                  key={group.label}
+                  onAllowDrop={allowGroupDrop}
+                  onDropAccount={dropAccountOnGroup}
+                  onLaunchAccount={launchAccount}
+                  onRestoreAccount={restoreAccount}
+                  onSelectAccount={setSelectedName}
+                  onStartAccountDrag={startAccountDrag}
+                  onToggleCollapse={toggleGroupCollapse}
+                  selectedName={selected?.name ?? ""}
+                  setDraggingAccountName={setDraggingAccountName}
+                  setDropTargetGroup={setDropTargetGroup}
+                />
               ))
             )}
           </div>
@@ -422,7 +648,7 @@ export default function App() {
             <>
               <header className="detailHeader">
                 <div className="titleBlock">
-                  <span className="eyebrow">Isolated identity</span>
+                  <span className="eyebrow">隔离身份</span>
                   <h1 title={selected.name}>{middleTruncate(selected.name, 44)}</h1>
                 </div>
                 {selected.trashed ? (
@@ -439,25 +665,16 @@ export default function App() {
               </header>
 
               <div className="detailScroll">
-                <div className={`statusStrip ${plan?.privacy_failures.length || !plan ? "warn" : "ok"}`}>
-                  {planLoading ? <Loader2 className="spin" size={15} /> : plan?.privacy_failures.length || !plan ? <AlertTriangle size={15} /> : <ShieldCheck size={15} />}
-                  <span>{planStatusLabel}</span>
-                  {!selected.trashed ? (
-                    <button className="stripButton" disabled={busy || planLoading} onClick={() => void runFullPreflight(selected)}>
-                      完整检查
-                    </button>
-                  ) : null}
-                </div>
-
                 <section className="inspector">
-                  <InspectorGroup title="Identity">
+                  <InspectorGroup title="身份">
                     <InfoRow icon={<KeyRound size={15} />} label="指纹" value={selected.seed} mono />
+                    <InfoRow icon={<Folder size={15} />} label="分组" value={accountGroupLabel(selected)} />
                     <InfoRow icon={<CalendarClock size={15} />} label="创建时间" value={formatCreatedAt(selected.created_at)} />
-                    <InfoRow icon={selected.trashed ? <Trash2 size={15} /> : selected.archived ? <Archive size={15} /> : <ShieldCheck size={15} />} label="状态" value={statusLabel} />
-                    <InfoRow label="Profile" value={selected.profile_path} mono />
+                    <InfoRow icon={selected.trashed ? <Trash2 size={15} /> : <ShieldCheck size={15} />} label="状态" value={statusLabel} />
+                    <InfoRow label="账号目录" value={selected.profile_path} mono />
                   </InspectorGroup>
 
-                  <InspectorGroup title="Network">
+                  <InspectorGroup title="网络">
                     <InfoRow icon={<Tag size={15} />} label="区域" value={selected.region ?? "未设置"} />
                     <InfoRow icon={<Globe2 size={15} />} label="语言" value={selected.locale_enabled ? "跟随出口" : "关"} />
                     <InfoRow icon={<Network size={15} />} label="代理" value={proxyLabel} />
@@ -465,10 +682,10 @@ export default function App() {
                     <InfoRow label="时区" value={plan?.geo.timezone ?? "启动时解析"} />
                   </InspectorGroup>
 
-                  <InspectorGroup title="Runtime">
+                  <InspectorGroup title="运行">
                     <InfoRow label="真实插件" value={plan ? extensionSummary(plan.extra_extension_paths) : "未解析"} />
                     <InfoRow label="自测插件" value={plan ? extensionSummary(plan.selftest_extension_paths) : "未解析"} />
-                    <InfoRow label="Browser" value={plan?.browser_binary ?? "未解析"} mono />
+                    <InfoRow label="浏览器" value={plan?.browser_binary ?? "未解析"} mono />
                   </InspectorGroup>
                 </section>
 
@@ -481,7 +698,7 @@ export default function App() {
                 ) : null}
 
                 <details className="argv">
-                  <summary>argv</summary>
+                  <summary>启动参数</summary>
                   <code>{[plan?.browser_binary, ...(plan?.argv ?? [])].filter(Boolean).join(" ")}</code>
                 </details>
               </div>
@@ -489,20 +706,18 @@ export default function App() {
               <footer className="detailFooter">
                 <div className="actionBar">
                   {selected.trashed ? (
-                    <ActionButton icon={<ArchiveRestore size={15} />} label="恢复账号" onClick={() => void restoreAccount(selected)} />
+                    <>
+                      <ActionButton icon={<ArchiveRestore size={15} />} label="恢复账号" onClick={() => void restoreAccount(selected)} />
+                      <ActionButton danger icon={<Trash2 size={15} />} label="彻底删除" onClick={() => setDialog({ kind: "permanentDelete", account: selected })} />
+                    </>
                   ) : (
                     <>
-                      <ActionButton icon={<ShieldCheck size={15} />} label="完整检查" onClick={() => void runFullPreflight(selected)} />
                       <ActionButton icon={<Network size={15} />} label="代理" onClick={() => setDialog({ kind: "proxy", account: selected, value: "" })} />
                       <ActionButton icon={<Tag size={15} />} label="区域" onClick={() => setDialog({ kind: "region", account: selected, value: selected.region ?? "" })} />
+                      <ActionButton icon={<Folder size={15} />} label="分组" onClick={() => setDialog({ kind: "group", account: selected, value: selected.group ?? "" })} />
                       <ActionButton icon={<Globe2 size={15} />} label={selected.locale_enabled ? "关闭语言" : "开启语言"} onClick={() => void toggleLocale(selected)} />
                       <ActionButton icon={<Pencil size={15} />} label="重命名" onClick={() => setDialog({ kind: "rename", account: selected, value: selected.name })} />
-                      <ActionButton
-                        icon={selected.archived ? <ArchiveRestore size={15} /> : <Archive size={15} />}
-                        label={selected.archived ? "恢复" : "归档"}
-                        onClick={() => void setArchived(selected, !selected.archived)}
-                      />
-                      <ActionButton danger icon={<Trash2 size={15} />} label="移入回收站" onClick={() => setDialog({ kind: "delete", account: selected })} />
+                      <ActionButton danger icon={<Trash2 size={15} />} label="删除" onClick={() => setDialog({ kind: "delete", account: selected })} />
                     </>
                   )}
                 </div>
@@ -532,10 +747,109 @@ export default function App() {
             setDialog(null);
           }}
           onConfirmDelete={confirmDeleteAccount}
+          onConfirmPermanentDelete={confirmPermanentDeleteAccount}
+          groupOptions={groupOptions}
+          onQuickGroup={(account, value) => void assignAccountGroup(account, value || null, true)}
           onSubmit={submitDialog}
         />
       ) : null}
     </main>
+  );
+}
+
+function AccountGroupSection({
+  canCollapse,
+  collapsed,
+  dropTarget,
+  group,
+  selectedName,
+  onAllowDrop,
+  onDropAccount,
+  onLaunchAccount,
+  onRestoreAccount,
+  onSelectAccount,
+  onStartAccountDrag,
+  onToggleCollapse,
+  setDraggingAccountName,
+  setDropTargetGroup,
+}: {
+  canCollapse: boolean;
+  collapsed: boolean;
+  dropTarget: boolean;
+  group: AccountGroup;
+  selectedName: string;
+  onAllowDrop: (event: DragEvent<HTMLElement>, groupLabel: string) => void;
+  onDropAccount: (event: DragEvent<HTMLElement>, groupLabel: string) => Promise<void>;
+  onLaunchAccount: (account: Account) => Promise<void>;
+  onRestoreAccount: (account: Account) => Promise<void>;
+  onSelectAccount: (name: string) => void;
+  onStartAccountDrag: (event: DragEvent<HTMLButtonElement>, account: Account) => void;
+  onToggleCollapse: (groupLabel: string) => void;
+  setDraggingAccountName: (name: string) => void;
+  setDropTargetGroup: (groupLabel: string) => void;
+}) {
+  return (
+    <section
+      className={`accountGroup ${dropTarget ? "dropTarget" : ""} ${collapsed ? "collapsed" : ""}`}
+      onDragLeave={() => setDropTargetGroup("")}
+      onDragOver={(event) => onAllowDrop(event, group.label)}
+      onDrop={(event) => void onDropAccount(event, group.label)}
+    >
+      <div className="accountGroupHeader">
+        <button
+          className="accountGroupName"
+          type="button"
+          title={canCollapse ? "点击折叠或展开该分组" : group.label}
+          onClick={() => {
+            if (canCollapse) onToggleCollapse(group.label);
+          }}
+        >
+          {canCollapse ? (
+            collapsed ? (
+              <ChevronRight className="collapseIcon" size={13} />
+            ) : (
+              <ChevronDown className="collapseIcon" size={13} />
+            )
+          ) : (
+            <Folder size={13} />
+          )}
+          <strong>{middleTruncate(group.label, 28)}</strong>
+        </button>
+        <span className="accountGroupCount">{group.accounts.length}</span>
+      </div>
+      {collapsed
+        ? null
+        : group.accounts.map((account) => (
+            <button
+              className={`accountRow ${account.name === selectedName ? "selected" : ""}`}
+              draggable={!account.trashed}
+              key={account.name}
+              title={account.trashed ? account.name : `${account.name}｜拖动可调整分组`}
+              onClick={() => onSelectAccount(account.name)}
+              onDoubleClick={() => {
+                if (account.trashed) {
+                  void onRestoreAccount(account);
+                } else {
+                  void onLaunchAccount(account);
+                }
+              }}
+              onDragEnd={() => {
+                setDraggingAccountName("");
+                setDropTargetGroup("");
+              }}
+              onDragStart={(event) => onStartAccountDrag(event, account)}
+            >
+              <span className="accountRail" />
+              <span className="accountMain">
+                <span className="accountTitle">
+                  <GripVertical className="dragHandle" size={14} />
+                  <strong title={account.name}>{middleTruncate(account.name, 34)}</strong>
+                  <code>{account.seed}</code>
+                </span>
+              </span>
+            </button>
+          ))}
+    </section>
   );
 }
 
@@ -546,6 +860,9 @@ function EditorDialog({
   onChange,
   onClose,
   onConfirmDelete,
+  onConfirmPermanentDelete,
+  groupOptions,
+  onQuickGroup,
   onSubmit,
 }: {
   dialog: DialogState;
@@ -554,6 +871,9 @@ function EditorDialog({
   onChange: (next: DialogState | null) => void;
   onClose: () => void;
   onConfirmDelete: (account: Account) => void;
+  onConfirmPermanentDelete: (account: Account) => void;
+  groupOptions: GroupOption[];
+  onQuickGroup: (account: Account, value: string) => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
 }) {
   if (dialog.kind === "delete") {
@@ -563,17 +883,42 @@ function EditorDialog({
           <button className="modalClose" type="button" aria-label="关闭" onClick={onClose}>
             <X size={15} />
           </button>
-          <h2 title={`移入回收站「${dialog.account.name}」？`}>
-            移入回收站「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
+          <h2 title={`删除「${dialog.account.name}」？`}>
+            删除「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
           </h2>
-          <p>Profile、cookie 和登录状态会保留，可在回收站恢复。</p>
+          <p>账号会移入回收站，可恢复；账号目录、登录数据和缓存会保留，不会立即释放磁盘。</p>
           {error ? <p className="modalError">{error}</p> : null}
           <div className="modalActions">
             <button autoFocus className="secondaryButton" disabled={busy} type="button" onClick={onClose}>
               取消
             </button>
             <button className="dangerButton" disabled={busy} type="button" onClick={() => onConfirmDelete(dialog.account)}>
-              {busy ? "移动中..." : "移入回收站"}
+              {busy ? "删除中..." : "删除"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (dialog.kind === "permanentDelete") {
+    return (
+      <div className="modalBackdrop">
+        <div className="modal" role="alertdialog" aria-modal="true">
+          <button className="modalClose" type="button" aria-label="关闭" onClick={onClose}>
+            <X size={15} />
+          </button>
+          <h2 title={`彻底删除「${dialog.account.name}」？`}>
+            彻底删除「<span className="dialogAccountName">{middleTruncate(dialog.account.name, 28)}</span>」？
+          </h2>
+          <p>将永久删除该账号目录、登录数据和缓存。此操作不可恢复。</p>
+          {error ? <p className="modalError">{error}</p> : null}
+          <div className="modalActions">
+            <button autoFocus className="secondaryButton" disabled={busy} type="button" onClick={onClose}>
+              取消
+            </button>
+            <button className="dangerButton" disabled={busy} type="button" onClick={() => onConfirmPermanentDelete(dialog.account)}>
+              {busy ? "删除中..." : "彻底删除"}
             </button>
           </div>
         </div>
@@ -589,6 +934,28 @@ function EditorDialog({
           <X size={15} />
         </button>
         <h2>{config.title}</h2>
+        {config.description ? <p>{config.description}</p> : null}
+        {dialog.kind === "group" ? (
+          <div className="groupPicker" aria-label="可选分组">
+            {groupOptions.map((option) => {
+              const activeValue = dialog.value.trim();
+              const isActive = option.value === activeValue || (!option.value && !activeValue);
+              return (
+                <button
+                  className={`groupOption ${isActive ? "active" : ""}`}
+                  disabled={busy}
+                  key={option.label}
+                  type="button"
+                  aria-pressed={isActive}
+                  onClick={() => onQuickGroup(dialog.account, option.value)}
+                >
+                  <Folder size={13} />
+                  <span>{option.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        ) : null}
         <label className="field">
           <span>{config.label}</span>
           <input
@@ -612,7 +979,13 @@ function EditorDialog({
   );
 }
 
-function dialogConfig(dialog: Exclude<DialogState, { kind: "delete" }>) {
+function dialogConfig(dialog: Exclude<DialogState, { kind: "delete" } | { kind: "permanentDelete" }>): {
+  title: string;
+  label: string;
+  placeholder: string;
+  action: string;
+  description?: string;
+} {
   switch (dialog.kind) {
     case "create":
       return { title: "新建账号", label: "名称", placeholder: "work_01", action: "创建" };
@@ -622,11 +995,15 @@ function dialogConfig(dialog: Exclude<DialogState, { kind: "delete" }>) {
     }
     case "proxy": {
       const accountName = middleTruncate(dialog.account.name, 28);
-      return { title: `代理「${accountName}」`, label: "代理 URL", placeholder: "socks5://user:pass@host:1080", action: dialog.account.has_proxy ? "保存 / 清除" : "保存" };
+      return { title: `代理「${accountName}」`, label: "代理地址", placeholder: "socks5://user:pass@host:1080", action: dialog.account.has_proxy ? "保存 / 清除" : "保存" };
     }
     case "region": {
       const accountName = middleTruncate(dialog.account.name, 28);
-      return { title: `区域「${accountName}」`, label: "区域标签", placeholder: "US / JP / Tokyo", action: dialog.account.region ? "保存 / 清除" : "保存" };
+      return { title: `区域「${accountName}」`, label: "区域代码", placeholder: "US / JP / Tokyo", action: dialog.account.region ? "保存 / 清除" : "保存" };
+    }
+    case "group": {
+      const accountName = middleTruncate(dialog.account.name, 28);
+      return { title: `分组「${accountName}」`, label: "分组名称", placeholder: "codex / antigravity / claude", action: dialog.account.group ? "保存 / 清除" : "保存" };
     }
   }
 }
@@ -691,15 +1068,138 @@ function InfoRow({ icon, label, value, mono }: { icon?: ReactNode; label: string
   );
 }
 
-function StatusDot({ active }: { active: boolean }) {
-  return <span className={`statusDot ${active ? "active" : ""}`} />;
-}
-
 async function call<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (shouldUseMockTauri()) {
     return mockInvoke<T>(command, args);
   }
   return invoke<T>(command, args);
+}
+
+type AccountGroup = {
+  label: string;
+  accounts: Account[];
+};
+
+function groupAccounts(accounts: Account[]): AccountGroup[] {
+  const groups: AccountGroup[] = [];
+  const indexes = new Map<string, number>();
+  for (const account of accounts) {
+    const label = accountGroupLabel(account);
+    const existing = indexes.get(label);
+    if (existing === undefined) {
+      indexes.set(label, groups.length);
+      groups.push({ label, accounts: [account] });
+    } else {
+      groups[existing].accounts.push(account);
+    }
+  }
+  return groups;
+}
+
+function buildGroupOptions(accounts: Account[]): GroupOption[] {
+  const options: GroupOption[] = [{ label: ungroupedLabel, value: "" }];
+  const seen = new Set<string>([ungroupedLabel]);
+  for (const account of accounts) {
+    const label = account.group?.trim();
+    if (!label || seen.has(label)) continue;
+    seen.add(label);
+    options.push({ label, value: label });
+  }
+  for (const label of commonGroups) {
+    if (seen.has(label)) continue;
+    seen.add(label);
+    options.push({ label, value: label });
+  }
+  return options;
+}
+
+function orderAccountGroups(groups: AccountGroup[], groupOrder: string[]): AccountGroup[] {
+  const labels = orderGroupLabels(
+    groups.map((group) => group.label),
+    groupOrder,
+  );
+  const groupsByLabel = new Map(groups.map((group) => [group.label, group]));
+  return labels.map((label) => groupsByLabel.get(label)).filter((group): group is AccountGroup => Boolean(group));
+}
+
+function buildGroupFilters(accounts: Account[], groupOrder: string[]): GroupFilter[] {
+  const groups = groupAccounts(accounts);
+  const counts = new Map(groups.map((group) => [group.label, group.accounts.length]));
+  for (const label of commonGroups) {
+    if (!counts.has(label)) counts.set(label, 0);
+  }
+  const labels = orderGroupLabels([...counts.keys()], groupOrder);
+  const filters: GroupFilter[] = [{ label: allGroupsLabel, value: allGroupsValue, count: accounts.length }];
+  for (const label of labels) {
+    filters.push({ label, value: label, count: counts.get(label) ?? 0 });
+  }
+  return filters;
+}
+
+function orderGroupLabels(labels: string[], groupOrder: string[]): string[] {
+  const known = new Set(labels);
+  const ordered = groupOrder.filter((label) => known.has(label));
+  const remaining = labels.filter((label) => !ordered.includes(label));
+  return [...ordered, ...remaining];
+}
+
+function reorderGroupLabels(currentOrder: string[], filters: GroupFilter[], source: string, target: string): string[] {
+  if (!source || source === target || target === allGroupsLabel) return currentOrder;
+  const labels = orderGroupLabels(
+    filters.filter((group) => group.value !== allGroupsValue).map((group) => group.label),
+    currentOrder,
+  ).filter((label) => label !== source);
+  const targetIndex = labels.indexOf(target);
+  labels.splice(targetIndex >= 0 ? targetIndex : labels.length, 0, source);
+  return labels;
+}
+
+function moveGroupLabel(
+  currentOrder: string[],
+  filters: GroupFilter[],
+  source: string,
+  direction: -1 | 1,
+): string[] {
+  if (!source || source === allGroupsLabel) return currentOrder;
+  const labels = orderGroupLabels(
+    filters.filter((group) => group.value !== allGroupsValue).map((group) => group.label),
+    currentOrder,
+  );
+  const sourceIndex = labels.indexOf(source);
+  const targetIndex = sourceIndex + direction;
+  if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= labels.length) return currentOrder;
+  const next = [...labels];
+  const [moved] = next.splice(sourceIndex, 1);
+  next.splice(targetIndex, 0, moved);
+  return next;
+}
+
+function toggleStringInArray(values: string[], value: string): string[] {
+  return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
+}
+
+function readStoredStringArray(key: string): string[] {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function writeStoredStringArray(key: string, values: string[]) {
+  try {
+    window.localStorage.setItem(key, JSON.stringify(values));
+  } catch {
+    // Ignore storage failures; grouping still works for the current session.
+  }
+}
+
+function accountGroupLabel(account: Account) {
+  return account.group?.trim() || ungroupedLabel;
 }
 
 function shouldUseMockTauri() {
@@ -710,19 +1210,21 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
   await new Promise((resolve) => window.setTimeout(resolve, 80));
   const accounts = mockAccounts();
   if (command === "list_accounts") return accounts.filter((account) => !account.archived && !account.trashed) as T;
-  if (command === "list_archived_accounts") return accounts.filter((account) => account.archived && !account.trashed) as T;
-  if (command === "list_trashed_accounts") return accounts.filter((account) => account.trashed) as T;
+  if (command === "list_trashed_accounts") return accounts.filter((account) => account.trashed || account.archived) as T;
   if (command === "launch_dry_run" || command === "launch_preflight") {
     const name = String(args?.name ?? accounts[0].name);
     const account = accounts.find((item) => item.name === name) ?? accounts[0];
     return mockLaunchPlan(account, command === "launch_preflight") as T;
   }
   if (command === "create_account") {
-    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, trashed: false, seed: "68122" } as T;
+    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, trashed: false, seed: "68122", group: null } as T;
   }
   if (command === "rename_account") return { ...accounts[0], name: String(args?.newName ?? "renamed") } as T;
-  if (command === "archive_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), archived: Boolean(args?.archived) } as T;
-  if (command === "restore_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), trashed: false } as T;
+  if (command === "restore_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), archived: false, trashed: false } as T;
+  if (command === "permanently_delete_account") return undefined as T;
+  if (command === "set_group") {
+    return { ...accounts[0], name: String(args?.name ?? accounts[0].name), group: (args?.value as string | null | undefined) ?? null } as T;
+  }
   if (command === "set_proxy" || command === "set_region" || command === "toggle_locale") return accounts[0] as T;
   return undefined as T;
 }
@@ -736,9 +1238,10 @@ function mockAccounts(): Account[] {
       archived: false,
       trashed: false,
       seed: "48366",
+      group: "codex",
       region: null,
       locale_enabled: false,
-      proxy_display: "off (system VPN / direct)",
+      proxy_display: "关",
       has_proxy: false,
     },
     {
@@ -748,9 +1251,10 @@ function mockAccounts(): Account[] {
       archived: false,
       trashed: false,
       seed: "77296",
+      group: "claude",
       region: "JP",
       locale_enabled: true,
-      proxy_display: "off (system VPN / direct)",
+      proxy_display: "关",
       has_proxy: false,
     },
     {
@@ -760,9 +1264,10 @@ function mockAccounts(): Account[] {
       archived: true,
       trashed: false,
       seed: "68098",
+      group: "codex",
       region: "US",
       locale_enabled: false,
-      proxy_display: "socks5://proxy.example.net:1080  (via local SOCKS5 relay)",
+      proxy_display: "socks5://proxy.example.net:1080（经本机 SOCKS5 中继）",
       has_proxy: true,
     },
     {
@@ -772,9 +1277,10 @@ function mockAccounts(): Account[] {
       archived: false,
       trashed: true,
       seed: "51024",
+      group: null,
       region: "NL",
       locale_enabled: false,
-      proxy_display: "off (system VPN / direct)",
+      proxy_display: "关",
       has_proxy: false,
     },
   ];
@@ -859,6 +1365,7 @@ function errorMessage(caught: unknown) {
   const doesNotExistPrefix = "account does not exist: ";
   const runningPrefix = "account is running: ";
   const trashedPrefix = "account is in trash: ";
+  const notTrashedPrefix = "account is not in trash: ";
   if (raw.startsWith(alreadyExistsPrefix)) {
     return `账号已存在：${raw.slice(alreadyExistsPrefix.length)}`;
   }
@@ -866,10 +1373,13 @@ function errorMessage(caught: unknown) {
     return `账号不存在：${raw.slice(doesNotExistPrefix.length)}`;
   }
   if (raw.startsWith(runningPrefix)) {
-    return `账号正在运行：${raw.slice(runningPrefix.length)}。请先关闭这个浏览器窗口，再移动或恢复。`;
+    return `账号正在运行：${raw.slice(runningPrefix.length)}。请先关闭这个浏览器窗口，再删除、恢复或彻底删除。`;
   }
   if (raw.startsWith(trashedPrefix)) {
     return `账号已在回收站：${raw.slice(trashedPrefix.length)}。请先恢复再启动。`;
+  }
+  if (raw.startsWith(notTrashedPrefix)) {
+    return `账号不在回收站：${raw.slice(notTrashedPrefix.length)}。请先删除到回收站，再彻底删除。`;
   }
   if (raw.includes("account name is invalid")) {
     return "名字无效：可用字母、数字、.、@、+、-、_；不能叫 main，不能以 . 开头/结尾，不能含 /、\\ 或连续 ..。";
