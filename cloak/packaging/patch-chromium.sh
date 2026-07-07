@@ -21,7 +21,7 @@ set -euo pipefail
 # again, so re-run after every CloakBrowser upgrade.
 #
 # Note: Chromium is intentionally NOT rebranded. The green ChatGPT identity belongs to the
-# ChatGPT Cloak launcher; the Chromium it drives stays a plain browser so the two are distinct.
+# NoTrace Browser launcher; the Chromium it drives stays a plain browser so the two are distinct.
 
 PLISTBUDDY=/usr/libexec/PlistBuddy
 MIC_DESC="ChatGPT voice input uses the microphone."
@@ -80,4 +80,4 @@ for APP in "${APPS[@]}"; do
   printf 'patched + resigned: %s\n' "$APP"
 done
 
-printf '\ndone. Quit any running Cloak Chromium and relaunch ChatGPT Cloak for the change to take effect.\n'
+printf '\ndone. Quit any running Cloak Chromium and relaunch NoTrace Browser for the change to take effect.\n'

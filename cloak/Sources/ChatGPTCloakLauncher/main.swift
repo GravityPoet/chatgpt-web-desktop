@@ -3,8 +3,8 @@ import Darwin
 import Foundation
 import OSLog
 
-private let appName = "ChatGPT Cloak"
-private let appBundleIdentifier = "local.chatgpt-cloak"
+private let appName = "NoTrace Browser"
+private let appBundleIdentifier = "local.notrace-browser"
 private let chromiumBundleIdentifier = "org.chromium.Chromium"
 private let chatGPTAppURL = "https://chatgpt.com/"
 private let defaultProfileID = "main"
@@ -65,7 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let result = try launcher.launchOrActivate()
             launcherLogger.info("\(result.logMessage, privacy: .public)")
         } catch {
-            presentError(error, title: "ChatGPT Cloak 无法打开 ChatGPT")
+            presentError(error, title: "NoTrace Browser 无法打开 ChatGPT")
         }
     }
 
@@ -74,7 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let launcher = try CloakLauncher()
             try launcher.openFullBrowser()
         } catch {
-            presentError(error, title: "ChatGPT Cloak 无法打开浏览器")
+            presentError(error, title: "NoTrace Browser 无法打开浏览器")
         }
     }
 
@@ -211,6 +211,7 @@ struct CloakLauncher {
     func openFullBrowser() throws {
         try validateChromiumBinary()
         try prepareProfileDirectory()
+        normalizeProfilePreferences()
 
         let process = Process()
         process.executableURL = chromiumBinaryURL
@@ -254,21 +255,29 @@ struct CloakLauncher {
         }
     }
 
-    // Make app-mode launches deterministic: disable session restore and clear the crash flag so a
-    // click always opens a clean ChatGPT window instead of restoring a previously opened full
-    // browser window. Only runs when Preferences already exists (i.e. not the very first launch),
-    // and is only called when no Cloak Chromium is running, so it never races a live process.
+    // Make launches deterministic and safer: disable session restore, clear the crash flag, and
+    // keep HTTPS-Only enabled for this profile before Chromium starts.
     private func normalizeProfilePreferences() {
         let prefsURL = profileDirectoryURL
             .appendingPathComponent("Default", isDirectory: true)
             .appendingPathComponent("Preferences")
 
-        guard
-            let data = try? Data(contentsOf: prefsURL),
-            var root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
-        else {
+        do {
+            try fileManager.createDirectory(
+                at: prefsURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true
+            )
+        } catch {
             return
         }
+
+        var root: [String: Any] = [:]
+        if let data = try? Data(contentsOf: prefsURL),
+           let existing = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            root = existing
+        }
+
+        root["https_only_mode_enabled"] = true
 
         var session = root["session"] as? [String: Any] ?? [:]
         session["restore_on_startup"] = 5  // 5 = open New Tab page; do not restore previous windows
@@ -279,7 +288,7 @@ struct CloakLauncher {
         root["profile"] = profile
 
         if let output = try? JSONSerialization.data(withJSONObject: root) {
-            try? output.write(to: prefsURL)
+            try? output.write(to: prefsURL, options: .atomic)
         }
     }
 
@@ -406,15 +415,15 @@ enum LauncherError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .applicationSupportDirectoryUnavailable:
-            return "无法解析本机 Application Support 目录，暂时不能创建 ChatGPT Cloak 数据目录。"
+            return "无法解析本机 Application Support 目录，暂时不能创建 NoTrace Browser 数据目录。"
         case .chromiumBinaryMissing(let path):
             return "找不到 CloakBrowser Chromium binary。\n\n预期路径：\(path)\n\n请确认 CloakBrowser 已安装：~/.cloakbrowser/current 指向某个 chromium-*，或 ~/.cloakbrowser/chromium-* 下存在 Chromium.app。"
         case .chromiumBinaryNotExecutable(let path):
             return "CloakBrowser Chromium binary 存在，但没有可执行权限。\n\n路径：\(path)"
         case .profileDirectoryCreationFailed(let path, let reason):
-            return "无法创建 ChatGPT Cloak profile 目录。\n\n目录：\(path)\n错误：\(reason)"
+            return "无法创建 NoTrace Browser profile 目录。\n\n目录：\(path)\n错误：\(reason)"
         case .profileDirectoryNotWritable(let path):
-            return "ChatGPT Cloak profile 目录不可写。\n\n目录：\(path)\n\n请检查该目录权限后再启动。"
+            return "NoTrace Browser profile 目录不可写。\n\n目录：\(path)\n\n请检查该目录权限后再启动。"
         case .chromiumLaunchFailed(let reason):
             return "CloakBrowser Chromium 启动失败。\n\n错误：\(reason)"
         }

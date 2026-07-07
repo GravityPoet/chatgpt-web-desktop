@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "ChatGPT Cloak Companion",
+  "name": "NoTrace Browser Companion",
   "version": "1.1.0",
   "description": "Match the browser timezone to your IP/proxy, removing the timezone-vs-IP mismatch fingerprint signal. Pick a zone or auto-match the current IP.",
   "permissions": ["storage", "scripting", "webNavigation", "tabs", "declarativeNetRequestWithHostAccess"],

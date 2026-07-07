@@ -1,5 +1,5 @@
 use cloak_core::{
-    build_launch_plan, create_account as core_create_account,
+    build_launch_plan, create_account_with_group as core_create_account_with_group,
     delete_account as core_delete_account, launch_account as core_launch_account,
     list_accounts as core_list_accounts, list_trashed_accounts as core_list_trashed_accounts,
     permanently_delete_account as core_permanently_delete_account,
@@ -24,8 +24,9 @@ fn list_trashed_accounts() -> Result<Vec<Account>, String> {
 }
 
 #[tauri::command]
-fn create_account(name: String) -> Result<Account, String> {
-    core_create_account(&config()?, &name).map_err(|err| err.to_string())
+fn create_account(name: String, group: Option<String>) -> Result<Account, String> {
+    core_create_account_with_group(&config()?, &name, group.as_deref())
+        .map_err(|err| err.to_string())
 }
 
 #[tauri::command]

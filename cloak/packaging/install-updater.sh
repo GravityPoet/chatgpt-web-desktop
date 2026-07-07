@@ -5,12 +5,12 @@ set -euo pipefail
 # the stealth Chromium stays current with zero manual action. Idempotent.
 #
 # Uninstall:
-#   launchctl bootout gui/$(id -u)/com.chatgpt-cloak.update 2>/dev/null || \
-#     launchctl unload ~/Library/LaunchAgents/com.chatgpt-cloak.update.plist
-#   rm ~/Library/LaunchAgents/com.chatgpt-cloak.update.plist
+#   launchctl bootout gui/$(id -u)/com.notrace-browser.update 2>/dev/null || \
+#     launchctl unload ~/Library/LaunchAgents/com.notrace-browser.update.plist
+#   rm ~/Library/LaunchAgents/com.notrace-browser.update.plist
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # cloak/
-LABEL="com.chatgpt-cloak.update"
+LABEL="com.notrace-browser.update"
 UPDATER="$ROOT/packaging/update-chromium.sh"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 LOG="$HOME/.cloakbrowser/update.log"

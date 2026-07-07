@@ -2,8 +2,8 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   ArchiveRestore,
   CalendarClock,
+  Check,
   ChevronDown,
-  ChevronLeft,
   ChevronRight,
   Folder,
   GripVertical,
@@ -20,7 +20,18 @@ import {
   Trash2,
   X,
 } from "lucide-react";
-import { useEffect, useMemo, useState, type DragEvent, type FormEvent, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type DragEvent,
+  type FormEvent,
+  type MouseEvent,
+  type PointerEvent,
+  type ReactNode,
+} from "react";
 
 type Account = {
   name: string;
@@ -63,13 +74,33 @@ type LaunchPlan = {
 };
 
 type DialogState =
-  | { kind: "create"; value: string }
+  | { kind: "create"; value: string; group: string }
   | { kind: "rename"; account: Account; value: string }
   | { kind: "proxy"; account: Account; value: string }
   | { kind: "region"; account: Account; value: string }
   | { kind: "group"; account: Account; value: string }
   | { kind: "delete"; account: Account }
-  | { kind: "permanentDelete"; account: Account };
+  | { kind: "permanentDelete"; account: Account }
+  | { kind: "deleteGroup"; groupLabel: string; count: number };
+
+type GroupContextMenuState = {
+  groupLabel: string;
+  count: number;
+  x: number;
+  y: number;
+};
+
+type AccountContextMenuState = {
+  account: Account;
+  x: number;
+  y: number;
+};
+
+const contextMenuWidth = 140;
+const contextMenuHeight = 44;
+const accountContextMenuWidth = 184;
+const accountContextMenuMaxHeight = 320;
+const contextMenuViewportPadding = 8;
 
 const emptyAccounts: Account[] = [];
 type AccountView = "active" | "trash";
@@ -79,6 +110,12 @@ const ungroupedLabel = "未分组";
 const commonGroups = ["codex", "antigravity", "claude"];
 const groupOrderStorageKey = "cloak-picker.groupOrder.v1";
 const collapsedGroupsStorageKey = "cloak-picker.collapsedGroups.v1";
+const hiddenGroupsStorageKey = "cloak-picker.hiddenGroups.v1";
+const sidebarWidthStorageKey = "cloak-picker.sidebarWidth.v1";
+const defaultSidebarWidth = 326;
+const minSidebarWidth = 260;
+const minDetailWidth = 360;
+const paneResizerWidth = 8;
 
 type GroupOption = {
   label: string;
@@ -98,17 +135,32 @@ export default function App() {
   const [draggingGroupLabel, setDraggingGroupLabel] = useState<string>("");
   const [dropTargetGroup, setDropTargetGroup] = useState<string>("");
   const [groupOrder, setGroupOrder] = useState<string[]>(() => readStoredStringArray(groupOrderStorageKey));
+  const [sidebarWidth, setSidebarWidth] = useState<number>(() =>
+    readStoredNumber(sidebarWidthStorageKey, defaultSidebarWidth),
+  );
+  const [resizingPane, setResizingPane] = useState(false);
   const [collapsedGroups, setCollapsedGroups] = useState<string[]>(() =>
     readStoredStringArray(collapsedGroupsStorageKey),
   );
+  const [hiddenGroups, setHiddenGroups] = useState<string[]>(() => readStoredStringArray(hiddenGroupsStorageKey));
   const [busy, setBusy] = useState(false);
   const [planLoading, setPlanLoading] = useState(false);
   const [error, setError] = useState<string>("");
   const [dialogError, setDialogError] = useState<string>("");
   const [plan, setPlan] = useState<LaunchPlan | null>(null);
   const [dialog, setDialog] = useState<DialogState | null>(null);
+  const [groupContextMenu, setGroupContextMenu] = useState<GroupContextMenuState | null>(null);
+  const [accountContextMenu, setAccountContextMenu] = useState<AccountContextMenuState | null>(null);
+  const draggingGroupLabelRef = useRef("");
+  const groupDragStartRef = useRef<{ label: string; x: number; y: number } | null>(null);
+  const groupDragMovedRef = useRef(false);
+  const workspaceRef = useRef<HTMLElement | null>(null);
+  const resizingPaneRef = useRef(false);
 
-  const groupFilters = useMemo(() => buildGroupFilters(accounts, groupOrder), [accounts, groupOrder]);
+  const groupFilters = useMemo(
+    () => buildGroupFilters(accounts, groupOrder, hiddenGroups),
+    [accounts, groupOrder, hiddenGroups],
+  );
   const visibleAccounts = useMemo(
     () =>
       selectedGroup === allGroupsValue
@@ -121,7 +173,7 @@ export default function App() {
     [visibleAccounts, selectedName],
   );
   const groupedAccounts = useMemo(() => orderAccountGroups(groupAccounts(visibleAccounts), groupOrder), [visibleAccounts, groupOrder]);
-  const groupOptions = useMemo(() => buildGroupOptions(accounts), [accounts]);
+  const groupOptions = useMemo(() => buildGroupOptions(accounts, hiddenGroups), [accounts, hiddenGroups]);
 
   async function refresh(preferredName?: string, view: AccountView = accountView) {
     setError("");
@@ -171,10 +223,47 @@ export default function App() {
   }, [collapsedGroups]);
 
   useEffect(() => {
+    writeStoredStringArray(hiddenGroupsStorageKey, hiddenGroups);
+  }, [hiddenGroups]);
+
+  useEffect(() => {
+    writeStoredNumber(sidebarWidthStorageKey, sidebarWidth);
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    function clampSidebarToWorkspace() {
+      const bounds = workspaceRef.current?.getBoundingClientRect();
+      if (!bounds) return;
+      const maxSidebarWidth = Math.max(minSidebarWidth, bounds.width - minDetailWidth - paneResizerWidth);
+      setSidebarWidth((current) => Math.round(clampNumber(current, minSidebarWidth, maxSidebarWidth)));
+    }
+
+    clampSidebarToWorkspace();
+    window.addEventListener("resize", clampSidebarToWorkspace);
+    return () => window.removeEventListener("resize", clampSidebarToWorkspace);
+  }, []);
+
+  useEffect(() => {
     if (!error) return;
     const timer = window.setTimeout(() => setError(""), 5000);
     return () => window.clearTimeout(timer);
   }, [error]);
+
+  useEffect(() => {
+    if (!groupContextMenu && !accountContextMenu) return;
+    const close = () => {
+      setGroupContextMenu(null);
+      setAccountContextMenu(null);
+    };
+    window.addEventListener("click", close);
+    window.addEventListener("contextmenu", close);
+    window.addEventListener("keydown", close);
+    return () => {
+      window.removeEventListener("click", close);
+      window.removeEventListener("contextmenu", close);
+      window.removeEventListener("keydown", close);
+    };
+  }, [groupContextMenu, accountContextMenu]);
 
   useEffect(() => {
     if (!selected) {
@@ -221,11 +310,20 @@ export default function App() {
       return;
     }
 
+    if (dialog.kind === "deleteGroup") {
+      await confirmDeleteGroup(dialog.groupLabel);
+      return;
+    }
+
     const value = dialog.value.trim();
     if (dialog.kind === "create") {
       if (!value) return;
-      const account = await run(() => call<Account>("create_account", { name: value }));
+      const group = dialog.group.trim() || null;
+      const account = await run(() => call<Account>("create_account", { name: value, group }));
       if (account) {
+        if (group) {
+          setHiddenGroups((current) => current.filter((label) => label !== group));
+        }
         setDialog(null);
         setAccountView("active");
         await refresh(account.name, "active");
@@ -282,7 +380,12 @@ export default function App() {
   function openCreateDialog() {
     setError("");
     setDialogError("");
-    setDialog({ kind: "create", value: "" });
+    setDialog({ kind: "create", value: "", group: defaultCreateGroupValue() });
+  }
+
+  function defaultCreateGroupValue() {
+    if (accountView !== "active" || selectedGroup === allGroupsValue) return "";
+    return selectedGroup === ungroupedLabel ? "" : selectedGroup;
   }
 
   async function assignAccountGroup(account: Account, value: string | null, closeDialog: boolean) {
@@ -300,6 +403,9 @@ export default function App() {
       }),
     );
     if (!updated) return;
+    if (nextGroup) {
+      setHiddenGroups((current) => current.filter((label) => label !== nextGroup));
+    }
     if (closeDialog) setDialog(null);
     await refresh(updated.name);
   }
@@ -327,33 +433,93 @@ export default function App() {
     const account = accounts.find((item) => item.name === accountName);
     if (!account) return;
     await assignAccountGroup(account, groupLabel === ungroupedLabel ? null : groupLabel, false);
-    setSelectedGroup(groupLabel);
   }
 
-  function startGroupDrag(event: DragEvent<HTMLElement>, group: GroupFilter) {
-    if (group.value === allGroupsValue) return;
+  async function moveAccountFromContextMenu(account: Account, value: string) {
+    setAccountContextMenu(null);
+    await assignAccountGroup(account, value || null, false);
+  }
+
+  function renameAccountFromContextMenu(account: Account) {
+    setAccountContextMenu(null);
+    setDialog({ kind: "rename", account, value: account.name });
+  }
+
+  function deleteAccountFromContextMenu(account: Account) {
+    setAccountContextMenu(null);
+    setDialog(account.trashed ? { kind: "permanentDelete", account } : { kind: "delete", account });
+  }
+
+  function openAccountContextMenu(event: MouseEvent<HTMLButtonElement>, account: Account) {
+    event.preventDefault();
     event.stopPropagation();
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("application/x-cloak-group", group.label);
+    const menuPosition = placeContextMenu(
+      event.clientX,
+      event.clientY,
+      accountContextMenuWidth,
+      accountContextMenuHeight(groupOptions.length),
+    );
+    setGroupContextMenu(null);
+    setSelectedName(account.name);
+    setAccountContextMenu({
+      account,
+      x: menuPosition.x,
+      y: menuPosition.y,
+    });
+  }
+
+  function startGroupPointerDrag(event: PointerEvent<HTMLElement>, group: GroupFilter) {
+    if (group.value === allGroupsValue) return;
+    if (event.button !== 0) return;
+    draggingGroupLabelRef.current = group.label;
+    groupDragStartRef.current = { label: group.label, x: event.clientX, y: event.clientY };
+    groupDragMovedRef.current = false;
     setDraggingGroupLabel(group.label);
-  }
-
-  function allowGroupReorder(event: DragEvent<HTMLElement>, group: GroupFilter) {
-    if (!draggingGroupLabel || group.value === allGroupsValue) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
     setDropTargetGroup(group.label);
+    event.currentTarget.setPointerCapture(event.pointerId);
   }
 
-  function dropGroupOnGroup(event: DragEvent<HTMLElement>, group: GroupFilter) {
+  function moveGroupPointerDrag(event: PointerEvent<HTMLElement>) {
+    const source = draggingGroupLabelRef.current;
+    if (!source) return;
     event.preventDefault();
-    if (!draggingGroupLabel || group.value === allGroupsValue) return;
-    setGroupOrder((current) => reorderGroupLabels(current, groupFilters, draggingGroupLabel, group.label));
+    const start = groupDragStartRef.current;
+    if (start && Math.hypot(event.clientX - start.x, event.clientY - start.y) > 4) {
+      groupDragMovedRef.current = true;
+    }
+    const element = document.elementFromPoint(event.clientX, event.clientY);
+    const target = element?.closest("[data-group-label]") as HTMLElement | null;
+    const targetLabel = target?.dataset.groupLabel ?? "";
+    if (!targetLabel || targetLabel === allGroupsLabel) return;
+    setDropTargetGroup(targetLabel);
+    if (targetLabel !== source) {
+      setGroupOrder((current) => reorderGroupLabels(current, groupFilters, source, targetLabel));
+    }
+  }
+
+  function endGroupPointerDrag(event: PointerEvent<HTMLElement>) {
+    const start = groupDragStartRef.current;
+    const moved = groupDragMovedRef.current;
+    if (draggingGroupLabelRef.current && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    draggingGroupLabelRef.current = "";
+    groupDragStartRef.current = null;
     setDraggingGroupLabel("");
     setDropTargetGroup("");
+    if (start && !moved) {
+      setSelectedGroup(start.label);
+    }
+    window.setTimeout(() => {
+      groupDragMovedRef.current = false;
+    }, 0);
   }
 
   function handleGroupFilterClick(group: GroupFilter) {
+    if (groupDragMovedRef.current) {
+      groupDragMovedRef.current = false;
+      return;
+    }
     if (group.value === allGroupsValue && selectedGroup === allGroupsValue) {
       toggleAllGroupsCollapsed();
       return;
@@ -361,9 +527,35 @@ export default function App() {
     setSelectedGroup(group.value);
   }
 
-  function moveGroupFilter(group: GroupFilter, direction: -1 | 1) {
-    if (group.value === allGroupsValue) return;
-    setGroupOrder((current) => moveGroupLabel(current, groupFilters, group.label, direction));
+  function resizeSidebarFromPointer(clientX: number) {
+    const bounds = workspaceRef.current?.getBoundingClientRect();
+    if (!bounds) return;
+    const maxSidebarWidth = Math.max(minSidebarWidth, bounds.width - minDetailWidth - paneResizerWidth);
+    const next = clampNumber(clientX - bounds.left, minSidebarWidth, maxSidebarWidth);
+    setSidebarWidth(Math.round(next));
+  }
+
+  function startPaneResize(event: PointerEvent<HTMLDivElement>) {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    resizingPaneRef.current = true;
+    setResizingPane(true);
+    event.currentTarget.setPointerCapture(event.pointerId);
+    resizeSidebarFromPointer(event.clientX);
+  }
+
+  function movePaneResize(event: PointerEvent<HTMLDivElement>) {
+    if (!resizingPaneRef.current) return;
+    event.preventDefault();
+    resizeSidebarFromPointer(event.clientX);
+  }
+
+  function endPaneResize(event: PointerEvent<HTMLDivElement>) {
+    if (resizingPaneRef.current && event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    resizingPaneRef.current = false;
+    setResizingPane(false);
   }
 
   function toggleGroupCollapse(groupLabel: string) {
@@ -456,6 +648,45 @@ export default function App() {
     }
   }
 
+  async function confirmDeleteGroup(groupLabel: string) {
+    if (!groupLabel || groupLabel === allGroupsLabel || groupLabel === ungroupedLabel) {
+      setDialog(null);
+      return;
+    }
+    setBusy(true);
+    setError("");
+    setDialogError("");
+    try {
+      const [activeAccounts, trashedAccounts] = await Promise.all([
+        call<Account[]>("list_accounts"),
+        call<Account[]>("list_trashed_accounts"),
+      ]);
+      const accountsToClear = [...activeAccounts, ...trashedAccounts].filter(
+        (account) => accountGroupLabel(account) === groupLabel,
+      );
+      await Promise.all(
+        accountsToClear.map((account) =>
+          call<Account>("set_group", {
+            name: account.name,
+            value: null,
+          }),
+        ),
+      );
+      setHiddenGroups((current) => (current.includes(groupLabel) ? current : [...current, groupLabel]));
+      setGroupOrder((current) => current.filter((label) => label !== groupLabel));
+      setCollapsedGroups((current) => current.filter((label) => label !== groupLabel));
+      if (selectedGroup === groupLabel) setSelectedGroup(allGroupsValue);
+      setDialog(null);
+      await refresh(selectedName, accountView);
+    } catch (caught) {
+      const message = errorMessage(caught);
+      setDialogError(message);
+      setError(message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function restoreAccount(account: Account) {
     const restored = await run(() => call<Account>("restore_account", { name: account.name }));
     if (!restored) return;
@@ -473,10 +704,9 @@ export default function App() {
   const emptyAction = accountView === "active" ? "新建账号" : "查看活跃";
   const proxyLabel = selected ? middleTruncate(selected.proxy_display, 48) : "";
   const statusLabel = selected?.trashed ? "已移入回收站" : "活跃";
-  const reorderableGroupLabels = groupFilters
-    .filter((group) => group.value !== allGroupsValue)
-    .map((group) => group.label);
-
+  const workspaceStyle = { "--sidebar-width": `${sidebarWidth}px` } as CSSProperties & {
+    "--sidebar-width": string;
+  };
   return (
     <main className="shell">
       <header className="topbar">
@@ -498,7 +728,7 @@ export default function App() {
         </div>
       </header>
 
-      <section className="workspace">
+      <section className={`workspace ${resizingPane ? "resizing" : ""}`} ref={workspaceRef} style={workspaceStyle}>
         <aside className="sidebar">
           <div className="sidebarHeader">
             <span>账号</span>
@@ -529,46 +759,53 @@ export default function App() {
             {groupFilters.map((group) => {
               const isAll = group.value === allGroupsValue;
               const isActive = selectedGroup === group.value;
-              const groupIndex = reorderableGroupLabels.indexOf(group.label);
-              const canMoveBackward = groupIndex > 0;
-              const canMoveForward = groupIndex >= 0 && groupIndex < reorderableGroupLabels.length - 1;
+              const canDeleteGroup = !isAll && group.label !== ungroupedLabel;
               return (
                 <div
-                  className={`groupFilterButton ${isActive ? "active" : ""} ${dropTargetGroup === group.label ? "dropTarget" : ""}`}
+                  className={`groupFilterButton ${isActive ? "active" : ""} ${draggingGroupLabel === group.label ? "dragging" : ""} ${dropTargetGroup === group.label ? "dropTarget" : ""}`}
+                  data-group-label={isAll ? undefined : group.label}
                   key={group.value}
-                  onDragEnd={() => {
-                    setDraggingGroupLabel("");
-                    setDropTargetGroup("");
-                  }}
+                  title={isAll ? "再次点击可折叠或展开全部分组" : "按住拖动可调整分组顺序"}
                   onDragLeave={() => setDropTargetGroup((current) => (current === group.label ? "" : current))}
                   onDragOver={(event) => {
-                    if (draggingGroupLabel) {
-                      allowGroupReorder(event, group);
-                    } else if (!isAll) {
+                    if (!isAll) {
                       allowGroupDrop(event, group.label);
                     }
                   }}
                   onDrop={(event) => {
-                    if (draggingGroupLabel) {
-                      dropGroupOnGroup(event, group);
-                    } else if (!isAll) {
+                    if (!isAll) {
                       void dropAccountOnGroup(event, group.label);
                     }
+                  }}
+                  onPointerCancel={endGroupPointerDrag}
+                  onPointerDown={(event) => startGroupPointerDrag(event, group)}
+                  onPointerMove={moveGroupPointerDrag}
+                  onPointerUp={endGroupPointerDrag}
+                  onContextMenu={(event) => {
+                    if (!canDeleteGroup) return;
+                    event.preventDefault();
+                    event.stopPropagation();
+                    const menuPosition = placeContextMenu(event.clientX, event.clientY, contextMenuWidth, contextMenuHeight);
+                    setAccountContextMenu(null);
+                    setGroupContextMenu({
+                      groupLabel: group.label,
+                      count: group.count,
+                      x: menuPosition.x,
+                      y: menuPosition.y,
+                    });
                   }}
                 >
                   <button
                     className="groupFilterSelect"
                     type="button"
                     aria-pressed={isActive}
-                    title={isAll ? "再次点击可折叠或展开全部分组" : "点击查看该分组；拖动抓手或点箭头调整顺序"}
+                    title={isAll ? "再次点击可折叠或展开全部分组" : "点击查看该分组；按住拖动调整顺序"}
                     onClick={() => handleGroupFilterClick(group)}
                   >
                     {isAll ? null : (
                       <span
                         className="groupDragHandle"
-                        draggable
                         title="拖动调整分组顺序"
-                        onDragStart={(event) => startGroupDrag(event, group)}
                       >
                         <GripVertical size={12} />
                       </span>
@@ -577,30 +814,6 @@ export default function App() {
                     <span className="groupFilterLabel">{group.label}</span>
                     <small>{group.count}</small>
                   </button>
-                  {isAll ? null : (
-                    <span className="groupMoveControls" aria-label={`${group.label} 分组排序`}>
-                      <button
-                        className="groupMoveButton"
-                        type="button"
-                        aria-label={`${group.label} 前移`}
-                        title="前移分组"
-                        disabled={!canMoveBackward}
-                        onClick={() => moveGroupFilter(group, -1)}
-                      >
-                        <ChevronLeft size={12} />
-                      </button>
-                      <button
-                        className="groupMoveButton"
-                        type="button"
-                        aria-label={`${group.label} 后移`}
-                        title="后移分组"
-                        disabled={!canMoveForward}
-                        onClick={() => moveGroupFilter(group, 1)}
-                      >
-                        <ChevronRight size={12} />
-                      </button>
-                    </span>
-                  )}
                 </div>
               );
             })}
@@ -630,6 +843,7 @@ export default function App() {
                   onAllowDrop={allowGroupDrop}
                   onDropAccount={dropAccountOnGroup}
                   onLaunchAccount={launchAccount}
+                  onOpenAccountContextMenu={openAccountContextMenu}
                   onRestoreAccount={restoreAccount}
                   onSelectAccount={setSelectedName}
                   onStartAccountDrag={startAccountDrag}
@@ -642,6 +856,21 @@ export default function App() {
             )}
           </div>
         </aside>
+
+        <div
+          className={`paneResizer ${resizingPane ? "dragging" : ""}`}
+          role="separator"
+          aria-label="调整账号列表宽度"
+          aria-orientation="vertical"
+          aria-valuemin={minSidebarWidth}
+          aria-valuenow={sidebarWidth}
+          onDoubleClick={() => setSidebarWidth(defaultSidebarWidth)}
+          onPointerCancel={endPaneResize}
+          onPointerDown={startPaneResize}
+          onPointerMove={movePaneResize}
+          onPointerUp={endPaneResize}
+          title="左右拖动调整账号列表宽度，双击恢复默认"
+        />
 
         <section className="detail">
           {selected ? (
@@ -732,6 +961,95 @@ export default function App() {
         </section>
       </section>
 
+      {groupContextMenu ? (
+        <div
+          className="contextMenu"
+          style={{ left: groupContextMenu.x, top: groupContextMenu.y }}
+          role="menu"
+          aria-label={`${groupContextMenu.groupLabel} 分组菜单`}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <button
+            className="contextMenuItem danger"
+            disabled={busy}
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setDialog({
+                kind: "deleteGroup",
+                groupLabel: groupContextMenu.groupLabel,
+                count: groupContextMenu.count,
+              });
+              setGroupContextMenu(null);
+            }}
+          >
+            <Trash2 size={14} />
+            删除分组
+          </button>
+        </div>
+      ) : null}
+
+      {accountContextMenu ? (
+        <div
+          className="contextMenu accountContextMenu"
+          style={{ left: accountContextMenu.x, top: accountContextMenu.y }}
+          role="menu"
+          aria-label={`${accountContextMenu.account.name} 账号菜单`}
+          onClick={(event) => event.stopPropagation()}
+          onContextMenu={(event) => event.preventDefault()}
+        >
+          <div className="contextMenuTitle">移动到分组</div>
+          {groupOptions.map((option) => {
+            const activeValue = accountContextMenu.account.group?.trim() || "";
+            const isActive = option.value === activeValue || (!option.value && !activeValue);
+            return (
+              <button
+                className={`contextMenuItem ${isActive ? "active" : ""}`}
+                disabled={busy}
+                type="button"
+                key={option.label}
+                role="menuitem"
+                aria-pressed={isActive}
+                onClick={() => {
+                  if (isActive) {
+                    setAccountContextMenu(null);
+                    return;
+                  }
+                  void moveAccountFromContextMenu(accountContextMenu.account, option.value);
+                }}
+              >
+                <Folder size={14} />
+                <span className="contextMenuItemLabel">{option.label}</span>
+                {isActive ? <Check className="contextMenuCheck" size={14} /> : null}
+              </button>
+            );
+          })}
+          <div className="contextMenuDivider" />
+          <div className="contextMenuTitle">账号操作</div>
+          <button
+            className="contextMenuItem"
+            disabled={busy}
+            type="button"
+            role="menuitem"
+            onClick={() => renameAccountFromContextMenu(accountContextMenu.account)}
+          >
+            <Pencil size={14} />
+            <span className="contextMenuItemLabel">重命名</span>
+          </button>
+          <button
+            className="contextMenuItem danger"
+            disabled={busy}
+            type="button"
+            role="menuitem"
+            onClick={() => deleteAccountFromContextMenu(accountContextMenu.account)}
+          >
+            <Trash2 size={14} />
+            <span className="contextMenuItemLabel">{accountContextMenu.account.trashed ? "彻底删除" : "删除"}</span>
+          </button>
+        </div>
+      ) : null}
+
       {error && !dialog ? <div className="toast">{error}</div> : null}
       {dialog ? (
         <EditorDialog
@@ -747,6 +1065,7 @@ export default function App() {
             setDialog(null);
           }}
           onConfirmDelete={confirmDeleteAccount}
+          onConfirmDeleteGroup={(groupLabel) => void confirmDeleteGroup(groupLabel)}
           onConfirmPermanentDelete={confirmPermanentDeleteAccount}
           groupOptions={groupOptions}
           onQuickGroup={(account, value) => void assignAccountGroup(account, value || null, true)}
@@ -766,6 +1085,7 @@ function AccountGroupSection({
   onAllowDrop,
   onDropAccount,
   onLaunchAccount,
+  onOpenAccountContextMenu,
   onRestoreAccount,
   onSelectAccount,
   onStartAccountDrag,
@@ -781,6 +1101,7 @@ function AccountGroupSection({
   onAllowDrop: (event: DragEvent<HTMLElement>, groupLabel: string) => void;
   onDropAccount: (event: DragEvent<HTMLElement>, groupLabel: string) => Promise<void>;
   onLaunchAccount: (account: Account) => Promise<void>;
+  onOpenAccountContextMenu: (event: MouseEvent<HTMLButtonElement>, account: Account) => void;
   onRestoreAccount: (account: Account) => Promise<void>;
   onSelectAccount: (name: string) => void;
   onStartAccountDrag: (event: DragEvent<HTMLButtonElement>, account: Account) => void;
@@ -826,6 +1147,7 @@ function AccountGroupSection({
               key={account.name}
               title={account.trashed ? account.name : `${account.name}｜拖动可调整分组`}
               onClick={() => onSelectAccount(account.name)}
+              onContextMenu={(event) => onOpenAccountContextMenu(event, account)}
               onDoubleClick={() => {
                 if (account.trashed) {
                   void onRestoreAccount(account);
@@ -844,7 +1166,7 @@ function AccountGroupSection({
                 <span className="accountTitle">
                   <GripVertical className="dragHandle" size={14} />
                   <strong title={account.name}>{middleTruncate(account.name, 34)}</strong>
-                  <code>{account.seed}</code>
+                  <code>{formatCreatedDate(account.created_at)}</code>
                 </span>
               </span>
             </button>
@@ -860,6 +1182,7 @@ function EditorDialog({
   onChange,
   onClose,
   onConfirmDelete,
+  onConfirmDeleteGroup,
   onConfirmPermanentDelete,
   groupOptions,
   onQuickGroup,
@@ -871,6 +1194,7 @@ function EditorDialog({
   onChange: (next: DialogState | null) => void;
   onClose: () => void;
   onConfirmDelete: (account: Account) => void;
+  onConfirmDeleteGroup: (groupLabel: string) => void;
   onConfirmPermanentDelete: (account: Account) => void;
   groupOptions: GroupOption[];
   onQuickGroup: (account: Account, value: string) => void;
@@ -926,7 +1250,65 @@ function EditorDialog({
     );
   }
 
+  if (dialog.kind === "deleteGroup") {
+    return (
+      <div className="modalBackdrop">
+        <div className="modal" role="alertdialog" aria-modal="true">
+          <button className="modalClose" type="button" aria-label="关闭" onClick={onClose}>
+            <X size={15} />
+          </button>
+          <h2 title={`删除分组「${dialog.groupLabel}」？`}>
+            删除分组「<span className="dialogAccountName">{middleTruncate(dialog.groupLabel, 28)}</span>」？
+          </h2>
+          <p>
+            {dialog.count > 0
+              ? `该分组下 ${dialog.count} 个账号会移到“未分组”，账号本身不会删除。`
+              : "该空分组会从分组栏隐藏，账号本身不会删除。"}
+          </p>
+          {error ? <p className="modalError">{error}</p> : null}
+          <div className="modalActions">
+            <button autoFocus className="secondaryButton" disabled={busy} type="button" onClick={onClose}>
+              取消
+            </button>
+            <button className="dangerButton" disabled={busy} type="button" onClick={() => onConfirmDeleteGroup(dialog.groupLabel)}>
+              {busy ? "删除中..." : "删除分组"}
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   const config = dialogConfig(dialog);
+  const groupPicker =
+    dialog.kind === "group" || dialog.kind === "create" ? (
+      <div className="groupPicker" aria-label="可选分组">
+        <span className="groupPickerLabel">分组</span>
+        {groupOptions.map((option) => {
+          const activeValue = dialog.kind === "create" ? dialog.group.trim() : dialog.value.trim();
+          const isActive = option.value === activeValue || (!option.value && !activeValue);
+          return (
+            <button
+              className={`groupOption ${isActive ? "active" : ""}`}
+              disabled={busy}
+              key={option.label}
+              type="button"
+              aria-pressed={isActive}
+              onClick={() => {
+                if (dialog.kind === "create") {
+                  onChange({ ...dialog, group: option.value });
+                  return;
+                }
+                onQuickGroup(dialog.account, option.value);
+              }}
+            >
+              <Folder size={13} />
+              <span>{option.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    ) : null;
   return (
     <div className="modalBackdrop">
       <form className="modal" onSubmit={onSubmit}>
@@ -935,27 +1317,7 @@ function EditorDialog({
         </button>
         <h2>{config.title}</h2>
         {config.description ? <p>{config.description}</p> : null}
-        {dialog.kind === "group" ? (
-          <div className="groupPicker" aria-label="可选分组">
-            {groupOptions.map((option) => {
-              const activeValue = dialog.value.trim();
-              const isActive = option.value === activeValue || (!option.value && !activeValue);
-              return (
-                <button
-                  className={`groupOption ${isActive ? "active" : ""}`}
-                  disabled={busy}
-                  key={option.label}
-                  type="button"
-                  aria-pressed={isActive}
-                  onClick={() => onQuickGroup(dialog.account, option.value)}
-                >
-                  <Folder size={13} />
-                  <span>{option.label}</span>
-                </button>
-              );
-            })}
-          </div>
-        ) : null}
+        {dialog.kind === "group" ? groupPicker : null}
         <label className="field">
           <span>{config.label}</span>
           <input
@@ -965,6 +1327,7 @@ function EditorDialog({
             onChange={(event) => onChange({ ...dialog, value: event.currentTarget.value })}
           />
         </label>
+        {dialog.kind === "create" ? groupPicker : null}
         {error ? <p className="modalError">{error}</p> : null}
         <div className="modalActions">
           <button className="secondaryButton" type="button" onClick={onClose}>
@@ -979,7 +1342,9 @@ function EditorDialog({
   );
 }
 
-function dialogConfig(dialog: Exclude<DialogState, { kind: "delete" } | { kind: "permanentDelete" }>): {
+function dialogConfig(
+  dialog: Exclude<DialogState, { kind: "delete" } | { kind: "permanentDelete" } | { kind: "deleteGroup" }>,
+): {
   title: string;
   label: string;
   placeholder: string;
@@ -1096,9 +1461,10 @@ function groupAccounts(accounts: Account[]): AccountGroup[] {
   return groups;
 }
 
-function buildGroupOptions(accounts: Account[]): GroupOption[] {
+function buildGroupOptions(accounts: Account[], hiddenGroups: string[]): GroupOption[] {
   const options: GroupOption[] = [{ label: ungroupedLabel, value: "" }];
   const seen = new Set<string>([ungroupedLabel]);
+  const hidden = new Set(hiddenGroups);
   for (const account of accounts) {
     const label = account.group?.trim();
     if (!label || seen.has(label)) continue;
@@ -1106,7 +1472,7 @@ function buildGroupOptions(accounts: Account[]): GroupOption[] {
     options.push({ label, value: label });
   }
   for (const label of commonGroups) {
-    if (seen.has(label)) continue;
+    if (seen.has(label) || hidden.has(label)) continue;
     seen.add(label);
     options.push({ label, value: label });
   }
@@ -1122,11 +1488,12 @@ function orderAccountGroups(groups: AccountGroup[], groupOrder: string[]): Accou
   return labels.map((label) => groupsByLabel.get(label)).filter((group): group is AccountGroup => Boolean(group));
 }
 
-function buildGroupFilters(accounts: Account[], groupOrder: string[]): GroupFilter[] {
+function buildGroupFilters(accounts: Account[], groupOrder: string[], hiddenGroups: string[]): GroupFilter[] {
   const groups = groupAccounts(accounts);
   const counts = new Map(groups.map((group) => [group.label, group.accounts.length]));
+  const hidden = new Set(hiddenGroups);
   for (const label of commonGroups) {
-    if (!counts.has(label)) counts.set(label, 0);
+    if (!counts.has(label) && !hidden.has(label)) counts.set(label, 0);
   }
   const labels = orderGroupLabels([...counts.keys()], groupOrder);
   const filters: GroupFilter[] = [{ label: allGroupsLabel, value: allGroupsValue, count: accounts.length }];
@@ -1154,26 +1521,6 @@ function reorderGroupLabels(currentOrder: string[], filters: GroupFilter[], sour
   return labels;
 }
 
-function moveGroupLabel(
-  currentOrder: string[],
-  filters: GroupFilter[],
-  source: string,
-  direction: -1 | 1,
-): string[] {
-  if (!source || source === allGroupsLabel) return currentOrder;
-  const labels = orderGroupLabels(
-    filters.filter((group) => group.value !== allGroupsValue).map((group) => group.label),
-    currentOrder,
-  );
-  const sourceIndex = labels.indexOf(source);
-  const targetIndex = sourceIndex + direction;
-  if (sourceIndex < 0 || targetIndex < 0 || targetIndex >= labels.length) return currentOrder;
-  const next = [...labels];
-  const [moved] = next.splice(sourceIndex, 1);
-  next.splice(targetIndex, 0, moved);
-  return next;
-}
-
 function toggleStringInArray(values: string[], value: string): string[] {
   return values.includes(value) ? values.filter((item) => item !== value) : [...values, value];
 }
@@ -1198,6 +1545,42 @@ function writeStoredStringArray(key: string, values: string[]) {
   }
 }
 
+function readStoredNumber(key: string, fallback: number) {
+  try {
+    const raw = window.localStorage.getItem(key);
+    if (!raw) return fallback;
+    const parsed = Number(raw);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeStoredNumber(key: string, value: number) {
+  try {
+    window.localStorage.setItem(key, String(value));
+  } catch {
+    // Ignore storage failures; resizing still works for the current session.
+  }
+}
+
+function clampNumber(value: number, min: number, max: number) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function accountContextMenuHeight(optionCount: number) {
+  return Math.min(accountContextMenuMaxHeight, 70 + optionCount * 32 + 68);
+}
+
+function placeContextMenu(x: number, y: number, width: number, height: number) {
+  const maxX = Math.max(contextMenuViewportPadding, window.innerWidth - width - contextMenuViewportPadding);
+  const maxY = Math.max(contextMenuViewportPadding, window.innerHeight - height - contextMenuViewportPadding);
+  return {
+    x: clampNumber(x, contextMenuViewportPadding, maxX),
+    y: clampNumber(y, contextMenuViewportPadding, maxY),
+  };
+}
+
 function accountGroupLabel(account: Account) {
   return account.group?.trim() || ungroupedLabel;
 }
@@ -1217,7 +1600,15 @@ async function mockInvoke<T>(command: string, args?: Record<string, unknown>): P
     return mockLaunchPlan(account, command === "launch_preflight") as T;
   }
   if (command === "create_account") {
-    return { ...accounts[0], name: String(args?.name ?? "new"), created_at: Date.now() * 1000, archived: false, trashed: false, seed: "68122", group: null } as T;
+    return {
+      ...accounts[0],
+      name: String(args?.name ?? "new"),
+      created_at: Date.now() * 1000,
+      archived: false,
+      trashed: false,
+      seed: "68122",
+      group: (args?.group as string | null | undefined) ?? null,
+    } as T;
   }
   if (command === "rename_account") return { ...accounts[0], name: String(args?.newName ?? "renamed") } as T;
   if (command === "restore_account") return { ...accounts[0], name: String(args?.name ?? accounts[0].name), archived: false, trashed: false } as T;
@@ -1233,7 +1624,7 @@ function mockAccounts(): Account[] {
   return [
     {
       name: "demo-alpha@example.test",
-      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-alpha@example.test",
+      profile_path: "/Users/example/Library/Application Support/NoTrace Browser/Accounts/demo-alpha@example.test",
       created_at: 1_700_000_001_000_000,
       archived: false,
       trashed: false,
@@ -1246,7 +1637,7 @@ function mockAccounts(): Account[] {
     },
     {
       name: "demo-beta",
-      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-beta",
+      profile_path: "/Users/example/Library/Application Support/NoTrace Browser/Accounts/demo-beta",
       created_at: 1_700_000_002_000_000,
       archived: false,
       trashed: false,
@@ -1259,7 +1650,7 @@ function mockAccounts(): Account[] {
     },
     {
       name: "demo-gamma",
-      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/demo-gamma",
+      profile_path: "/Users/example/Library/Application Support/NoTrace Browser/Accounts/demo-gamma",
       created_at: 1_700_000_003_000_000,
       archived: true,
       trashed: false,
@@ -1272,7 +1663,7 @@ function mockAccounts(): Account[] {
     },
     {
       name: "old-lab",
-      profile_path: "/Users/example/Library/Application Support/ChatGPT Cloak/Accounts/old-lab",
+      profile_path: "/Users/example/Library/Application Support/NoTrace Browser/Accounts/old-lab",
       created_at: 1_700_000_004_000_000,
       archived: false,
       trashed: true,
@@ -1294,17 +1685,17 @@ function mockLaunchPlan(account: Account, full: boolean): LaunchPlan {
     extension_runtime_path: `${account.profile_path}/.cloak-companion`,
     load_extension_paths: [
       `${account.profile_path}/.cloak-companion`,
-      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/Chromium Web Store 插件",
-      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/NoTrace Browser/Default Extensions/Chromium Web Store 插件",
+      "/Users/example/Library/Application Support/NoTrace Browser/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
     extra_extension_paths: [
-      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/Chromium Web Store 插件",
-      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/NoTrace Browser/Default Extensions/Chromium Web Store 插件",
+      "/Users/example/Library/Application Support/NoTrace Browser/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
     selftest_extension_paths: [
-      "/Users/example/Library/Application Support/ChatGPT Cloak/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
+      "/Users/example/Library/Application Support/NoTrace Browser/Default Extensions/get-cookies.txt-locally_v0.7.2_chrome",
       `${account.profile_path}/.cloak-extra-extensions/Cookies.crx`,
     ],
     browser_binary: "/Users/example/.cloakbrowser/current/Chromium.app/Contents/MacOS/Chromium",
@@ -1348,6 +1739,15 @@ function formatCreatedAt(createdAtMicros: number) {
     hour: "2-digit",
     minute: "2-digit",
   }).format(new Date(Math.floor(createdAtMicros / 1000)));
+}
+
+function formatCreatedDate(createdAtMicros: number) {
+  if (!Number.isFinite(createdAtMicros) || createdAtMicros <= 0) return "未知";
+  const date = new Date(Math.floor(createdAtMicros / 1000));
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 function extensionSummary(paths: string[]) {
