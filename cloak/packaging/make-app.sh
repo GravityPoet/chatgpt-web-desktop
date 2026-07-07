@@ -3,13 +3,13 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO_ROOT="$(cd "$ROOT/.." && pwd)"
-APP_NAME="ChatGPT Cloak"
+APP_NAME="NoTrace Browser"
 BINARY_NAME="ChatGPTCloakLauncher"
 DIST_DIR="$ROOT/dist"
 APP_DIR="$DIST_DIR/$APP_NAME.app"
 CONTENTS_NAME="$APP_NAME.app/Contents"
 ICON_SOURCE="$REPO_ROOT/tauri/src-tauri/icons/icon.icns"
-SIGN_IDENTITY="${CHATGPT_CLOAK_CODESIGN_IDENTITY:-}"
+SIGN_IDENTITY="${NOTRACE_BROWSER_CODESIGN_IDENTITY:-}"
 
 cd "$ROOT"
 
@@ -18,11 +18,11 @@ printf '%s\n' "backup: skipped; dist app bundle is generated and fully rebuildab
 swift build -c release
 
 if [[ -z "$SIGN_IDENTITY" ]]; then
-  SIGN_IDENTITY="$(CHATGPT_RUST_CODESIGN_IDENTITY="ChatGPT Cloak Local Code Signing" "$REPO_ROOT/tauri/packaging/ensure-local-codesign-cert.sh")"
+  SIGN_IDENTITY="$(CHATGPT_RUST_CODESIGN_IDENTITY="NoTrace Browser Local Code Signing" "$REPO_ROOT/tauri/packaging/ensure-local-codesign-cert.sh")"
 fi
 
 mkdir -p "$DIST_DIR"
-STAGING_DIR="$(/usr/bin/mktemp -d "$DIST_DIR/.chatgpt-cloak-app.XXXXXX")"
+STAGING_DIR="$(/usr/bin/mktemp -d "$DIST_DIR/.notrace-browser-app.XXXXXX")"
 cleanup() {
   /bin/rm -rf "$STAGING_DIR"
 }
@@ -43,17 +43,17 @@ cat >"$CONTENTS/Info.plist" <<'EOF'
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
 	<key>CFBundleDisplayName</key>
-	<string>ChatGPT Cloak</string>
+	<string>NoTrace Browser</string>
 	<key>CFBundleExecutable</key>
 	<string>ChatGPTCloakLauncher</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>local.chatgpt-cloak</string>
+	<string>local.notrace-browser</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>ChatGPT Cloak</string>
+	<string>NoTrace Browser</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>

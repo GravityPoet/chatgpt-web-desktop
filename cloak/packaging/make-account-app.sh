@@ -55,7 +55,7 @@ trap '/bin/rm -rf "$TMP"' EXIT
 # python3 (often under Homebrew) resolves even from the GUI launch context.
 cat >"$TMP/app.applescript" <<OSA
 on run
-	display notification "不要用 Chromium 原生 Profile 切换账号；隔离入口是这个账号 App / 账号选择器。" with title "ChatGPT Cloak"
+	display notification "不要用 Chromium 原生 Profile 切换账号；隔离入口是这个账号 App / 账号选择器。" with title "NoTrace Browser"
 	do shell script "export PATH=/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin; " & quoted form of "$LAUNCH" & " " & quoted form of "$name" & " > /dev/null 2>&1 &"
 end run
 OSA
@@ -89,8 +89,8 @@ rm -rf "$APP"
 # Compute the seed this tile will launch with, for the receipt.
 hex="$(printf '%s' "$name" | /usr/bin/shasum -a 256 | cut -c1-8)"
 seed=$(( 16#$hex % 90000 + 10000 ))
-[[ -f "$HOME/Library/Application Support/ChatGPT Cloak/Accounts/$name/.cloak-seed" ]] && \
-  seed="$(head -1 "$HOME/Library/Application Support/ChatGPT Cloak/Accounts/$name/.cloak-seed" 2>/dev/null || printf '%s' "$seed")"
+[[ -f "$HOME/Library/Application Support/NoTrace Browser/Accounts/$name/.cloak-seed" ]] && \
+  seed="$(head -1 "$HOME/Library/Application Support/NoTrace Browser/Accounts/$name/.cloak-seed" 2>/dev/null || printf '%s' "$seed")"
 
 printf 'created : %s\n' "$APP"
 printf 'account : %s  (seed %s, isolated via launch-account.sh)\n' "$name" "$seed"

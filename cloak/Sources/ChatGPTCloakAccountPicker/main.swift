@@ -84,7 +84,7 @@ final class AccountStore {
             accountBaseURL = URL(fileURLWithPath: accountBase, isDirectory: true)
         } else {
             accountBaseURL = homeURL
-                .appendingPathComponent("Library/Application Support/ChatGPT Cloak/Accounts", isDirectory: true)
+                .appendingPathComponent("Library/Application Support/NoTrace Browser/Accounts", isDirectory: true)
         }
 
         if let launchScript = environment["CLOAK_LAUNCH_SCRIPT"], !launchScript.isEmpty {

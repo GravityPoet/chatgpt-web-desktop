@@ -73,7 +73,7 @@ gpu_renderer_for_seed() {
   esac
 }
 
-ACCOUNT_BASE="${CLOAK_ACCOUNT_BASE:-$HOME/Library/Application Support/ChatGPT Cloak/Accounts}"
+ACCOUNT_BASE="${CLOAK_ACCOUNT_BASE:-$HOME/Library/Application Support/NoTrace Browser/Accounts}"
 UDD="$ACCOUNT_BASE/$name"
 if [[ -z "${DRY_RUN:-}" ]]; then
   mkdir -p "$UDD"
@@ -102,6 +102,94 @@ companion_page_spoof_enabled() {
     return
   fi
   return 0
+}
+
+ensure_chromium_webstore_install_flag() {
+  local profile_dir="$1"
+  command -v python3 >/dev/null 2>&1 || {
+    printf 'error: python3 required to update Chromium Local State\n' >&2
+    exit 1
+  }
+  python3 - "$profile_dir" <<'PY'
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+FLAG = "extension-mime-request-handling@2"
+
+profile_dir = Path(sys.argv[1])
+state_path = profile_dir / "Local State"
+state_path.parent.mkdir(parents=True, exist_ok=True)
+root: dict[str, Any] = {}
+if state_path.exists():
+    with state_path.open("r", encoding="utf-8") as fh:
+        loaded = json.load(fh)
+    if isinstance(loaded, dict):
+        root = loaded
+
+browser = root.get("browser")
+if not isinstance(browser, dict):
+    browser = {}
+    root["browser"] = browser
+
+labs = browser.get("enabled_labs_experiments")
+if not isinstance(labs, list):
+    labs = []
+
+clean_labs = [
+    item
+    for item in labs
+    if isinstance(item, str)
+    and not item.startswith("extension-mime-request-handling@")
+]
+if FLAG not in clean_labs:
+    clean_labs.append(FLAG)
+browser["enabled_labs_experiments"] = clean_labs
+
+tmp_path = state_path.with_name(f"{state_path.name}.tmp.{os.getpid()}")
+with tmp_path.open("w", encoding="utf-8") as fh:
+    json.dump(root, fh, ensure_ascii=False, sort_keys=True)
+    fh.write("\n")
+os.chmod(tmp_path, 0o600)
+os.replace(tmp_path, state_path)
+os.chmod(state_path, 0o600)
+PY
+}
+
+enforce_https_only_mode() {
+  local profile_dir="$1"
+  command -v python3 >/dev/null 2>&1 || {
+    printf 'error: python3 required to update Chromium HTTPS-Only preference\n' >&2
+    exit 1
+  }
+  python3 - "$profile_dir" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+profile_dir = Path(sys.argv[1])
+prefs_path = profile_dir / "Default" / "Preferences"
+prefs_path.parent.mkdir(parents=True, exist_ok=True)
+root = {}
+if prefs_path.exists():
+    with prefs_path.open("r", encoding="utf-8") as fh:
+        loaded = json.load(fh)
+    if isinstance(loaded, dict):
+        root = loaded
+root["https_only_mode_enabled"] = True
+tmp_path = prefs_path.with_name(f"{prefs_path.name}.tmp.{os.getpid()}")
+with tmp_path.open("w", encoding="utf-8") as fh:
+    json.dump(root, fh, ensure_ascii=False, sort_keys=True)
+    fh.write("\n")
+os.chmod(tmp_path, 0o600)
+os.replace(tmp_path, prefs_path)
+os.chmod(prefs_path, 0o600)
+PY
 }
 
 osa_esc() {
@@ -142,7 +230,7 @@ confirm_privacy_override() {
     local escaped reply
     escaped="$(osa_esc "隐私门禁失败，默认不启动：\n\n$body\n\n确认仍然启动？")"
     reply="$(osascript <<OSA 2>/dev/null || true
-set r to display dialog "$escaped" with title "ChatGPT Cloak 隐私门禁" buttons {"取消", "仍然启动"} default button "取消" with icon caution
+set r to display dialog "$escaped" with title "NoTrace Browser 隐私门禁" buttons {"取消", "仍然启动"} default button "取消" with icon caution
 return button returned of r
 OSA
 )"
@@ -184,7 +272,7 @@ notify_privacy_failure() {
     msg+="\n\n浏览器已启动；请暂停使用该账号，直到修复此项失败。"
     escaped="$(osa_esc "$msg")"
     osascript <<OSA >/dev/null 2>&1 &
-display dialog "$escaped" with title "ChatGPT Cloak 隐私检测失败" buttons {"知道了"} default button "知道了" with icon caution
+display dialog "$escaped" with title "NoTrace Browser 隐私检测失败" buttons {"知道了"} default button "知道了" with icon caution
 OSA
   fi
 }
@@ -305,7 +393,7 @@ if [[ -z "${DRY_RUN:-}" ]]; then
   prepare_account_extension
 fi
 
-LOCAL_EXTRA_EXT_ROOT="$HOME/Library/Application Support/ChatGPT Cloak/Default Extensions"
+LOCAL_EXTRA_EXT_ROOT="$HOME/Library/Application Support/NoTrace Browser/Default Extensions"
 ICLOUD_EXTRA_EXT_ROOT="$HOME/Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"
 DEFAULT_EXTRA_EXT_ROOT="$ICLOUD_EXTRA_EXT_ROOT"
 [[ -d "$LOCAL_EXTRA_EXT_ROOT" ]] && DEFAULT_EXTRA_EXT_ROOT="$LOCAL_EXTRA_EXT_ROOT"
@@ -314,6 +402,35 @@ extra_ext_root="${CLOAK_EXTRA_EXTENSIONS_DIR:-$DEFAULT_EXTRA_EXT_ROOT}"
 load_extension_dirs=("$EXT_RUNTIME")
 extra_extension_dirs=()
 selftest_extension_dirs=()
+
+ensure_legacy_rename_compat() {
+  [[ -d "$LOCAL_EXTRA_EXT_ROOT" ]] || return 0
+
+  local legacy_root="$HOME/Library/Application Support/ChatGPT Cloak"
+  local legacy_accounts="$legacy_root/Accounts"
+  local legacy_default_ext="$legacy_root/Default Extensions"
+
+  mkdir -p "$legacy_root" "$legacy_default_ext"
+  chmod 700 "$legacy_root" "$legacy_default_ext" 2>/dev/null || true
+
+  if [[ -d "$ACCOUNT_BASE" && ! -e "$legacy_accounts" && ! -L "$legacy_accounts" ]]; then
+    ln -s "$ACCOUNT_BASE" "$legacy_accounts"
+  fi
+
+  local src base dst
+  while IFS= read -r src; do
+    base="${src##*/}"
+    [[ "$base" == ".DS_Store" ]] && continue
+    dst="$legacy_default_ext/$base"
+    if [[ ! -e "$dst" && ! -L "$dst" ]]; then
+      ln -s "$src" "$dst"
+    fi
+  done < <(find "$LOCAL_EXTRA_EXT_ROOT" -mindepth 1 -maxdepth 1 -print | sort)
+}
+
+if [[ -z "${DRY_RUN:-}" ]]; then
+  ensure_legacy_rename_compat
+fi
 
 slug_for_path() {
   basename "$1" | tr -cs 'A-Za-z0-9._-' '_' | sed 's/^_*//;s/_*$//'
@@ -503,12 +620,6 @@ elif source == "ipinfo":
     ip = str(data.get("ip") or "")
     country = str(data.get("country") or "")
     timezone = str(data.get("timezone") or "")
-elif source == "ip-api":
-    if data.get("status") != "success":
-        sys.exit(1)
-    ip = str(data.get("query") or "")
-    country = str(data.get("countryCode") or "")
-    timezone = str(data.get("timezone") or "")
 else:
     sys.exit(1)
 
@@ -528,9 +639,6 @@ lookup_geo() {
   parsed="$(printf '%s' "$body" | parse_geo_json ipinfo)"
   [[ -n "$parsed" ]] && { printf '%s' "$parsed"; return 0; }
 
-  body="$(proxy_curl "http://ip-api.com/json/?fields=status,message,countryCode,timezone,query")"
-  parsed="$(printf '%s' "$body" | parse_geo_json ip-api)"
-  [[ -n "$parsed" ]] && { printf '%s' "$parsed"; return 0; }
   return 1
 }
 
@@ -737,6 +845,11 @@ if [[ -n "$proxy_server_arg" ]]; then
   browser_args+=("--proxy-server=$proxy_server_arg")
   browser_args+=("${args[$((${#args[@]} - 2))]}" "${args[$((${#args[@]} - 1))]}")
   args=("${browser_args[@]}")
+fi
+
+if [[ -z "${DRY_RUN:-}" ]]; then
+  enforce_https_only_mode "$UDD"
+  ensure_chromium_webstore_install_flag "$UDD"
 fi
 
 run_browser_selftest() {

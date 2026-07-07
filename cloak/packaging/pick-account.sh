@@ -35,7 +35,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LAUNCH="$ROOT/packaging/launch-account.sh"
-ACCT_BASE="$HOME/Library/Application Support/ChatGPT Cloak/Accounts"
+ACCT_BASE="$HOME/Library/Application Support/NoTrace Browser/Accounts"
 [[ -x "$LAUNCH" ]] || { printf 'error: launcher not found: %s\n' "$LAUNCH" >&2; exit 1; }
 mkdir -p "$ACCT_BASE"
 chmod 700 "$ACCT_BASE" 2>/dev/null || true

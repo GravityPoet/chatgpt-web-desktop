@@ -101,7 +101,7 @@ newer="$(printf '%s\n%s\n' "$installed" "$latest" | sort -V | tail -1)"
 if [[ -n "${DRY_RUN:-}" ]]; then log "DRY-RUN: would update $installed -> $latest"; exit 0; fi
 
 # 4) never swap under a running browser
-if pgrep -f "user-data-dir=.*ChatGPT Cloak" >/dev/null 2>&1 || \
+if pgrep -f "user-data-dir=.*NoTrace Browser" >/dev/null 2>&1 || \
    pgrep -f "$CB/.*/Chromium.app/Contents/MacOS/Chromium" >/dev/null 2>&1; then
   log "Cloak Chromium running; defer update to next run"; exit 0
 fi

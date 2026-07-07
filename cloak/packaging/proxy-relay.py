@@ -2,7 +2,7 @@
 """Local SOCKS5 (no-auth) -> upstream proxy relay.
 
 Chromium has NO SOCKS5 username/password support: a `--proxy-server=socks5://`
-URL can only point at a no-auth proxy. To let one ChatGPT Cloak account use an
+URL can only point at a no-auth proxy. To let one NoTrace Browser account use an
 *authenticated* SOCKS5/HTTP proxy, this relay listens on 127.0.0.1 as a plain
 no-auth SOCKS5 server and bridges every CONNECT to the real (authenticated)
 upstream. The browser only ever sees a local no-auth socket; the credentials
@@ -15,7 +15,7 @@ traffic -- the same guarantee as Firefox's `network.proxy.socks_remote_dns=true`
 
 Usage:
     proxy-relay.py --listen 127.0.0.1:PORT --upstream URL
-    URL = socks5://[user:pass@]host:port | http://[user:pass@]host:port | direct
+    URL = socks5://[credentials@]host:port | http://[credentials@]host:port | direct
 
 Bind host is forced to 127.0.0.1 regardless of --listen: this relay is no-auth and
 must never be reachable off the loopback interface.

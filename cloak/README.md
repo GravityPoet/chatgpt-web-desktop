@@ -1,6 +1,6 @@
-# ChatGPT Cloak
+# NoTrace Browser
 
-ChatGPT Cloak runs ChatGPT Web inside the locally installed CloakBrowser patched Chromium (anti-fingerprint), packaged as a single-tile macOS app.
+NoTrace Browser runs ChatGPT Web inside the locally installed CloakBrowser patched Chromium (anti-fingerprint), packaged as a single-tile macOS app.
 
 This route is independent from the existing `swift/` and `tauri/` implementations. It does not use WKWebView, Tauri WebView, Docker, VNC, or CloakBrowser Manager.
 
@@ -16,11 +16,11 @@ The shipping UX is a **Chromium "installed app" (PWA)**, not a custom launcher:
 
 ### Runtime paths
 
-- App bundle (PWA): `~/Applications/Chromium Apps.localized/ChatGPT Cloak.app`
+- App bundle (PWA): `~/Applications/Chromium Apps.localized/NoTrace Browser.app`
 - App-mode shortcut id: `CrAppModeShortcutID` under the profile
 - ChatGPT URL: `https://chatgpt.com/`
 - CloakBrowser Chromium: `~/.cloakbrowser/chromium-<version>/Chromium.app/Contents/MacOS/Chromium`
-- Profile (cloaked, persistent): `~/Library/Application Support/ChatGPT Cloak/Profiles/main`
+- Profile (cloaked, persistent): `~/Library/Application Support/NoTrace Browser/Profiles/main`
 
 ## Create the single-tile app
 
@@ -28,7 +28,7 @@ There is no stable CLI for Chromium's "Install as app", so this step is manual:
 
 1. Open the cloaked profile in a full Chromium window (logged in to ChatGPT).
 2. Chromium **⋮ → 更多工具 → 创建快捷方式…** (More tools → Create shortcut…).
-3. Name it `ChatGPT Cloak`, **check 在窗口中打开 (Open as window)**, click 创建.
+3. Name it `NoTrace Browser`, **check 在窗口中打开 (Open as window)**, click 创建.
 
 The bundle appears in `~/Applications/Chromium Apps.localized/` and Launchpad.
 
@@ -47,7 +47,7 @@ the bundle root, independent of Chrome's in-place `app.icns` rewrite:
 ./packaging/set-pwa-icon.sh
 ```
 
-It applies `packaging/icon-green.icns` to `~/Applications/Chromium Apps.localized/ChatGPT Cloak.app`
+It applies `packaging/icon-green.icns` to `~/Applications/Chromium Apps.localized/NoTrace Browser.app`
 via `NSWorkspace setIcon:forFile:` and refreshes the Dock. Verified: the LaunchServices-resolved
 icon is full-bleed green and survives a PWA relaunch. Re-run only if a Chromium upgrade recreates
 the shim from scratch.
@@ -195,7 +195,7 @@ Each account gets:
   (`--fingerprint-platform=macos`); faking Windows-on-Mac creates detectable
   contradictions.
 - **Own login/storage** — `--user-data-dir` under
-  `~/Library/Application Support/ChatGPT Cloak/Accounts/<name>`, never the daily
+  `~/Library/Application Support/NoTrace Browser/Accounts/<name>`, never the daily
   `main` PWA profile.
 - **Timezone follows the VPN exit** — the zone is read from the current IP and
   passed as `--fingerprint-timezone` plus `TZ`, so ICU reports it in **both** the

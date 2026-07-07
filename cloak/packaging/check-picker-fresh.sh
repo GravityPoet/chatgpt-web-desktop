@@ -64,7 +64,7 @@ picker_running() {
 }
 
 notify() {
-  /usr/bin/osascript -e "display notification \"$1\" with title \"ChatGPT Cloak\"" >/dev/null 2>&1 || true
+  /usr/bin/osascript -e "display notification \"$1\" with title \"NoTrace Browser\"" >/dev/null 2>&1 || true
 }
 
 rebuild() {

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Force the ChatGPT Cloak PWA Dock/Finder icon to the full-bleed green ChatGPT icon,
+# Force the NoTrace Browser PWA Dock/Finder icon to the full-bleed green ChatGPT icon,
 # overriding Chrome's white-inset PWA shim icon.
 #
 # Chrome renders the web app icon shrunk onto a white macOS squircle and writes that to
@@ -17,12 +17,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ICON="${ICON:-$ROOT/packaging/icon-green.icns}"
-PWA_APP="${PWA_APP:-$HOME/Applications/Chromium Apps.localized/ChatGPT Cloak.app}"
+PWA_APP="${PWA_APP:-$HOME/Applications/Chromium Apps.localized/NoTrace Browser.app}"
 
 [[ -f "$ICON" ]] || { printf 'error: icon not found: %s\n' "$ICON" >&2; exit 1; }
 
 # If a stale dead shim was still holding the canonical name when the PWA was
-# reinstalled, Chromium saves the new shim as "ChatGPT Cloak 1.app" (2, 3, ...).
+# reinstalled, Chromium saves the new shim as "NoTrace Browser 1.app" (2, 3, ...).
 # The numbered bundle is the freshly installed working one; the unnumbered one is
 # the dead leftover. Converge before touching icons: drop the stale bundle and move
 # the numbered one onto the canonical path — the Dock tile references the canonical
@@ -57,7 +57,7 @@ fi
 # or a web-app icon/title/start_url change) respawns the loader and rewrites app.icns
 # back to the teal shim icon. So also kill the loader by its exact path — surgical,
 # this never matches the main browser or any other PWA.
-/usr/bin/osascript -e 'tell application "ChatGPT Cloak" to quit' >/dev/null 2>&1 || true
+/usr/bin/osascript -e 'tell application "NoTrace Browser" to quit' >/dev/null 2>&1 || true
 /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
 
 # 1) Overwrite the Dock-read shim icon with the full-bleed green icns, then verify it
@@ -69,7 +69,7 @@ for _try in 1 2 3 4 5; do
   if /usr/bin/cmp -s "$ICON" "$PWA_APP/Contents/Resources/app.icns"; then copied=1; break; fi
   /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
 done
-[[ -n "$copied" ]] || { printf 'error: app.icns keeps reverting to the teal shim icon — fully quit the ChatGPT Cloak PWA, then re-run\n' >&2; exit 1; }
+[[ -n "$copied" ]] || { printf 'error: app.icns keeps reverting to the teal shim icon — fully quit the NoTrace Browser PWA, then re-run\n' >&2; exit 1; }
 printf 'app.icns -> %s (verified green)\n' "$ICON"
 
 # 2) Set the Finder custom icon (Finder / Launchpad / Get-Info).

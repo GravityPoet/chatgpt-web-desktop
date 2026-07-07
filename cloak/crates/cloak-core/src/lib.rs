@@ -12,7 +12,7 @@ use std::fs;
 use std::io;
 use std::io::Cursor;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream as StdTcpStream};
+use std::net::{TcpStream as StdTcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,6 +25,8 @@ const RELAY_PLACEHOLDER: &str = "socks5://127.0.0.1:<relay-port>";
 const CLOAK_CHROME_MAJOR_FALLBACK: &str = "145";
 const CLOAK_MAC_UA_VERSION: &str = "10_15_7";
 const CLOAK_MAC_PLATFORM_VERSION: &str = "15.5.0";
+const HTTPS_ONLY_MODE_PREF: &str = "https_only_mode_enabled";
+const EXTENSION_MIME_REQUEST_HANDLING_FLAG: &str = "extension-mime-request-handling@2";
 
 /// Apple Silicon GPU renderer pool — base chips only, coherent with 8-core hardwareConcurrency.
 /// Pro/Max/Ultra variants excluded to avoid "M4 Max + 8 cores" inconsistency.
@@ -433,6 +435,14 @@ pub fn read_account(config: &CloakConfig, name: &str) -> Result<Account> {
 }
 
 pub fn create_account(config: &CloakConfig, name: &str) -> Result<Account> {
+    create_account_with_group(config, name, None)
+}
+
+pub fn create_account_with_group(
+    config: &CloakConfig,
+    name: &str,
+    group: Option<&str>,
+) -> Result<Account> {
     validate_account_name(name)?;
     let profile = config.profile_dir(name);
     if profile.exists() {
@@ -445,6 +455,9 @@ pub fn create_account(config: &CloakConfig, name: &str) -> Result<Account> {
         &profile.join(".cloak-created-at"),
         &current_created_at().to_string(),
     )?;
+    if let Some(raw) = group.map(str::trim).filter(|value| !value.is_empty()) {
+        write_secret_atomic(&profile.join(".cloak-group"), raw)?;
+    }
     read_account(config, name)
 }
 
@@ -498,6 +511,8 @@ pub fn set_account_trashed(config: &CloakConfig, name: &str, trashed: bool) -> R
     if trashed && account_profile_is_running(&profile)? {
         return Err(CloakError::AccountRunning(name.to_string()));
     }
+
+    pin_account_created_at(&profile)?;
 
     let trash_path = profile.join(".cloak-trashed");
     let deleted_at_path = profile.join(".cloak-deleted-at");
@@ -748,6 +763,9 @@ pub fn launch_account(config: &CloakConfig, name: &str, options: &LaunchOptions)
     }
 
     secure_account_dir(&plan.profile_path)?;
+    ensure_legacy_rename_compat(config)?;
+    enforce_https_only_mode(&plan.profile_path)?;
+    enforce_chromium_webstore_install_flag(&plan.profile_path)?;
     prepare_account_extension(config, &plan)?;
 
     let mut argv = plan.argv.clone();
@@ -902,7 +920,12 @@ fn live_supervised_relay_port(state_path: &Path, expected_hash: &str) -> Result<
 }
 
 fn local_socks5_ready(port: u16) -> bool {
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let Ok(mut addrs) = ("localhost", port).to_socket_addrs() else {
+        return false;
+    };
+    let Some(addr) = addrs.next() else {
+        return false;
+    };
     let Ok(mut stream) = StdTcpStream::connect_timeout(&addr, Duration::from_millis(250)) else {
         return false;
     };
@@ -1079,6 +1102,15 @@ fn account_created_at(profile_path: &Path) -> Result<u64> {
     let metadata = fs::metadata(profile_path)?;
     let created_at = metadata.created().or_else(|_| metadata.modified()).ok();
     Ok(created_at.map(system_time_micros).unwrap_or(0))
+}
+
+fn pin_account_created_at(profile_path: &Path) -> Result<u64> {
+    let created_at = account_created_at(profile_path)?;
+    write_secret_atomic(
+        &profile_path.join(".cloak-created-at"),
+        &created_at.to_string(),
+    )?;
+    Ok(created_at)
 }
 
 fn current_created_at() -> u64 {
@@ -1383,12 +1415,94 @@ fn extra_extensions_root() -> Result<PathBuf> {
         return Ok(PathBuf::from(path));
     }
     let home = home_dir()?;
-    let local_cache = home.join("Library/Application Support/ChatGPT Cloak/Default Extensions");
+    let local_cache = default_extensions_root(&home);
     if local_cache.is_dir() {
         return Ok(local_cache);
     }
     Ok(home
         .join("Library/Mobile Documents/com~apple~CloudDocs/电脑文件/Google插件/Cloak 浏览器插件"))
+}
+
+#[cfg(target_os = "macos")]
+fn default_extensions_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/NoTrace Browser/Default Extensions")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn default_extensions_root(home: &Path) -> PathBuf {
+    home.join(".config/NoTrace Browser/Default Extensions")
+}
+
+fn legacy_default_extensions_root(home: &Path) -> PathBuf {
+    home.join("Library/Application Support/ChatGPT Cloak/Default Extensions")
+}
+
+fn ensure_legacy_rename_compat(config: &CloakConfig) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = home_dir()?;
+        let legacy_root = home.join("Library/Application Support/ChatGPT Cloak");
+        let legacy_accounts = legacy_root.join("Accounts");
+        if config.account_base.is_dir() && !path_exists_or_symlink(&legacy_accounts) {
+            fs::create_dir_all(&legacy_root)?;
+            secure_dir(&legacy_root)?;
+            symlink_path(&config.account_base, &legacy_accounts)?;
+        }
+
+        ensure_legacy_default_extension_links(
+            &default_extensions_root(&home),
+            &legacy_default_extensions_root(&home),
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_legacy_default_extension_links(current_root: &Path, legacy_root: &Path) -> Result<()> {
+    if !current_root.is_dir() {
+        return Ok(());
+    }
+    if !path_exists_or_symlink(legacy_root) {
+        if let Some(parent) = legacy_root.parent() {
+            fs::create_dir_all(parent)?;
+            secure_dir(parent)?;
+        }
+        symlink_path(current_root, legacy_root)?;
+        return Ok(());
+    }
+    if !legacy_root.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(current_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == OsStr::new(".DS_Store") {
+            continue;
+        }
+        let legacy_path = legacy_root.join(&name);
+        if !path_exists_or_symlink(&legacy_path) {
+            symlink_path(&entry.path(), &legacy_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn path_exists_or_symlink(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok()
+}
+
+#[cfg(unix)]
+fn symlink_path(src: &Path, dst: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn symlink_path(src: &Path, dst: &Path) -> io::Result<()> {
+    if src.is_dir() {
+        std::os::windows::fs::symlink_dir(src, dst)
+    } else {
+        std::os::windows::fs::symlink_file(src, dst)
+    }
 }
 
 fn slug_for_path(path: &Path) -> String {
@@ -1443,10 +1557,6 @@ fn lookup_geo(proxy: &ProxyConfig) -> Result<GeoPlan> {
     let sources = [
         ("https://ipwho.is/", "ipwho"),
         ("https://ipinfo.io/json", "ipinfo"),
-        (
-            "http://ip-api.com/json/?fields=status,message,countryCode,timezone,query",
-            "ip-api",
-        ),
     ];
     for (url, source) in sources {
         if let Ok(response) = client.get(url).send() {
@@ -1489,19 +1599,6 @@ fn parse_geo_json(source: &str, body: &str) -> Option<GeoPlan> {
             (
                 value.get("ip")?.as_str()?,
                 value.get("country").and_then(Value::as_str).unwrap_or(""),
-                value.get("timezone")?.as_str()?,
-            )
-        }
-        "ip-api" => {
-            if value.get("status")?.as_str()? != "success" {
-                return None;
-            }
-            (
-                value.get("query")?.as_str()?,
-                value
-                    .get("countryCode")
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
                 value.get("timezone")?.as_str()?,
             )
         }
@@ -1967,6 +2064,70 @@ fn read_first_line(path: &Path) -> Result<Option<String>> {
         .filter(|s| !s.is_empty()))
 }
 
+fn enforce_https_only_mode(profile_path: &Path) -> Result<()> {
+    let prefs_path = profile_path.join("Default").join("Preferences");
+    let mut root = if prefs_path.exists() {
+        let body = fs::read_to_string(&prefs_path)?;
+        serde_json::from_str::<Value>(&body)?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(serde_json::Map::new());
+    }
+    root.as_object_mut()
+        .expect("root object checked")
+        .insert(HTTPS_ONLY_MODE_PREF.to_string(), Value::Bool(true));
+    let encoded = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    write_secret_atomic(&prefs_path, &encoded)?;
+    Ok(())
+}
+
+fn enforce_chromium_webstore_install_flag(profile_path: &Path) -> Result<()> {
+    let state_path = profile_path.join("Local State");
+    let mut root = if state_path.exists() {
+        let body = fs::read_to_string(&state_path)?;
+        serde_json::from_str::<Value>(&body)?
+    } else {
+        Value::Object(serde_json::Map::new())
+    };
+    if !root.is_object() {
+        root = Value::Object(serde_json::Map::new());
+    }
+    let object = root.as_object_mut().expect("root object checked");
+    let browser = object
+        .entry("browser".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !browser.is_object() {
+        *browser = Value::Object(serde_json::Map::new());
+    }
+    let browser = browser.as_object_mut().expect("browser object checked");
+    let existing = browser
+        .get("enabled_labs_experiments")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut labs = existing
+        .iter()
+        .filter_map(Value::as_str)
+        .filter(|value| !value.starts_with("extension-mime-request-handling@"))
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if !labs
+        .iter()
+        .any(|value| value == EXTENSION_MIME_REQUEST_HANDLING_FLAG)
+    {
+        labs.push(EXTENSION_MIME_REQUEST_HANDLING_FLAG.to_string());
+    }
+    browser.insert(
+        "enabled_labs_experiments".to_string(),
+        Value::Array(labs.into_iter().map(Value::String).collect()),
+    );
+    let encoded = format!("{}\n", serde_json::to_string_pretty(&root)?);
+    write_secret_atomic(&state_path, &encoded)?;
+    Ok(())
+}
+
 fn write_secret_atomic(path: &Path, value: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
@@ -2084,19 +2245,19 @@ fn find_repo_root(start: PathBuf) -> Option<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn default_account_base(home: &Path) -> PathBuf {
-    home.join("Library/Application Support/ChatGPT Cloak/Accounts")
+    home.join("Library/Application Support/NoTrace Browser/Accounts")
 }
 
 #[cfg(target_os = "windows")]
 fn default_account_base(_home: &Path) -> PathBuf {
     dirs::config_dir()
         .unwrap_or_else(|| PathBuf::from(r"C:\Users\Default\AppData\Roaming"))
-        .join("ChatGPT Cloak/Accounts")
+        .join("NoTrace Browser/Accounts")
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn default_account_base(home: &Path) -> PathBuf {
-    home.join(".config/ChatGPT Cloak/Accounts")
+    home.join(".config/NoTrace Browser/Accounts")
 }
 
 fn truthy_env(key: &str) -> bool {
@@ -2183,6 +2344,27 @@ mod tests {
         assert_eq!(account.created_at, renamed.created_at);
         assert!(renamed.profile_path.join(".cloak-seed").exists());
         assert!(renamed.profile_path.join(".cloak-created-at").exists());
+    }
+
+    #[test]
+    fn create_account_can_assign_group_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        let account = create_account_with_group(&config, "work", Some(" codex ")).unwrap();
+        assert_eq!(account.group.as_deref(), Some("codex"));
+        assert_eq!(
+            read_first_line(&config.profile_dir("work").join(".cloak-group"))
+                .unwrap()
+                .as_deref(),
+            Some("codex")
+        );
     }
 
     #[test]
@@ -2314,6 +2496,29 @@ mod tests {
         assert_eq!(restored.seed, account.seed);
         assert_eq!(list_accounts(&config).unwrap().len(), 1);
         assert!(list_trashed_accounts(&config).unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_account_creation_time_survives_trash_and_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = CloakConfig {
+            repo_root: dir.path().to_path_buf(),
+            account_base: dir.path().join("accounts"),
+            extension_source: dir.path().join("extension"),
+            cloakbrowser_root: dir.path().join("browser"),
+        };
+        fs::create_dir_all(&config.extension_source).unwrap();
+
+        let profile = config.profile_dir("legacy");
+        fs::create_dir_all(&profile).unwrap();
+        let original_created_at = read_account(&config, "legacy").unwrap().created_at;
+
+        let trashed = set_account_trashed(&config, "legacy", true).unwrap();
+        assert_eq!(trashed.created_at, original_created_at);
+        assert!(profile.join(".cloak-created-at").exists());
+
+        let restored = set_account_trashed(&config, "legacy", false).unwrap();
+        assert_eq!(restored.created_at, original_created_at);
     }
 
     #[test]
@@ -2472,6 +2677,83 @@ mod tests {
         assert!(!companion_page_spoof_enabled_from(Some("0"), None));
         assert!(!companion_page_spoof_enabled_from(None, Some("false")));
         assert!(!companion_page_spoof_enabled_from(Some("OFF"), Some("1")));
+    }
+
+    #[test]
+    fn enforce_https_only_mode_preserves_existing_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("account");
+        let prefs = profile.join("Default").join("Preferences");
+        write_secret_atomic(
+            &prefs,
+            r#"{"profile":{"exit_type":"Normal"},"session":{"restore_on_startup":5}}"#,
+        )
+        .unwrap();
+
+        enforce_https_only_mode(&profile).unwrap();
+
+        let root: Value = serde_json::from_str(&fs::read_to_string(&prefs).unwrap()).unwrap();
+        assert_eq!(
+            root.get("https_only_mode_enabled"),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            root.pointer("/profile/exit_type").and_then(Value::as_str),
+            Some("Normal")
+        );
+        assert_eq!(
+            root.pointer("/session/restore_on_startup")
+                .and_then(Value::as_i64),
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn enforce_chromium_webstore_install_flag_preserves_existing_labs() {
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("account");
+        let state = profile.join("Local State");
+        write_secret_atomic(
+            &state,
+            r#"{"browser":{"enabled_labs_experiments":["other-flag@1","extension-mime-request-handling@1"]}}"#,
+        )
+        .unwrap();
+
+        enforce_chromium_webstore_install_flag(&profile).unwrap();
+
+        let root: Value = serde_json::from_str(&fs::read_to_string(&state).unwrap()).unwrap();
+        let labs = root
+            .pointer("/browser/enabled_labs_experiments")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(labs.contains(&"other-flag@1"));
+        assert!(labs.contains(&EXTENSION_MIME_REQUEST_HANDLING_FLAG));
+        assert!(!labs.contains(&"extension-mime-request-handling@1"));
+    }
+
+    #[test]
+    fn ensure_legacy_default_extension_links_resolves_child_manifests() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("NoTrace Browser/Default Extensions");
+        let legacy = dir.path().join("ChatGPT Cloak/Default Extensions");
+        let cws = current.join("Chromium Web Store 插件");
+        let cookies = current.join("get-cookies.txt-locally_v0.7.2_chrome");
+        fs::create_dir_all(&cws).unwrap();
+        fs::create_dir_all(&cookies).unwrap();
+        fs::write(cws.join("manifest.json"), "{}").unwrap();
+        fs::write(cookies.join("manifest.json"), "{}").unwrap();
+
+        ensure_legacy_default_extension_links(&current, &legacy).unwrap();
+
+        assert!(legacy
+            .join("Chromium Web Store 插件/manifest.json")
+            .is_file());
+        assert!(legacy
+            .join("get-cookies.txt-locally_v0.7.2_chrome/manifest.json")
+            .is_file());
     }
 
     #[test]

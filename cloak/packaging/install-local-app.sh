@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-APP_NAME="ChatGPT Cloak"
+APP_NAME="NoTrace Browser"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
 INSTALL_APP="/Applications/$APP_NAME.app"
 INSTALL_TMP="/Applications/.$APP_NAME.app.tmp.$$"
