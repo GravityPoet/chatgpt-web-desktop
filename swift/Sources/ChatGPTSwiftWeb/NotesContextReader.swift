@@ -1,6 +1,7 @@
+import AppKit
 import Foundation
 
-enum NotesContextError: LocalizedError {
+enum NotesContextError: LocalizedError, Equatable {
     case emptySelection
     case automationDenied
     case scriptFailed(String)
@@ -17,49 +18,80 @@ enum NotesContextError: LocalizedError {
     }
 }
 
-enum NotesContextReader {
-    static func readSelectedNote(completion: @escaping (Result<String, Error>) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async {
-            var errorInfo: NSDictionary?
-            let script = NSAppleScript(source: """
-            tell application "Notes"
-                if (count of windows) is 0 then activate
-                set selectedNotes to selection
-                if selectedNotes is {} then return ""
-                set selectedNote to item 1 of selectedNotes
-                set noteTitle to name of selectedNote
-                set noteBodyHTML to body of selectedNote
-                return noteTitle & linefeed & "----CHATGPT_SWIFT_NOTES_BODY----" & linefeed & noteBodyHTML
-            end tell
-            """)
+enum NotesScriptExecutionResult {
+    case success(String)
+    case failure(number: Int?, message: String)
+}
 
-            guard let descriptor = script?.executeAndReturnError(&errorInfo) else {
-                if appleScriptErrorNumber(errorInfo) == -1743 {
+protocol NotesScriptExecuting {
+    func execute(_ source: String) -> NotesScriptExecutionResult
+}
+
+struct SystemNotesScriptExecutor: NotesScriptExecuting {
+    func execute(_ source: String) -> NotesScriptExecutionResult {
+        var errorInfo: NSDictionary?
+        guard let script = NSAppleScript(source: source) else {
+            return .failure(number: nil, message: "AppleScript 无法创建")
+        }
+
+        let descriptor = script.executeAndReturnError(&errorInfo)
+        if errorInfo != nil {
+            let number: Int?
+            if let value = errorInfo?[NSAppleScript.errorNumber] as? NSNumber {
+                number = value.intValue
+            } else {
+                number = errorInfo?[NSAppleScript.errorNumber] as? Int
+            }
+            let message = errorInfo?[NSAppleScript.errorMessage] as? String ?? "AppleScript 无返回"
+            return .failure(number: number, message: message)
+        }
+        return .success(descriptor.stringValue ?? "")
+    }
+}
+
+enum NotesContextReader {
+    static let scriptSource = """
+    tell application "Notes"
+        if (count of windows) is 0 then activate
+        set selectedNotes to selection
+        if selectedNotes is {} then return ""
+        set selectedNote to item 1 of selectedNotes
+        set noteTitle to name of selectedNote
+        set noteBodyHTML to body of selectedNote
+        return noteTitle & linefeed & "----CHATGPT_SWIFT_NOTES_BODY----" & linefeed & noteBodyHTML
+    end tell
+    """
+
+    static func readSelectedNote(
+        executor: NotesScriptExecuting = SystemNotesScriptExecutor(),
+        queue: DispatchQueue = DispatchQueue.global(qos: .userInitiated),
+        completion: @escaping (Result<String, Error>) -> Void
+    ) {
+        queue.async {
+            switch executor.execute(scriptSource) {
+            case .failure(let number, let message):
+                if number == -1743 {
                     completion(.failure(NotesContextError.automationDenied))
+                } else {
+                    completion(.failure(NotesContextError.scriptFailed(message)))
+                }
+            case .success(let rawText):
+                let cleaned = contextText(from: rawText)
+                guard !cleaned.isEmpty else {
+                    completion(.failure(NotesContextError.emptySelection))
                     return
                 }
-                let message = errorInfo?[NSAppleScript.errorMessage] as? String ?? "AppleScript 无返回"
-                completion(.failure(NotesContextError.scriptFailed(message)))
-                return
+
+                completion(.success("""
+                以下是我在 Apple Notes 列表中当前选中的备忘录标题和完整正文，请参考：
+
+                \(cleaned)
+                """))
             }
-
-            let rawText = descriptor.stringValue ?? ""
-            let cleaned = contextText(from: rawText)
-
-            guard !cleaned.isEmpty else {
-                completion(.failure(NotesContextError.emptySelection))
-                return
-            }
-
-            completion(.success("""
-            以下是我在 Apple Notes 列表中当前选中的备忘录标题和完整正文，请参考：
-
-            \(cleaned)
-            """))
         }
     }
 
-    private static func contextText(from rawText: String) -> String {
+    static func contextText(from rawText: String) -> String {
         let marker = "----CHATGPT_SWIFT_NOTES_BODY----"
         let parts = rawText.components(separatedBy: marker)
         if parts.count >= 2 {
@@ -74,7 +106,7 @@ enum NotesContextReader {
         return normalizePlainText(htmlToPlainText(rawText))
     }
 
-    private static func htmlToPlainText(_ html: String) -> String {
+    static func htmlToPlainText(_ html: String) -> String {
         guard let data = html.data(using: .utf8),
               let attributed = try? NSAttributedString(
                 data: data,
@@ -89,7 +121,7 @@ enum NotesContextReader {
         return attributed.string
     }
 
-    private static func normalizePlainText(_ text: String) -> String {
+    static func normalizePlainText(_ text: String) -> String {
         let lines = text
             .replacingOccurrences(of: "\r\n", with: "\n")
             .replacingOccurrences(of: "\r", with: "\n")
@@ -108,12 +140,5 @@ enum NotesContextReader {
         return normalizedLines
             .joined(separator: "\n")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private static func appleScriptErrorNumber(_ errorInfo: NSDictionary?) -> Int? {
-        if let number = errorInfo?[NSAppleScript.errorNumber] as? NSNumber {
-            return number.intValue
-        }
-        return errorInfo?[NSAppleScript.errorNumber] as? Int
     }
 }

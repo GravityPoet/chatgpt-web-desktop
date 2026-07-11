@@ -20,8 +20,18 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 - 支持 OAuth / 登录弹窗、新窗口；第三方链接可选择 App 内或系统浏览器打开
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
+- ChatGPT / OpenAI 可信页面首次使用麦克风或摄像头仍由 macOS 原生授权；系统已授权后直接复用，不再反复弹网页授权
+- email 型账号空间名在主窗口标题中显示为“邮箱账号（已遮罩）”，避免截图或录屏泄露账号
 - 显式单实例锁：重复打开会激活已有窗口，不会堆多个进程
 - `Info.plist` 已声明 Apple Events、麦克风、摄像头、下载目录权限说明
+
+## 源码结构
+
+- `main.swift`：共享运行支撑与 App 启动入口
+- `AppDelegate.swift`：菜单、设置、profile 生命周期、诊断与通知编排
+- `BrowserWindowController.swift`：WKWebView 窗口、导航、权限与下载桥
+- `BrowserSupport.swift`：profile、指纹、隐私脚本与数据存储支撑
+- `CompletionNotificationService.swift`、`DownloadStore.swift`、`NotesContextReader.swift`：可独立集成测试的原生能力边界
 
 ## 构建
 

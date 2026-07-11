@@ -26,6 +26,7 @@ let package = Package(
             ],
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("WebKit"),
                 .linkedFramework("UniformTypeIdentifiers"),
                 .linkedFramework("UserNotifications"),
@@ -34,6 +35,10 @@ let package = Package(
         .testTarget(
             name: "ChatGPTSwiftWebCoreTests",
             dependencies: ["ChatGPTSwiftWebCore"]
+        ),
+        .testTarget(
+            name: "ChatGPTSwiftWebIntegrationTests",
+            dependencies: ["ChatGPTSwiftWeb"]
         ),
     ]
 )
