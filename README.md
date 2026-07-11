@@ -19,7 +19,7 @@ It does not bypass ChatGPT subscriptions, usage limits, or account permissions. 
 - Uses a dedicated app window instead of a normal browser tab.
 - Keeps its WebView storage separate from Chrome, Safari, and other wrappers.
 - Preserves login/OAuth flows inside the app when possible.
-- Handles external links through the system browser.
+- Lets you choose whether third-party links stay in the app or open in the system browser.
 - Adds desktop conveniences such as window restore, single-instance behavior, zoom shortcuts, and download handling.
 
 ## Why Use This
