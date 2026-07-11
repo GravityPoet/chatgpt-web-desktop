@@ -14,12 +14,20 @@ mkdir -p "$STAGING"
 cp -R "$APP_DIR" "$STAGING/"
 ln -s /Applications "$STAGING/Applications"
 
-hdiutil create \
-  -volname "$APP_NAME" \
-  -srcfolder "$STAGING" \
-  -ov \
-  -format UDZO \
-  "$DMG_PATH"
+if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
+  /usr/sbin/diskutil image create from \
+    --format UDZO \
+    --volumeName "$APP_NAME" \
+    "$STAGING" \
+    "$DMG_PATH"
+else
+  hdiutil create \
+    -volname "$APP_NAME" \
+    -srcfolder "$STAGING" \
+    -ov \
+    -format UDZO \
+    "$DMG_PATH"
+fi
 
 hdiutil verify "$DMG_PATH"
 echo "$DMG_PATH"

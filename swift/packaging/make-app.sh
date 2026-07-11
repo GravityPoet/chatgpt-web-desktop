@@ -17,6 +17,17 @@ SIGN_ENTITLEMENTS="${CHATGPT_SWIFT_CODESIGN_ENTITLEMENTS:-}"
 LOCAL_ENTITLEMENTS="$ROOT/packaging/local-debug.entitlements"
 SPARKLE_FEED_URL="${CHATGPT_SWIFT_SPARKLE_FEED_URL:-}"
 SPARKLE_PUBLIC_ED_KEY="${CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY:-}"
+SHORT_VERSION_OVERRIDE="${CHATGPT_SWIFT_SHORT_VERSION:-}"
+BUILD_NUMBER_OVERRIDE="${CHATGPT_SWIFT_BUILD_NUMBER:-}"
+
+if [[ -n "$SHORT_VERSION_OVERRIDE" && ! "$SHORT_VERSION_OVERRIDE" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "error: CHATGPT_SWIFT_SHORT_VERSION must use numeric major.minor.patch format." >&2
+  exit 2
+fi
+if [[ -n "$BUILD_NUMBER_OVERRIDE" && ! "$BUILD_NUMBER_OVERRIDE" =~ ^[1-9][0-9]*$ ]]; then
+  echo "error: CHATGPT_SWIFT_BUILD_NUMBER must be a positive integer." >&2
+  exit 2
+fi
 
 cd "$ROOT"
 
@@ -39,6 +50,14 @@ mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
 
 cp ".build/release/$BINARY_NAME" "$MACOS/$BINARY_NAME"
 cp "$ROOT/packaging/Info.plist" "$CONTENTS/Info.plist"
+
+if [[ -n "$SHORT_VERSION_OVERRIDE" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $SHORT_VERSION_OVERRIDE" "$CONTENTS/Info.plist"
+fi
+if [[ -n "$BUILD_NUMBER_OVERRIDE" ]]; then
+  /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_NUMBER_OVERRIDE" "$CONTENTS/Info.plist"
+fi
+/usr/bin/plutil -lint "$CONTENTS/Info.plist" >/dev/null
 
 if [[ -n "$SPARKLE_FEED_URL" || -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
   if [[ -z "$SPARKLE_FEED_URL" || -z "$SPARKLE_PUBLIC_ED_KEY" ]]; then

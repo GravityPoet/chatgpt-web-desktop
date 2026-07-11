@@ -2,6 +2,10 @@ import XCTest
 @testable import ChatGPTSwiftWebCore
 
 final class NavigationRulesTests: XCTestCase {
+    func testThirdPartyLinksDefaultToSystemBrowser() {
+        XCTAssertFalse(NavigationRules.defaultKeepThirdPartyLinksInApp)
+    }
+
     func testValidatedExternalURLAddsHTTPSAndRejectsUnsafeSchemes() {
         XCTAssertEqual(NavigationRules.validatedExternalURL("example.com")?.absoluteString, "https://example.com")
         XCTAssertEqual(NavigationRules.validatedExternalURL(" https://chatgpt.com/ ")?.absoluteString, "https://chatgpt.com/")

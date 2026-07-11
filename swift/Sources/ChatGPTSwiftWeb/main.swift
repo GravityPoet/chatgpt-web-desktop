@@ -590,7 +590,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(NSMenuItem.separator())
-        let notesContextItem = editMenu.addItem(withTitle: "插入备忘录上下文", action: #selector(insertNotesContextAction(_:)), keyEquivalent: "")
+        let notesContextItem = editMenu.addItem(withTitle: "插入选中备忘录正文", action: #selector(insertNotesContextAction(_:)), keyEquivalent: "")
         notesContextItem.target = self
         editItem.submenu = editMenu
         mainMenu.addItem(editItem)
@@ -1040,7 +1040,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
             webRTCProtectionEnabled: PrivacySettings.isWebRTCProtectionEnabled(),
             keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp(),
-            notesAutomationStatus: "按需请求；首次插入备忘录上下文时由 macOS 弹出授权。",
+            notesAutomationStatus: "按需请求；首次插入选中备忘录正文时由 macOS 弹出授权。",
             updateStatus: updateCheckStatus,
             distributionStatus: "\(sparkleStatus)。本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
         )
@@ -1054,7 +1054,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func exportDiagnosticsPackage(_ state: AppDiagnosticsState) {
         let panel = NSSavePanel()
         panel.title = "导出诊断包"
-        panel.message = "导出当前诊断信息和最近 10 分钟本 App 统一日志。不会导出 cookies、localStorage 或聊天内容。"
+        panel.message = "导出默认脱敏后的当前诊断、最近 10 分钟本 App 统一日志和崩溃报告。不会主动读取 cookies、localStorage 或聊天正文；账号名、会话标题、完整 URL、邮箱和用户主目录会按已知模式脱敏。分享前仍请检查包内文本。"
         panel.prompt = "导出"
         panel.allowedContentTypes = [.zip]
         panel.nameFieldStringValue = "chatgpt-swift-diagnostics-\(Self.filenameTimestamp(Date())).zip"
@@ -1087,7 +1087,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 bundleID: \(Bundle.main.bundleIdentifier ?? appBundleIdentifier)
                 version: \(Self.appVersionText())
                 process: \(ProcessInfo.processInfo.processName)
-                note: This package excludes cookies, localStorage, IndexedDB, and chat transcript content. It may include recent local crash reports for this app process.
+                note: This package does not intentionally read cookies, localStorage, IndexedDB, or chat transcript content. App diagnostics remove profile names, page titles, and full page URLs; logs and crash reports redact known URL, email, and user-home patterns. Review the text before sharing.
                 """
                 try manifest.write(
                     to: packageDir.appendingPathComponent("manifest.txt"),
@@ -1108,10 +1108,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     try fileManager.createDirectory(at: crashReportDir, withIntermediateDirectories: true)
                     for reportURL in crashReports {
                         let destination = crashReportDir.appendingPathComponent(reportURL.lastPathComponent)
-                        if fileManager.fileExists(atPath: destination.path) {
-                            try fileManager.removeItem(at: destination)
+                        let reportData = try Data(contentsOf: reportURL)
+                        guard let reportText = String(data: reportData, encoding: .utf8) else {
+                            continue
                         }
-                        try fileManager.copyItem(at: reportURL, to: destination)
+                        try DiagnosticRedactor.text(reportText).write(
+                            to: destination,
+                            atomically: true,
+                            encoding: .utf8
+                        )
                     }
                 }
 
@@ -1129,7 +1134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     currentDirectory: nil
                 )
                 let logText = logResult.output.isEmpty ? logResult.errorOutput : logResult.output
-                try logText.write(
+                try DiagnosticRedactor.text(logText).write(
                     to: packageDir.appendingPathComponent("recent-log.txt"),
                     atomically: true,
                     encoding: .utf8
@@ -1175,6 +1180,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func makeDiagnosticsReport(generatedAt: String) -> String {
         let profile = ProfileStore.currentProfile()
         let fingerprintName = ProfileStore.fingerprint(for: profile.id)?.displayName ?? "默认 Safari（不混淆）"
+        let profileLabel = DiagnosticRedactor.profileLabel(isDefault: profile.id == defaultProfileID)
+        let startupProfileLabel = ProfileStore.startupProfileID() == defaultProfileID
+            ? defaultProfileID
+            : "<custom-profile>"
         let bundle = Bundle.main
         let process = ProcessInfo.processInfo
         var sections: [String] = []
@@ -1197,9 +1206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         sections.append(Self.diagnosticSection("性能趋势", performanceMonitor.diagnosticRows()))
 
         sections.append(Self.diagnosticSection("账号空间 / 隐私", [
-            ("当前空间", profile.name),
-            ("首页", ProfileStore.homepageURL(for: profile.id).absoluteString),
-            ("启动默认空间", ProfileStore.startupProfileID()),
+            ("当前空间", profileLabel),
+            ("首页", DiagnosticRedactor.url(ProfileStore.homepageURL(for: profile.id))),
+            ("启动默认空间", startupProfileLabel),
             ("本机草稿恢复", PromptDraftStore.isRestoreEnabled() ? "开启" : "关闭"),
             ("当前空间草稿", PromptDraftStore.draftSummary(for: profile.id)),
             ("后台完成通知", BackgroundCompletionNotifications.isEnabled() ? "开启" : "关闭"),
@@ -1223,7 +1232,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("notarization", "运行时不能证明 DMG 是否已 stapled；用 packaging/notarize-dmg.sh / spctl / stapler 验证。"),
         ]))
 
-        return sections.joined(separator: "\n\n")
+        return DiagnosticRedactor.text(sections.joined(separator: "\n\n"))
     }
 
     private static func appVersionText() -> String {
@@ -2498,15 +2507,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func diagnosticsReport() -> String {
         let frame = window.frame
         let currentItemURL = webView.backForwardList.currentItem?.url
+        let profileLabel = DiagnosticRedactor.profileLabel(
+            isDefault: profileID == nil || profileID == defaultProfileID,
+            persistent: persistent
+        )
         let rows = [
-            ("窗口标题", window.title),
+            ("窗口标题", isPopup ? "弹窗（标题已脱敏）" : "ChatGPT Swift"),
             ("窗口 frame", "x=\(Int(frame.origin.x)), y=\(Int(frame.origin.y)), w=\(Int(frame.size.width)), h=\(Int(frame.size.height))"),
             ("窗口类型", isPopup ? "弹窗" : "主窗口"),
             ("持久数据", persistent ? "是" : "否"),
-            ("空间", profileDisplayName() ?? (persistent ? "默认" : "无痕")),
+            ("空间", profileLabel),
             ("当前 URL", webView.url.map(Self.loggableURL) ?? "nil"),
             ("历史当前项", currentItemURL.map(Self.loggableURL) ?? "nil"),
-            ("标题", webView.title ?? "nil"),
+            ("标题", DiagnosticRedactor.pageTitle(webView.title)),
             ("isLoading", webView.isLoading ? "true" : "false"),
             ("estimatedProgress", String(format: "%.3f", webView.estimatedProgress)),
             ("canGoBack / canGoForward", "\(webView.canGoBack) / \(webView.canGoForward)"),
@@ -4263,14 +4276,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func loggableURL(_ url: URL) -> String {
-        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false) else {
-            return "<unparseable-url>"
-        }
-        if components.query != nil {
-            components.percentEncodedQuery = nil
-            return (components.url?.absoluteString ?? "\(url.scheme ?? "unknown")://\(url.host ?? "unknown")") + "?<redacted>"
-        }
-        return components.url?.absoluteString ?? url.absoluteString
+        DiagnosticRedactor.url(url)
     }
 
     private static func canRewriteForPrivacy(_ request: URLRequest) -> Bool {
@@ -6316,7 +6322,7 @@ private enum PrivacySettings {
 
     static func keepThirdPartyLinksInApp() -> Bool {
         if UserDefaults.standard.object(forKey: keepThirdPartyLinksInAppDefaultsKey) == nil {
-            return true
+            return NavigationRules.defaultKeepThirdPartyLinksInApp
         }
         return UserDefaults.standard.bool(forKey: keepThirdPartyLinksInAppDefaultsKey)
     }

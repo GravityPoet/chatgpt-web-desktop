@@ -4,7 +4,7 @@ Languages: English | [简体中文](README.zh-CN.md)
 
 Use ChatGPT Web as a desktop app with isolated profiles, web-first feature parity, and lightweight native desktop integration.
 
-This project started from one specific pain point: ChatGPT Web sometimes exposed model or reasoning controls before the native desktop app did. OpenAI's official macOS app has since added more native capabilities, including model selection, Projects, Tasks, Canvas, Work with Apps, and IDE editing, and now targets macOS 14+ on Apple Silicon.
+This project started from one specific pain point: ChatGPT Web sometimes exposed model or reasoning controls before the native desktop app did. On July 9, 2026, OpenAI launched a new desktop app that brings Chat, Work, and Codex together; the previous macOS app remains available as ChatGPT Classic. OpenAI's published macOS requirements still target macOS 14+ on Apple Silicon. See the [current desktop release notes](https://help.openai.com/en/articles/6825453-chatgpt-release-notes) and [macOS requirements](https://help.openai.com/en/articles/9275200-downloading-the-chatgpt-macos-app).
 
 This wrapper is now best understood as a small, auditable WebView desktop shell: it keeps the full ChatGPT Web surface available inside a dedicated window, with separate WebView storage, predictable link/download handling, and optional privacy/profile controls.
 
@@ -12,7 +12,7 @@ It does not bypass ChatGPT subscriptions, usage limits, or account permissions. 
 
 ## What This Solves
 
-- Keeps ChatGPT Web's model picker and web-first controls in a desktop app.
+- Keeps ChatGPT Web's current Chat/Work surface, model picker, and web-first controls in a desktop app.
 - Provides a macOS 12-compatible Swift implementation for machines that cannot run the current official macOS app requirements.
 - Lets you deliberately spend more reasoning effort on coding, analysis, writing, planning, research, and other high-stakes tasks.
 - Avoids losing web-only controls just because you prefer a desktop-window workflow.

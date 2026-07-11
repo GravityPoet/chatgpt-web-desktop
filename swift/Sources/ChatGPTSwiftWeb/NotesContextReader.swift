@@ -8,7 +8,7 @@ enum NotesContextError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .emptySelection:
-            return "没有读取到选中的备忘录"
+            return "没有读取到 Notes 列表中当前选中的备忘录"
         case .automationDenied:
             return "没有访问备忘录的权限。请在系统设置 > 隐私与安全性 > 自动化中允许 ChatGPT Swift 控制备忘录。"
         case .scriptFailed(let message):
@@ -52,7 +52,7 @@ enum NotesContextReader {
             }
 
             completion(.success("""
-            以下是我当前备忘录里的上下文，请参考：
+            以下是我在 Apple Notes 列表中当前选中的备忘录标题和完整正文，请参考：
 
             \(cleaned)
             """))
