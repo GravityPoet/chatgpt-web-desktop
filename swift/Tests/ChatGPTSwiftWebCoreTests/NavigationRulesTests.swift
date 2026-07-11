@@ -2,8 +2,8 @@ import XCTest
 @testable import ChatGPTSwiftWebCore
 
 final class NavigationRulesTests: XCTestCase {
-    func testThirdPartyLinksDefaultToSystemBrowser() {
-        XCTAssertFalse(NavigationRules.defaultKeepThirdPartyLinksInApp)
+    func testThirdPartyLinksDefaultToStayInsideAppUntilUserChangesPreference() {
+        XCTAssertTrue(NavigationRules.defaultKeepThirdPartyLinksInApp)
     }
 
     func testValidatedExternalURLAddsHTTPSAndRejectsUnsafeSchemes() {

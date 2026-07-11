@@ -17,7 +17,7 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 - 可把 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文插入 ChatGPT 输入框；不会自动发送
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
 - 只读 `诊断…` 面板，可复制或导出默认脱敏的诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、最近崩溃报告、CPU/RSS/footprint 采样趋势和最近本 App 日志
-- 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
+- 支持 OAuth / 登录弹窗、新窗口；第三方链接可选择 App 内或系统浏览器打开
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
 - 显式单实例锁：重复打开会激活已有窗口，不会堆多个进程
