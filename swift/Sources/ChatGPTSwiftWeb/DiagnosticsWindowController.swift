@@ -50,7 +50,7 @@ final class DiagnosticsWindowController: NSWindowController {
 
     func update(state: AppDiagnosticsState) {
         self.state = state
-        generatedLabel.stringValue = "生成时间：\(state.generatedAt)"
+        generatedLabel.stringValue = "生成时间：\(state.generatedAt) · 账号、会话 URL 与标题已脱敏"
         textView.string = state.report
     }
 

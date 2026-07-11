@@ -1,6 +1,8 @@
 import Foundation
 
 public enum NavigationRules {
+    public static let defaultKeepThirdPartyLinksInApp = false
+
     public enum NavigationType {
         case linkActivated
         case other

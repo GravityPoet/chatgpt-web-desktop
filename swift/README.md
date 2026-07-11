@@ -2,7 +2,7 @@
 
 原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，把 ChatGPT Web 放进独立 macOS 桌面窗口，并保留独立 WebView 账号空间、macOS 12 兼容、网页优先的模型 / 工具体验、下载桥、诊断和隐私控制；也用于和 Tauri/Rust 版并排对比。
 
-OpenAI 官方 ChatGPT macOS App 已持续补齐模型选择、Projects、Tasks、Canvas、Work with Apps 和 IDE 编辑等能力，并要求 macOS 14 + Apple Silicon。本项目的价值不再是替代官方 App，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。
+OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 保留为 ChatGPT Classic；官方公布的 macOS 要求仍是 macOS 14 + Apple Silicon。本项目不以替代官方 App 为目标，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。参考：[ChatGPT 发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)、[macOS 系统要求](https://help.openai.com/en/articles/9275200-downloading-the-chatgpt-macos-app)。
 
 ## 特点
 
@@ -14,9 +14,9 @@ OpenAI 官方 ChatGPT macOS App 已持续补齐模型选择、Projects、Tasks�
 - 慢加载会收敛到 toolbar 状态；白屏、WebKit 渲染进程重启和加载失败才显示原生状态层，并尽量自动恢复
 - 本机输入草稿恢复：刷新、白屏恢复或渲染进程重启后，尽量把未发送输入还原到网页输入框
 - 可选后台完成通知：窗口不在前台时，检测到网页回复从生成中变为空闲后发送 macOS 通知
-- 可把 Apple Notes 当前选中的备忘录正文作为文本上下文插入 ChatGPT 输入框
+- 可把 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文插入 ChatGPT 输入框；不会自动发送
 - 标准 `设置…` 窗口，集中展示通用、隐私、备忘录和分发状态
-- 只读 `诊断…` 面板，可复制或导出诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、最近崩溃报告、CPU/RSS/footprint 采样趋势和最近本 App 日志
+- 只读 `诊断…` 面板，可复制或导出默认脱敏的诊断包，包含 App/Profile/WebView/分发状态、启动耗时、非正常退出线索、最近崩溃报告、CPU/RSS/footprint 采样趋势和最近本 App 日志
 - 支持 OAuth / 登录弹窗、新窗口、外部链接转默认浏览器
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
@@ -109,6 +109,9 @@ Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA �
 
 仓库提供手动触发的 GitHub Actions workflow：`.github/workflows/swift-macos-release.yml`。它会：
 
+- 校验 `v<major>.<minor>.<patch>` tag，并把 tag 版本和 GitHub run id 写入实际 App 的 `CFBundleShortVersionString` / `CFBundleVersion`
+- 在打包前运行 `swift test` 和真实 App 启动/render smoke；任一失败都会停止发布
+- 新 release tag 固定指向本次 `GITHUB_SHA`；只允许同一提交重跑 draft，已发布 release 不会被静默覆盖
 - 默认用本地自签名构建 GitHub Release DMG，不需要 Apple Developer 账号
 - 如果选择 `distribution=developer-id`，才导入 Developer ID Application `.p12`、notarize 并 staple DMG
 - 如果开启 `enable_sparkle=true`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`

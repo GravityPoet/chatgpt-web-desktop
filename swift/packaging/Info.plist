@@ -34,7 +34,7 @@
 		<true/>
 	</dict>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>用于读取你在备忘录中选中的文本，并插入到 ChatGPT 输入框作为上下文。</string>
+	<string>用于读取你在 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文，并插入到 ChatGPT 输入框作为上下文；不会自动发送。</string>
 	<key>NSCameraUsageDescription</key>
 	<string>ChatGPT 需要摄像头权限时，用于网页内的视频或多模态输入。</string>
 	<key>NSMicrophoneUsageDescription</key>

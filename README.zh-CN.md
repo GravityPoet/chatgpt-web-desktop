@@ -2,18 +2,18 @@
 
 语言：[English](README.md) | 简体中文
 
-把 ChatGPT Web 封装成桌面应用，在原生 ChatGPT 桌面 App 没有暴露进阶 / high thinking 控制时，仍然可以使用网页版的模型选择器和更高思考强度选项。
+把 ChatGPT Web 封装成独立桌面应用，保留网页端最新的 Chat / Work、模型选择器和工具体验，同时提供隔离 profile、旧 macOS 兼容和轻量原生集成。
 
-这个项目解决的是一个非常具体的痛点：原生 ChatGPT 桌面 App 有时无法选择 ChatGPT Web 上可用的更高思考强度模式。这样在处理复杂问题时，你可能只能用更轻量的推理模式，无法让模型投入更多计算，给出更准确、更谨慎的答案。
+这个项目最初解决的是一个具体痛点：ChatGPT Web 有时会比原生桌面 App 更早提供模型或推理控制。2026 年 7 月 9 日，OpenAI 已推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 则保留为 ChatGPT Classic；官方公布的 macOS 要求仍是 macOS 14+ 与 Apple Silicon。可参考[最新桌面版发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)和[macOS 系统要求](https://help.openai.com/en/articles/9275200-downloading-the-chatgpt-macos-app)。
 
-这个 wrapper 会把完整的 ChatGPT Web 体验放进独立桌面窗口，包括网页版模型选择器，以及 advanced / high 风格的 thinking-time 控制。
+因此，这个 wrapper 不再以“替代官方 App”为目标。它更适合被理解为一个小型、可审计的 WebView 桌面壳：把完整 ChatGPT Web 放进独立窗口，提供与主浏览器分离的存储、可预测的外链/下载处理，以及可选的隐私与多空间控制。
 
 它不会绕过 ChatGPT 订阅、使用额度或账号权限。它只是用你自己的 ChatGPT 账号，在桌面壳里打开官方 ChatGPT Web。
 
 ## 解决什么问题
 
-- 恢复很多人打开 ChatGPT Web 的核心原因：当原生桌面 App 没有提供同等控制时，仍然可以选择更高思考强度。
-- 在桌面 App 里保留 ChatGPT Web 的模型选择器和进阶 / high thinking 控制。
+- 在桌面 App 里保留 ChatGPT Web 当前的 Chat / Work、模型选择器和网页优先控制。
+- 提供 macOS 12 兼容的 Swift 实现，覆盖无法运行官方当前系统要求的机器。
 - 让你可以主动为代码、分析、写作、规划、研究等高要求任务投入更多推理 effort。
 - 不会因为想用桌面窗口工作流，就丢掉网页版独有控制。
 - 使用独立应用窗口，而不是普通浏览器标签页。

@@ -251,7 +251,7 @@ final class AppSettingsWindowController: NSWindowController {
     }
 
     private func renderNotes() {
-        addHeader("备忘录", "只读取 Apple Notes 当前选中的文本，并插入网页输入框；不读取 IDE、Terminal 或代码工程。")
+        addHeader("备忘录", "读取 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文，并插入网页输入框；不会自动发送，也不读取 IDE、Terminal 或代码工程。")
         addKeyValue("自动化权限", state.notesAutomationStatus)
         addActionButton("打开系统自动化设置", action: #selector(openNotesAutomationPrivacy(_:)))
     }
