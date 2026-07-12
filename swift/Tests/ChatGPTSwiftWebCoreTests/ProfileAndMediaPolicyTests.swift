@@ -2,21 +2,40 @@ import XCTest
 @testable import ChatGPTSwiftWebCore
 
 final class ProfileAndMediaPolicyTests: XCTestCase {
-    func testEmailProfileNameIsMaskedInWindowTitle() {
-        let title = ProfileWindowTitle.format(profileName: "person@example.com", isDefault: false)
-        XCTAssertEqual(title, "ChatGPT Swift · 邮箱账号（已遮罩）")
-        XCTAssertFalse(title.contains("person"))
-        XCTAssertFalse(title.contains("example.com"))
-    }
-
-    func testEmbeddedEmailIsAlsoMaskedButOrdinaryProfileNameRemainsVisible() {
+    func testWindowTitleDefaultsToAppNameOnly() {
         XCTAssertEqual(
-            ProfileWindowTitle.format(profileName: "Work person@example.com", isDefault: false),
-            "ChatGPT Swift · 邮箱账号（已遮罩）"
+            ProfileWindowTitle.format(profileName: "person@example.com", isDefault: false),
+            "ChatGPT Swift"
         )
         XCTAssertEqual(
             ProfileWindowTitle.format(profileName: "工作号", isDefault: false),
-            "ChatGPT Swift · 工作号"
+            "ChatGPT Swift"
+        )
+    }
+
+    func testProfileNameModeUsesEmailLocalPartOrCustomName() {
+        XCTAssertEqual(
+            ProfileWindowTitle.format(
+                profileName: "lance_barques6m@icloud.com",
+                isDefault: false,
+                mode: .profileName
+            ),
+            "ChatGPT Swift — lance_barques6m"
+        )
+        XCTAssertEqual(
+            ProfileWindowTitle.format(profileName: "工作号", isDefault: false, mode: .profileName),
+            "ChatGPT Swift — 工作号"
+        )
+    }
+
+    func testFullProfileNameModeCanShowCompleteEmail() {
+        XCTAssertEqual(
+            ProfileWindowTitle.format(
+                profileName: "work@example.com",
+                isDefault: false,
+                mode: .fullProfileName
+            ),
+            "ChatGPT Swift — work@example.com"
         )
     }
 

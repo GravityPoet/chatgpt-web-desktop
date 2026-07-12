@@ -798,10 +798,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             }
         }
 
-        let host = navigationAction.request.url?.host ?? "ChatGPT"
         let child = BrowserWindowController(
             initialURL: nil,
-            title: makePopupTitle(host: host),
+            title: makePopupTitle(),
             isPopup: true,
             persistent: persistent,
             profileID: profileID,
@@ -1172,10 +1171,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func openPopup(url: URL) {
-        let host = url.host ?? "ChatGPT"
         let child = BrowserWindowController(
             initialURL: url,
-            title: makePopupTitle(host: host),
+            title: makePopupTitle(),
             isPopup: true,
             persistent: persistent,
             profileID: profileID
@@ -1193,14 +1191,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return ProfileStore.loadProfiles().first(where: { $0.id == profileID })?.name
     }
 
-    private func makePopupTitle(host: String) -> String {
-        if !persistent {
-            return "\(host) · 无痕"
+    private func makePopupTitle() -> String {
+        preferredWindowTitle()
+    }
+
+    private func preferredWindowTitle() -> String {
+        let mode = WindowTitleSettings.mode()
+        guard persistent else {
+            return ProfileWindowTitle.format(profileName: "无痕", isDefault: false, mode: mode)
         }
-        if let name = profileDisplayName() {
-            return "\(host) · \(name)"
+        guard let name = profileDisplayName() else {
+            return "ChatGPT Swift"
         }
-        return host
+        return ProfileWindowTitle.format(profileName: name, isDefault: false, mode: mode)
     }
 
     private func presentError(_ text: String) {
@@ -2165,6 +2168,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return keyController
         }
         return controllers.first(where: { $0.window.isVisible && !$0.isPopup })
+    }
+
+    static func refreshWindowTitles() {
+        controllers.forEach { controller in
+            controller.window.title = controller.preferredWindowTitle()
+        }
     }
 
     private static func clampToVisibleScreen(_ frame: NSRect) -> NSRect {

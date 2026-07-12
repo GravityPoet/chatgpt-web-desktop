@@ -1,4 +1,5 @@
 import AppKit
+import ChatGPTSwiftWebCore
 
 struct AppSettingsState {
     let appVersion: String
@@ -14,6 +15,7 @@ struct AppSettingsState {
     let enhancedPrivacyEnabled: Bool
     let webRTCProtectionEnabled: Bool
     let keepThirdPartyLinksInApp: Bool
+    let windowTitleDisplayMode: WindowTitleDisplayMode
     let notesAutomationStatus: String
     let updateStatus: String
     let distributionStatus: String
@@ -24,6 +26,7 @@ struct AppSettingsCallbacks {
     let setBackgroundCompletionNotifications: (Bool) -> Void
     let setWebRTCProtection: (Bool) -> Void
     let setThirdPartyLinksInApp: (Bool) -> Void
+    let setWindowTitleDisplayMode: (WindowTitleDisplayMode) -> Void
     let setEnhancedPrivacy: (Bool) -> Void
     let openNotesAutomationPrivacy: () -> Void
     let showDiagnostics: () -> Void
@@ -228,7 +231,8 @@ final class AppSettingsWindowController: NSWindowController {
     }
 
     private func renderPrivacy() {
-        addHeader("隐私", "这些设置直接复用当前隐私菜单，改动会立即写入本机偏好。")
+        addHeader("隐私", "这些设置会立即写入本机偏好，并应用到窗口标题或当前空间的隐私行为。")
+        addWindowTitleDisplayOptions()
         addToggle(
             "WebRTC 防护",
             detail: "关闭 WebRTC 构造器暴露；会重建当前 WebView 才能完整生效。",
@@ -248,6 +252,50 @@ final class AppSettingsWindowController: NSWindowController {
             action: #selector(toggleEnhancedPrivacy(_:))
         )
         addKeyValue("指纹预设", state.fingerprintName)
+    }
+
+    private func addWindowTitleDisplayOptions() {
+        let stack = NSStackView()
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 5
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLabel = NSTextField(labelWithString: "窗口标题显示")
+        titleLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        titleLabel.textColor = .labelColor
+        stack.addArrangedSubview(titleLabel)
+
+        for (index, mode) in WindowTitleDisplayMode.allCases.enumerated() {
+            let button = NSButton(
+                radioButtonWithTitle: Self.windowTitleOptionLabel(mode),
+                target: self,
+                action: #selector(selectWindowTitleDisplayMode(_:))
+            )
+            button.tag = index
+            button.state = state.windowTitleDisplayMode == mode ? .on : .off
+            button.font = .systemFont(ofSize: 13, weight: .regular)
+            stack.addArrangedSubview(button)
+        }
+
+        let detailLabel = wrappingLabel(
+            "默认不显示账号信息。Profile 名称模式会把纯邮箱自动缩短为 @ 前面的部分，但该部分仍可能包含姓名或手机号。",
+            color: .secondaryLabelColor
+        )
+        detailLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        stack.addArrangedSubview(detailLabel)
+        contentStack.addArrangedSubview(stack)
+    }
+
+    private static func windowTitleOptionLabel(_ mode: WindowTitleDisplayMode) -> String {
+        switch mode {
+        case .appNameOnly:
+            return "仅显示 ChatGPT Swift"
+        case .profileName:
+            return "显示 Profile 名称"
+        case .fullProfileName:
+            return "显示完整邮箱"
+        }
     }
 
     private func renderNotes() {
@@ -363,6 +411,13 @@ final class AppSettingsWindowController: NSWindowController {
 
     @objc private func toggleThirdPartyLinks(_ sender: NSButton) {
         callbacks.setThirdPartyLinksInApp(sender.state == .on)
+    }
+
+    @objc private func selectWindowTitleDisplayMode(_ sender: NSButton) {
+        guard WindowTitleDisplayMode.allCases.indices.contains(sender.tag) else {
+            return
+        }
+        callbacks.setWindowTitleDisplayMode(WindowTitleDisplayMode.allCases[sender.tag])
     }
 
     @objc private func toggleEnhancedPrivacy(_ sender: NSButton) {
