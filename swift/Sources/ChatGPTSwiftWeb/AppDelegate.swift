@@ -19,7 +19,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var settingsWindowController: AppSettingsWindowController?
     private var diagnosticsWindowController: DiagnosticsWindowController?
     private var updateCheckStatus = "未检查；未配置 Sparkle 时会回退到 GitHub Releases 检查。"
-    private var didApplyLaunchGeoIP = false
     private var didFinishLaunchingAt: Date?
     private var previousRunSummary = "未记录"
     private var notificationPermissionStatus = "未检查"
@@ -65,8 +64,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         NSApp.activate(ignoringOtherApps: true)
         scheduleSmokeTestIfRequested()
 
-        if !smokeTestRun {
-            primeExitTimezoneAlignment()
+        if !smokeTestRun,
+           BrowserPerformancePolicy.shouldRefreshExitTimezoneCache(
+               hasExplicitFingerprint: ProfileStore.fingerprint(for: profile?.id) != nil
+           ) {
+            refreshExitTimezoneCache()
         }
 
         if needsIsolationFallbackNotice {
@@ -145,14 +147,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         defaults.set(processStartedAt, forKey: lastRunStartedAtDefaultsKey)
         defaults.removeObject(forKey: lastRunEndedAtDefaultsKey)
         defaults.set(false, forKey: lastRunCleanExitDefaultsKey)
-        defaults.synchronize()
     }
 
     private func markRunEndedCleanly() {
         let defaults = UserDefaults.standard
         defaults.set(Date(), forKey: lastRunEndedAtDefaultsKey)
         defaults.set(true, forKey: lastRunCleanExitDefaultsKey)
-        defaults.synchronize()
     }
 
     private func refreshNotificationPermissionStatus() {
@@ -1757,20 +1757,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         aboutItem.target = self
     }
 
-    /// Resolve the network exit timezone (VPN egress) and align the injected fingerprint to it. With
-    /// a cached value the first window is already aligned; the background lookup then keeps the cache
-    /// fresh. When the lookup first discovers (or changes) the exit timezone, rebuild the main window
-    /// once -- early in launch, before any Cloudflare challenge -- so the new timezone is injected at
-    /// document start. Later exit changes (e.g. switching VPN nodes) apply on the next new window
-    /// rather than yanking the current page out from under an in-progress challenge.
-    private func primeExitTimezoneAlignment() {
-        GeoIPResolver.refresh { [weak self] timezone, changed in
-            guard let self, changed, timezone != nil, !self.didApplyLaunchGeoIP else {
-                return
-            }
-            self.didApplyLaunchGeoIP = true
-            self.rebuildMainController(initialURL: self.mainController?.currentURL())
-        }
+    /// Refresh the optional fingerprint's exit timezone for the next WebView. Never rebuild a live
+    /// session after launch: changing browser characteristics mid-session invalidates challenge state
+    /// and turns an otherwise background lookup into a visible second page load.
+    private func refreshExitTimezoneCache() {
+        GeoIPResolver.refresh()
     }
 
     private func rebuildMainController(initialURL: URL? = nil) {

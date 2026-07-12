@@ -68,7 +68,7 @@ cloak 版本面向需要同时运行多个 ChatGPT 账号、并希望各账号�
 
 Swift App 也提供清空网站数据的菜单动作，可以在重新加载 ChatGPT 前重置本 App WebView 保存的 cookie、登录态、缓存、localStorage、IndexedDB、Service Worker 和其他本地网站数据。
 
-Swift App 还提供一组默认关闭的指纹控制项，用于在每个空间维持一致的浏览器身份：稳定的 Safari 家族 navigator/screen 画像、针对 Canvas/WebGL/Audio 的增强隐私扰动，以及 WebRTC 泄露防护。与这些独立：当网络出口（例如 VPN 出口）解析出的时区与系统不同时，App 会把页面时区与出口对齐，使上报时区与出口 IP 保持一致，且不改变其余真实 Safari 指纹。
+Swift App 还提供一组默认关闭的指纹控制项，用于在每个空间维持一致的浏览器身份：稳定的 Safari 家族 navigator/screen 画像、针对 Canvas/WebGL/Audio 的增强隐私扰动，以及 WebRTC 泄露防护。默认 Profile 保留原生 WebKit 时区，并且不会在 GeoIP 刷新后重建正在使用的页面。只有用户显式选择指纹预设时，出口时区才会后台刷新并从下一次新建 WebView 起生效。
 
 ## 构建
 
@@ -91,7 +91,7 @@ npm run build:signed-dmg
 
 ## 状态
 
-- Swift wrapper：原生 macOS AppKit/WKWebView 路线；可选的每空间指纹控制与 VPN 出口时区对齐。
+- Swift wrapper：原生 macOS AppKit/WKWebView 路线；稳定的原生默认值，以及可选的每空间指纹控制和从下一次会话生效的 VPN 出口时区对齐。
 - Tauri wrapper：Rust/Tauri v2 跨平台桌面路线。
 - Cloak launcher：macOS 多账号路线；每账号隔离的 CloakBrowser profile、指纹种子、可选代理，以及由出口推导的 timezone/locale/WebRTC-IP，配一个 Dock 账号选择器。
 - 打包辅助：已包含 macOS app/DMG 辅助脚本；其他桌面目标可以沿用标准 Tauri build flow。

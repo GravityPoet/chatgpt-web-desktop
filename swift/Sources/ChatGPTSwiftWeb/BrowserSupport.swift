@@ -176,12 +176,9 @@ struct FingerprintProfile: Codable {
     let timezone: String?
 }
 
-/// Resolves the timezone of the current network egress so the injected browser fingerprint's
-/// timezone matches the exit IP's country. A system VPN routes URLSession traffic through its exit,
-/// so a plain request reports the exit's geo. Cloudflare treats "IP in country A, browser timezone
-/// in country B" as a bot signal and issues more managed challenges; aligning the timezone removes
-/// it. Every failure path degrades to nil (no override -> system timezone), so offline / non-VPN
-/// behavior is unchanged.
+/// Resolves the timezone of the current network egress for an explicitly selected fingerprint
+/// preset. The native/default profile never consumes this cache, keeping its WebKit characteristics
+/// unchanged. Every failure path degrades to nil, and refreshes only affect the next WebView.
 enum GeoIPResolver {
     private static let cacheKey = "geoip.exit.timezone"
 
@@ -401,8 +398,7 @@ enum FingerprintCatalog {
         return issues
     }
 
-    /// 仅时区对齐的 JS 片段(只改 Intl.DateTimeFormat / Date.getTimezoneOffset,不碰 navigator/screen)。
-    /// 指纹脚本与「默认不混淆」时区脚本共用此片段,避免两处时区逻辑漂移。
+    /// 指纹脚本使用的时区对齐片段。默认 Profile 不调用它，以保持原生 WebKit 特征稳定。
     private static func timezoneAlignmentBlock(timezone: String) -> String {
         return """
           try {
@@ -453,24 +449,6 @@ enum FingerprintCatalog {
             markFake(getTimezoneOffset, 'getTimezoneOffset');
             Date.prototype.getTimezoneOffset = getTimezoneOffset;
           } catch (_) {}
-        """
-    }
-
-    /// 默认真 Safari(不混淆)下也对齐 VPN 出口时区:只改时区,绝不伪造 navigator/screen。
-    /// 仅当已解析到出口时区且与系统时区不同(典型 = 开了 VPN)时返回脚本;否则 nil(零注入、零影响)。
-    static func timezoneOnlyScript(systemTimezone: String) -> String? {
-        guard let timezone = GeoIPResolver.cachedTimezone(), timezone != systemTimezone else {
-            return nil
-        }
-        return """
-        (() => {
-          if (window.__wkTimezoneAlign) return;
-          try {
-            Object.defineProperty(window, '__wkTimezoneAlign', { value: true, configurable: false, writable: false });
-          } catch (_) {}
-          const markFake = window.__wkMarkNative || ((fn) => fn);
-        \(timezoneAlignmentBlock(timezone: timezone))
-        })();
         """
     }
 
@@ -919,7 +897,6 @@ enum ProfileStore {
                 UserDefaults.standard.set(false, forKey: enhancedKey)
             }
         }
-        UserDefaults.standard.synchronize()
     }
 
     private static func ensureFingerprintBaseline(for profileID: String) {
@@ -965,7 +942,6 @@ enum ProfileStore {
         save(profiles)
         UserDefaults.standard.set(id, forKey: startupProfileDefaultsKey)
         UserDefaults.standard.set(id, forKey: currentProfileDefaultsKey)
-        UserDefaults.standard.synchronize()
         return true
     }
 
@@ -974,7 +950,6 @@ enum ProfileStore {
             return
         }
         UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func applyStartupProfileIfAvailable() {
@@ -984,7 +959,6 @@ enum ProfileStore {
         let profiles = loadProfiles()
         guard profiles.contains(where: { $0.id == stored }) else {
             UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
-            UserDefaults.standard.synchronize()
             return
         }
         if stored != defaultProfileID {
@@ -1000,7 +974,6 @@ enum ProfileStore {
             return
         }
         UserDefaults.standard.set(data, forKey: profilesDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func resetDefaultProfile() {
@@ -1020,7 +993,6 @@ enum ProfileStore {
 
     static func setCurrentProfileID(_ id: String) {
         UserDefaults.standard.set(id, forKey: currentProfileDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func currentProfile() -> WebProfile {
@@ -1050,12 +1022,10 @@ enum ProfileStore {
         } else {
             UserDefaults.standard.removeObject(forKey: key)
         }
-        UserDefaults.standard.synchronize()
     }
 
     static func removeHomepage(for profileID: String) {
         UserDefaults.standard.removeObject(forKey: profileHomepageDefaultsPrefix + profileID)
-        UserDefaults.standard.synchronize()
     }
 
     static func isEnhancedPrivacyEnabled(for profileID: String?) -> Bool {
@@ -1068,7 +1038,6 @@ enum ProfileStore {
     static func setEnhancedPrivacyEnabled(_ enabled: Bool, for profileID: String) {
         let key = profileEnhancedPrivacyDefaultsPrefix + profileID
         UserDefaults.standard.set(enabled, forKey: key)
-        UserDefaults.standard.synchronize()
     }
 
     static func fingerprint(for profileID: String?) -> FingerprintProfile? {
@@ -1096,7 +1065,6 @@ enum ProfileStore {
         guard let fingerprint else {
             UserDefaults.standard.removeObject(forKey: key)
             UserDefaults.standard.removeObject(forKey: disabledKey)
-            UserDefaults.standard.synchronize()
             return
         }
         guard let data = try? JSONEncoder().encode(fingerprint) else {
@@ -1104,13 +1072,11 @@ enum ProfileStore {
         }
         UserDefaults.standard.set(data, forKey: key)
         UserDefaults.standard.removeObject(forKey: disabledKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func disableFingerprint(for profileID: String) {
         UserDefaults.standard.removeObject(forKey: profileFingerprintDefaultsPrefix + profileID)
         UserDefaults.standard.set(true, forKey: profileFingerprintDisabledDefaultsPrefix + profileID)
-        UserDefaults.standard.synchronize()
     }
 }
 
@@ -1128,7 +1094,6 @@ enum PrivacySettings {
 
     static func setWebRTCProtectionEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: webRTCProtectionDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func keepThirdPartyLinksInApp() -> Bool {
@@ -1140,7 +1105,6 @@ enum PrivacySettings {
 
     static func setKeepThirdPartyLinksInApp(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: keepThirdPartyLinksInAppDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 }
 
@@ -1204,7 +1168,22 @@ let openAIPasskeyFallbackScript = """
       || normalized.endsWith('.openai.com');
   };
 
-  if (!trustedHost(location.hostname)) return;
+  const authLikePage = () => {
+    const host = String(location.hostname || '').toLowerCase();
+    const path = String(location.pathname || '').toLowerCase();
+    return host === 'auth.openai.com'
+      || host === 'auth0.openai.com'
+      || host.startsWith('auth.')
+      || path.includes('/auth')
+      || path.includes('/login')
+      || path.includes('/signin')
+      || path.includes('/sign-in')
+      || path.includes('/credential')
+      || path.includes('/passkey')
+      || path.includes('/webauthn');
+  };
+
+  if (!trustedHost(location.hostname) || !authLikePage() || location.pathname.startsWith('/cdn-cgi/')) return;
 
   try {
     Object.defineProperty(window, '__wkOpenAIPasskeyFallbackInstalled', { value: true, configurable: false, writable: false });
@@ -1311,6 +1290,32 @@ let passkeyLimitationNoticeScript = """
 
   const fallbackActive = () => !!window.__wkOpenAIPasskeyFallbackActive;
   const fallbackUsed = () => !!window.__wkOpenAIPasskeyFallbackUsed;
+  const pageLooksLikeCloudflareChallenge = () => {
+    if (location.pathname.startsWith('/cdn-cgi/challenge-platform/')) return true;
+    return !!document.querySelector([
+      'iframe[src*="challenges.cloudflare.com"]',
+      '.cf-turnstile',
+      '#cf-challenge-running',
+      '#challenge-stage',
+      '[data-cf-challenge]'
+    ].join(','));
+  };
+  const authLikePage = () => {
+    const host = String(location.hostname || '').toLowerCase();
+    const path = String(location.pathname || '').toLowerCase();
+    return host === 'auth.openai.com'
+      || host === 'auth0.openai.com'
+      || host.startsWith('auth.')
+      || path.includes('/auth')
+      || path.includes('/login')
+      || path.includes('/signin')
+      || path.includes('/sign-in')
+      || path.includes('/credential')
+      || path.includes('/passkey')
+      || path.includes('/webauthn');
+  };
+
+  if (!trustedHost(location.hostname) || !authLikePage() || pageLooksLikeCloudflareChallenge()) return;
 
   const pageLooksLikePasskey = () => {
     const href = String(location.href || '').toLowerCase();
@@ -1342,7 +1347,6 @@ let passkeyLimitationNoticeScript = """
       || href.includes('signin')
       || href.includes('verify')
       || href.includes('verification')
-      || href.includes('challenge')
       || href.includes('continue')
       || href.includes('credential')
       || href.includes('passkey')
@@ -1351,6 +1355,7 @@ let passkeyLimitationNoticeScript = """
   };
 
   const showNotice = () => {
+    if (pageLooksLikeCloudflareChallenge()) return;
     if (!trustedHost(location.hostname) || (!pageLooksLikePasskey() && !pageLooksLikeAuthFallback())) return;
     if (document.getElementById('chatgpt-swift-passkey-notice')) return;
     if (!document.body || window.__wkPasskeyLimitationNoticeDismissed) return;

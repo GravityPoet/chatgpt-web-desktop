@@ -35,21 +35,44 @@ extension BrowserWindowController {
     func observeWebViewState() {
         webViewObservations = [
             webView.observe(\.estimatedProgress, options: [.new]) { [weak self] _, _ in
-                self?.updateNativeChromeStatus()
+                self?.scheduleNativeChromeStatusUpdate()
             },
             webView.observe(\.isLoading, options: [.new]) { [weak self] _, _ in
-                self?.updateNativeChromeStatus()
+                self?.scheduleNativeChromeStatusUpdate()
             },
             webView.observe(\.canGoBack, options: [.new]) { [weak self] _, _ in
-                self?.updateNativeChromeStatus()
+                self?.scheduleNativeChromeStatusUpdate()
             },
             webView.observe(\.canGoForward, options: [.new]) { [weak self] _, _ in
-                self?.updateNativeChromeStatus()
+                self?.scheduleNativeChromeStatusUpdate()
             },
             webView.observe(\.url, options: [.new]) { [weak self] _, _ in
-                self?.updateNativeChromeStatus()
+                self?.scheduleNativeChromeStatusUpdate()
             }
         ]
+    }
+
+    func scheduleNativeChromeStatusUpdate() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleNativeChromeStatusUpdate()
+            }
+            return
+        }
+        guard !isNativeChromeUpdateScheduled else {
+            return
+        }
+        isNativeChromeUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else {
+                return
+            }
+            self.isNativeChromeUpdateScheduled = false
+            guard !self.isDisposing else {
+                return
+            }
+            self.updateNativeChromeStatus()
+        }
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
@@ -132,6 +155,8 @@ extension BrowserWindowController {
         if webView.isLoading {
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             setStatus("加载中 \(percent)%", showsProgress: true)
+        } else if isCloudflareChallengeActive {
+            setStatus("正在完成人机验证…", showsProgress: false)
         } else if lastRenderProbeWasBlank {
             setStatus("页面空白，点击恢复", showsProgress: false)
         } else {
@@ -144,6 +169,20 @@ extension BrowserWindowController {
     }
 
     func setStatus(_ text: String, showsProgress: Bool) {
+        let progressPercent = showsProgress
+            ? max(3, min(100, Int(round(webView.estimatedProgress * 100))))
+            : 0
+        if statusLabel != nil {
+            guard text != lastPresentedStatusText
+                    || showsProgress != lastPresentedStatusShowsProgress
+                    || progressPercent != lastPresentedProgressPercent else {
+                return
+            }
+            lastPresentedStatusText = text
+            lastPresentedStatusShowsProgress = showsProgress
+            lastPresentedProgressPercent = progressPercent
+        }
+
         statusLabel?.stringValue = text
         statusLabel?.setAccessibilityLabel(text)
         statusContainer?.setAccessibilityLabel(text)
@@ -158,8 +197,7 @@ extension BrowserWindowController {
         statusWidthConstraint?.constant = statusWidth
         statusContainer?.setFrameSize(NSSize(width: statusWidth, height: NativeToolbarMetrics.statusHeight))
         if showsProgress {
-            let progress = max(0.03, min(1.0, webView.estimatedProgress))
-            progressIndicator?.doubleValue = progress
+            progressIndicator?.doubleValue = Double(progressPercent) / 100
         } else {
             progressIndicator?.doubleValue = 0
         }

@@ -11,7 +11,9 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 - 原生 `NSWindow`，窗口大小和位置由 macOS `setFrameAutosaveName` 记住
 - 原生 Dock / App 图标 / 菜单 / 轻量工具栏，toolbar 自定义布局会保存
 - `WKWebView` 加载 `https://chatgpt.com/`
+- 默认 Profile 保持原生 WebKit 时区和稳定 WebsiteDataStore，不在启动后重建正在加载的页面；只有用户显式选择指纹预设时才为下一次新建 WebView 刷新出口时区
 - 慢加载会收敛到 toolbar 状态；白屏、WebKit 渲染进程重启和加载失败才显示原生状态层，并尽量自动恢复
+- Cloudflare 挑战期间暂停草稿、回答状态和页面辅助监听，保留挑战 Cookie 与页面自身脚本的稳定执行环境
 - 本机输入草稿恢复：刷新、白屏恢复或渲染进程重启后，尽量把未发送输入还原到网页输入框
 - 可选后台完成通知：窗口不在前台时，检测到网页回复从生成中变为空闲后发送 macOS 通知
 - 可把 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文插入 ChatGPT 输入框；不会自动发送

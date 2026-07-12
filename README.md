@@ -68,7 +68,7 @@ Runtime login state is stored by the operating system WebView at runtime. The Sw
 
 The Swift app also includes a clear website data action for resetting this app's WebView cookies, login state, cache, localStorage, IndexedDB, service workers, and other local website data before reloading ChatGPT.
 
-The Swift app additionally provides optional, off-by-default fingerprint controls for a consistent per-profile browser identity: a stable Safari-family navigator/screen profile, enhanced-privacy noise for Canvas/WebGL/Audio, and WebRTC leak protection. Independently of those, when the network egress (for example a VPN exit) resolves to a different timezone than the system, the app aligns the page timezone with the exit so the reported timezone stays consistent with the exit IP, without otherwise altering the real Safari fingerprint.
+The Swift app additionally provides optional, off-by-default fingerprint controls for a consistent per-profile browser identity: a stable Safari-family navigator/screen profile, enhanced-privacy noise for Canvas/WebGL/Audio, and WebRTC leak protection. The default profile preserves the native WebKit timezone and never rebuilds a live page after a GeoIP refresh. When a fingerprint preset is explicitly enabled, egress-derived timezone data is refreshed only for the next newly created WebView.
 
 ## Build
 
@@ -91,7 +91,7 @@ npm run build:signed-dmg
 
 ## Status
 
-- Swift wrapper: native macOS AppKit/WKWebView path; optional per-profile fingerprint controls and VPN-egress timezone alignment.
+- Swift wrapper: native macOS AppKit/WKWebView path; stable native defaults plus optional per-profile fingerprint controls and next-session VPN-egress timezone alignment.
 - Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
 - Cloak launcher: macOS multi-account path; per-account isolated CloakBrowser profile, fingerprint seed, optional proxy, and egress-derived timezone/locale/WebRTC-IP, with a Dock account picker.
 - Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.
