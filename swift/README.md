@@ -21,7 +21,7 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 - 支持清空本 App 的 WebView 网站数据，重置 cookie、登录态、缓存、localStorage、IndexedDB 和 Service Worker
 - 支持常规下载，以及网页内 `blob:` / `data:` 下载桥接到 `~/Downloads`
 - ChatGPT / OpenAI 可信页面首次使用麦克风或摄像头仍由 macOS 原生授权；系统已授权后直接复用，不再反复弹网页授权
-- email 型账号空间名在主窗口标题中显示为“邮箱账号（已遮罩）”，避免截图或录屏泄露账号
+- 主窗口标题默认只显示 `ChatGPT Swift`；设置中可改为 Profile 名称（纯邮箱只保留 `@` 前部分）或完整邮箱
 - 显式单实例锁：重复打开会激活已有窗口，不会堆多个进程
 - `Info.plist` 已声明 Apple Events、麦克风、摄像头、下载目录权限说明
 

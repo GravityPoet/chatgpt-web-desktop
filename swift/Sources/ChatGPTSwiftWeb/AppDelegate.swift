@@ -454,6 +454,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     setThirdPartyLinksInApp: { [weak self] enabled in
                         self?.setThirdPartyLinksInAppFromSettings(enabled)
                     },
+                    setWindowTitleDisplayMode: { [weak self] mode in
+                        self?.setWindowTitleDisplayModeFromSettings(mode)
+                    },
                     setEnhancedPrivacy: { [weak self] enabled in
                         self?.setEnhancedPrivacyFromSettings(enabled)
                     },
@@ -569,6 +572,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func setThirdPartyLinksInAppFromSettings(_ enabled: Bool) {
         PrivacySettings.setKeepThirdPartyLinksInApp(enabled)
+        refreshNativeUtilityWindows()
+    }
+
+    private func setWindowTitleDisplayModeFromSettings(_ mode: WindowTitleDisplayMode) {
+        WindowTitleSettings.setMode(mode)
+        BrowserWindowController.refreshWindowTitles()
         refreshNativeUtilityWindows()
     }
 
@@ -760,6 +769,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
             webRTCProtectionEnabled: PrivacySettings.isWebRTCProtectionEnabled(),
             keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp(),
+            windowTitleDisplayMode: WindowTitleSettings.mode(),
             notesAutomationStatus: "按需请求；首次插入选中备忘录正文时由 macOS 弹出授权。",
             updateStatus: updateCheckStatus,
             distributionStatus: "\(sparkleStatus)。本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
@@ -1219,7 +1229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     @objc private func openIncognitoWindow(_ sender: Any?) {
         let controller = BrowserWindowController(
             initialURL: chatGPTURL,
-            title: "ChatGPT Swift · 无痕",
+            title: ProfileWindowTitle.format(
+                profileName: "无痕",
+                isDefault: false,
+                mode: WindowTitleSettings.mode()
+            ),
             isPopup: true,
             persistent: false,
             profileID: nil,
@@ -1789,7 +1803,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func mainWindowTitle(for profile: WebProfile) -> String {
         ProfileWindowTitle.format(
             profileName: profile.name,
-            isDefault: profile.id == defaultProfileID
+            isDefault: profile.id == defaultProfileID,
+            mode: WindowTitleSettings.mode()
         )
     }
 
