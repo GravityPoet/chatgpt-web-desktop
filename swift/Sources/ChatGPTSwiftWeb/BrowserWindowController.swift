@@ -23,7 +23,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private let controllerCreatedAt = Date()
     private var closeHandler: (() -> Void)?
     var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
-    private var isDisposing = false
+    var isDisposing = false
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
     private var renderProbeGeneration = 0
     var lastRenderProbeWasBlank = false
@@ -38,9 +38,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var firstNavigationFinishedAt: Date?
     private var loadingWatchdogGeneration = 0
     private var currentOverlayMode = BrowserStatusOverlayMode.hidden
+    var isCloudflareChallengeActive = false
     private var isAssistantResponseInProgress = false
     private var lastCompletionObservationSummary = "未运行"
     private var lastBackgroundCompletionNotificationAt: Date?
+    private var framePersistenceWorkItem: DispatchWorkItem?
+    var isNativeChromeUpdateScheduled = false
+    var lastPresentedStatusText: String?
+    var lastPresentedStatusShowsProgress = false
+    var lastPresentedProgressPercent = -1
     var toolbarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     var statusLabel: NSTextField?
     var statusContainer: NSView?
@@ -252,6 +258,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("lastNavigationStartedAt", Self.diagnosticDateString(lastNavigationStartedAt)),
             ("lastNavigationFinishedAt", Self.diagnosticDateString(lastNavigationFinishedAt)),
             ("lastNavigationDuration", Self.diagnosticDurationString(from: lastNavigationStartedAt, to: lastNavigationFinishedAt)),
+            ("cloudflareChallengeActive", isCloudflareChallengeActive ? "true" : "false"),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -288,6 +295,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let diagnosticsHealthy = navigationFailureCount == 0
             && webContentProcessTerminationCount == 0
             && overlayHealthy
+            && !isCloudflareChallengeActive
         let passed = windowVisible
             && hasContentAddress
             && !webView.isLoading
@@ -307,6 +315,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "lastRenderProbe=\(lastRenderProbeSummary)",
             "diagnosticsHealthy=\(diagnosticsHealthy)",
             "nativeStatusOverlay=\(currentOverlayMode.diagnosticDescription)",
+            "cloudflareChallengeActive=\(isCloudflareChallengeActive)",
             "navigationFailureCount=\(navigationFailureCount)",
             "lastNavigationFailure=\(lastNavigationFailureDescription)",
             "webContentProcessTerminationCount=\(webContentProcessTerminationCount)",
@@ -491,12 +500,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return true
         }
 
+        cancelScheduledMainWindowFramePersistence()
         persistMainWindowFrame()
         window.orderOut(nil)
         return false
     }
 
     func dispose() {
+        cancelScheduledMainWindowFramePersistence()
         webViewObservations.removeAll()
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
@@ -506,10 +517,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func windowDidMove(_ notification: Notification) {
-        persistMainWindowFrame()
+        scheduleMainWindowFramePersistence()
     }
 
     func windowDidResize(_ notification: Notification) {
+        scheduleMainWindowFramePersistence()
+    }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        cancelScheduledMainWindowFramePersistence()
         persistMainWindowFrame()
     }
 
@@ -518,6 +534,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func windowWillClose(_ notification: Notification) {
+        cancelScheduledMainWindowFramePersistence()
         persistMainWindowFrame()
         Self.controllers.removeAll { $0 === self }
         closeHandler?()
@@ -604,16 +621,22 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 return
             }
 
-            let isBlank = Self.boolValue(report["blank"])
+            let isChallenge = Self.boolValue(report["cloudflareChallenge"])
+            let isBlank = !isChallenge && Self.boolValue(report["blank"])
+            isCloudflareChallengeActive = isChallenge
             lastRenderProbeWasBlank = isBlank
             let readyState = report["readyState"] as? String ?? "unknown"
             let textLength = Self.intValue(report["textLength"])
             let visibleElements = Self.intValue(report["visibleElements"])
             let bodyChildren = Self.intValue(report["bodyChildren"])
-            lastRenderProbeSummary = "blank=\(isBlank), readyState=\(readyState), textLength=\(textLength), visibleElements=\(visibleElements), bodyChildren=\(bodyChildren)"
+            lastRenderProbeSummary = "blank=\(isBlank), cloudflareChallenge=\(isChallenge), readyState=\(readyState), textLength=\(textLength), visibleElements=\(visibleElements), bodyChildren=\(bodyChildren)"
             updateNativeChromeStatus()
 
-            if isBlank {
+            if isChallenge {
+                blankRecoveryAttempts = 0
+                hideStatusOverlayIfTransient()
+                setStatus("正在完成人机验证…", showsProgress: false)
+            } else if isBlank {
                 let urlText = Self.loggableURL(webView.url ?? chatGPTURL)
                 browserLogger.error("Rendered content probe found blank page (\(reason, privacy: .public)) at \(urlText, privacy: .public); textLength=\(textLength, privacy: .public), visibleElements=\(visibleElements, privacy: .public), bodyChildren=\(bodyChildren, privacy: .public)")
                 if recoverIfBlank {
@@ -655,7 +678,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func persistMainWindowFrame() {
-        guard !isPopup, window != nil else {
+        guard BrowserPerformancePolicy.shouldPersistWindowFrame(persistent: persistent, isPopup: isPopup),
+              window != nil else {
             return
         }
 
@@ -666,12 +690,37 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "width": frame.size.width,
             "height": frame.size.height,
         ], forKey: mainFrameDefaultsKey)
-        UserDefaults.standard.synchronize()
+    }
+
+    private func scheduleMainWindowFramePersistence() {
+        guard BrowserPerformancePolicy.shouldPersistWindowFrame(persistent: persistent, isPopup: isPopup) else {
+            return
+        }
+
+        framePersistenceWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isDisposing else {
+                return
+            }
+            self.framePersistenceWorkItem = nil
+            self.persistMainWindowFrame()
+        }
+        framePersistenceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + BrowserPerformancePolicy.windowFramePersistenceDelay,
+            execute: workItem
+        )
+    }
+
+    private func cancelScheduledMainWindowFramePersistence() {
+        framePersistenceWorkItem?.cancel()
+        framePersistenceWorkItem = nil
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
         lastNavigationStartedAt = Date()
         lastRenderProbeWasBlank = false
+        isCloudflareChallengeActive = false
         invalidateRenderedContentProbes()
         if case .recovering = currentOverlayMode {
             statusOverlay?.update(mode: currentOverlayMode)
@@ -1167,7 +1216,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         currentZoom = clamped
         webView.pageZoom = clamped
         UserDefaults.standard.set(Double(clamped), forKey: webZoomDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     private func openPopup(url: URL) {
@@ -1484,7 +1532,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             children.forEach { $0.window.close() }
             self.currentZoom = 1.0
             UserDefaults.standard.removeObject(forKey: webZoomDefaultsKey)
-            UserDefaults.standard.synchronize()
             completion()
         }
     }
@@ -1631,7 +1678,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return string
     }
 
-    private static let renderedContentProbeScript = """
+    static let renderedContentProbeScript = """
     (() => {
       const host = String(location.hostname || '').toLowerCase();
       const isChatGPTPage = location.protocol === 'https:' && (
@@ -1643,6 +1690,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       if (!isChatGPTPage || document.readyState !== 'complete') {
         return {
           blank: false,
+          cloudflareChallenge: false,
           readyState: document.readyState,
           href: location.href,
           title: document.title,
@@ -1653,52 +1701,46 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       }
 
       const body = document.body;
-      const text = body ? String(body.innerText || body.textContent || '').replace(/\\s+/g, ' ').trim() : '';
-      const selectors = [
-        'main',
-        '[role="main"]',
-        'form',
-        'textarea',
-        'input',
-        'button',
-        'nav',
-        'article',
-        'section',
-        'iframe',
-        'canvas',
-        'video',
-        'img',
-        'svg',
-        '[data-testid]',
-        '[contenteditable="true"]'
-      ].join(',');
+      const cloudflareChallenge = location.pathname.startsWith('/cdn-cgi/challenge-platform/') || !!document.querySelector([
+        'iframe[src*="challenges.cloudflare.com"]',
+        '.cf-turnstile',
+        '#cf-challenge-running',
+        '#challenge-stage',
+        '[data-cf-challenge]'
+      ].join(','));
+      const textLength = body ? String(body.textContent || '').trim().length : 0;
 
       let visibleElements = 0;
-      if (body) {
-        for (const element of body.querySelectorAll(selectors)) {
+      if (body && textLength < 8 && !cloudflareChallenge) {
+        const visualCandidates = body.querySelectorAll('main,[role="main"],form,iframe,canvas,video,img,svg');
+        for (const element of Array.from(visualCandidates).slice(0, 24)) {
           try {
             const style = window.getComputedStyle(element);
             if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity) === 0) continue;
             const rect = element.getBoundingClientRect();
-            if (rect.width > 1 && rect.height > 1) visibleElements += 1;
+            if (rect.width > 1 && rect.height > 1) {
+              visibleElements = 1;
+              break;
+            }
           } catch (_) {}
         }
       }
 
       const bodyChildren = body ? body.children.length : 0;
       return {
-        blank: !body || (text.length < 8 && visibleElements === 0),
+        blank: !cloudflareChallenge && (!body || (textLength < 8 && visibleElements === 0)),
+        cloudflareChallenge,
         readyState: document.readyState,
         href: location.href,
         title: document.title,
-        textLength: text.length,
+        textLength,
         visibleElements,
         bodyChildren
       };
     })()
     """
 
-    private static let promptDraftCaptureScript = """
+    static let promptDraftCaptureScript = """
     (() => {
       const host = String(location.hostname || '').toLowerCase();
       const isChatGPTPage = location.protocol === 'https:' && (
@@ -1707,24 +1749,17 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         host === 'chat.openai.com' ||
         host.endsWith('.chat.openai.com')
       );
-      if (!isChatGPTPage || window.__chatgptSwiftPromptDraftBridgeInstalled) return;
+      const isCloudflareChallenge = location.pathname.startsWith('/cdn-cgi/challenge-platform/') || !!document.querySelector([
+        'iframe[src*="challenges.cloudflare.com"]',
+        '.cf-turnstile',
+        '#cf-challenge-running',
+        '#challenge-stage',
+        '[data-cf-challenge]'
+      ].join(','));
+      if (!isChatGPTPage || isCloudflareChallenge || window.__chatgptSwiftPromptDraftBridgeInstalled) return;
       window.__chatgptSwiftPromptDraftBridgeInstalled = true;
 
       const maxLength = 12000;
-      const visible = (element) => {
-        if (!element) return false;
-        const rect = element.getBoundingClientRect();
-        const style = window.getComputedStyle(element);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
-      };
-      const firstVisible = (selector) => Array.from(document.querySelectorAll(selector)).find(visible);
-      const findComposer = () =>
-        firstVisible('textarea[data-testid="prompt-textarea"]') ||
-        firstVisible('[contenteditable="true"][data-testid="prompt-textarea"]') ||
-        firstVisible('#prompt-textarea') ||
-        firstVisible('textarea') ||
-        firstVisible('[role="textbox"]') ||
-        firstVisible('div[contenteditable="true"]');
       const readText = (element) => {
         if (!element) return '';
         if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
@@ -1732,34 +1767,38 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         return String(element.innerText || element.textContent || '').slice(0, maxLength);
       };
+      const composerFromEvent = (event) => {
+        const target = event.target;
+        if (!(target instanceof Element)) return null;
+        return target.closest([
+          'textarea[data-testid="prompt-textarea"]',
+          '[contenteditable="true"][data-testid="prompt-textarea"]',
+          '#prompt-textarea'
+        ].join(','));
+      };
 
       let publishTimer = 0;
-      const publish = () => {
+      let pendingComposer = null;
+      const publish = (composer) => {
+        pendingComposer = composer;
         window.clearTimeout(publishTimer);
         publishTimer = window.setTimeout(() => {
           try {
-            const composer = findComposer();
-            window.webkit.messageHandlers.promptDraft.postMessage({ text: readText(composer) });
+            window.webkit.messageHandlers.promptDraft.postMessage({ text: readText(pendingComposer) });
           } catch (_) {}
         }, 250);
       };
 
-      const attach = () => {
-        const composer = findComposer();
-        if (!composer || composer.__chatgptSwiftDraftObserved) return;
-        composer.__chatgptSwiftDraftObserved = true;
-        ['input', 'change', 'keyup', 'paste', 'cut'].forEach((eventName) => {
-          composer.addEventListener(eventName, publish, true);
-        });
-      };
-
-      attach();
-      new MutationObserver(attach).observe(document.documentElement, { childList: true, subtree: true });
-      window.setInterval(attach, 2500);
+      ['input', 'change'].forEach((eventName) => {
+        document.addEventListener(eventName, (event) => {
+          const composer = composerFromEvent(event);
+          if (composer) publish(composer);
+        }, true);
+      });
     })()
     """
 
-    private static let completionStateObserverScript = """
+    static let completionStateObserverScript = """
     (() => {
       const host = String(location.hostname || '').toLowerCase();
       const isChatGPTPage = location.protocol === 'https:' && (
@@ -1768,7 +1807,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         host === 'chat.openai.com' ||
         host.endsWith('.chat.openai.com')
       );
-      if (!isChatGPTPage || window.__chatgptSwiftCompletionObserverInstalled) return;
+      const isCloudflareChallenge = location.pathname.startsWith('/cdn-cgi/challenge-platform/') || !!document.querySelector([
+        'iframe[src*="challenges.cloudflare.com"]',
+        '.cf-turnstile',
+        '#cf-challenge-running',
+        '#challenge-stage',
+        '[data-cf-challenge]'
+      ].join(','));
+      if (!isChatGPTPage || isCloudflareChallenge || window.__chatgptSwiftCompletionObserverInstalled) return;
       window.__chatgptSwiftCompletionObserverInstalled = true;
 
       const visible = (element) => {
@@ -1785,7 +1831,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         ''
       ).toLowerCase();
       const busyReason = () => {
-        const candidates = Array.from(document.querySelectorAll('button, [role="button"], [aria-busy="true"], [data-testid]'))
+        const candidates = Array.from(document.querySelectorAll([
+          '[aria-busy="true"]',
+          '[data-testid*="stop" i]',
+          'button[aria-label*="stop" i]',
+          'button[aria-label*="停止"]',
+          '[role="button"][aria-label*="stop" i]',
+          '[role="button"][aria-label*="停止"]'
+        ].join(',')))
           .filter(visible);
         for (const element of candidates) {
           const text = textOf(element);
@@ -1808,8 +1861,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       let lastBusy = null;
       let publishTimer = 0;
       const publish = () => {
-        window.clearTimeout(publishTimer);
+        if (publishTimer) return;
         publishTimer = window.setTimeout(() => {
+          publishTimer = 0;
           const reason = busyReason();
           const busy = reason.length > 0;
           if (busy === lastBusy) return;
@@ -1817,7 +1871,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
           try {
             window.webkit.messageHandlers.completionState.postMessage({ busy, reason });
           } catch (_) {}
-        }, 500);
+        }, 350);
       };
 
       publish();
@@ -1895,12 +1949,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
-        // 默认(无指纹混淆)仍对齐 VPN 出口时区:不伪造 navigator/screen,只修正 IP/时区错位。
-        // 未开 VPN(出口时区==系统时区)或尚未解析到出口时区时为 nil,完全保持原生 Safari 行为。
-        let timezoneOnlyScript = fingerprint == nil
-            ? FingerprintCatalog.timezoneOnlyScript(systemTimezone: TimeZone.current.identifier)
-            : nil
-        if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled || timezoneOnlyScript != nil {
+        if fingerprint != nil || enhancedPrivacyEnabled || webRTCProtectionEnabled {
             userContentController.addUserScript(WKUserScript(source: nativeShimScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -1910,9 +1959,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))
-        }
-        if let timezoneOnlyScript {
-            userContentController.addUserScript(WKUserScript(source: timezoneOnlyScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         }
         if enhancedPrivacyEnabled {
             userContentController.addUserScript(WKUserScript(source: privacySignalsScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
@@ -2862,6 +2908,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 guardTimer = window.setTimeout(hideStopTooltips, 80);
               }
 
+              function containsTooltip(node) {
+                if (!(node instanceof Element)) return false;
+                return node.matches(tooltipSelector) || !!node.querySelector(tooltipSelector);
+              }
+
               const root = document.documentElement || document.body;
               if (!root) {
                 document.addEventListener('DOMContentLoaded', installStopTooltipGuard, { once: true });
@@ -2869,9 +2920,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
               }
 
               scheduleGuard();
-              document.addEventListener('pointermove', scheduleGuard, true);
-              document.addEventListener('focusin', scheduleGuard, true);
-              new MutationObserver(scheduleGuard).observe(root, {
+              new MutationObserver((mutations) => {
+                for (const mutation of mutations) {
+                  if (Array.from(mutation.addedNodes).some(containsTooltip)) {
+                    scheduleGuard();
+                    return;
+                  }
+                }
+              }).observe(root, {
                 childList: true,
                 subtree: true
               });

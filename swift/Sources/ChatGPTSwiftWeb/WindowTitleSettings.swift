@@ -15,6 +15,5 @@ enum WindowTitleSettings {
 
     static func setMode(_ mode: WindowTitleDisplayMode, defaults: UserDefaults = .standard) {
         defaults.set(mode.rawValue, forKey: defaultsKey)
-        defaults.synchronize()
     }
 }

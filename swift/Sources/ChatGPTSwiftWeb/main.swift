@@ -239,7 +239,6 @@ enum PromptDraftStore {
 
     static func setRestoreEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: promptDraftRestoreDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 
     static func draft(for profileID: String?) -> String {
@@ -266,7 +265,6 @@ enum PromptDraftStore {
 
     static func clearDraft(for profileID: String?) {
         UserDefaults.standard.removeObject(forKey: draftKey(profileID: profileID))
-        UserDefaults.standard.synchronize()
     }
 
     private static func draftKey(profileID: String?) -> String {
@@ -289,7 +287,6 @@ enum BackgroundCompletionNotifications {
 
     static func setEnabled(_ enabled: Bool) {
         UserDefaults.standard.set(enabled, forKey: backgroundCompletionNotificationsDefaultsKey)
-        UserDefaults.standard.synchronize()
     }
 }
 
