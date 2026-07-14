@@ -16,7 +16,7 @@ final class ProfileAndMediaPolicyTests: XCTestCase {
     func testProfileNameModeUsesEmailLocalPartOrCustomName() {
         XCTAssertEqual(
             ProfileWindowTitle.format(
-                profileName: "lance_barques6m@icloud.com",
+                profileName: "demo_user01@example.com",
                 isDefault: false,
                 mode: .profileName
             ),
