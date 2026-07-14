@@ -36,8 +36,8 @@ The bundle appears in `~/Applications/Chromium Apps.localized/` and Launchpad.
 
 Chromium owns the PWA shim's `Contents/Resources/app.icns` and renders it as a small green
 badge inset on a **white macOS tile** (and rebuilds it on shim updates). Editing `app.icns`
-or the profile's source icon PNGs does **not** produce the full-bleed, Swift-style green icon —
-Chrome re-insets it on the next rebuild.
+or the profile's source icon PNGs does **not** produce an independent, optically sized green
+icon — Chrome re-insets it on the next rebuild.
 
 The durable fix is a **Finder custom icon** (`kHasCustomIcon` + the bundle-root `Icon\r`
 resource). LaunchServices and the Dock prefer the custom icon over `app.icns`, and it lives at
@@ -48,9 +48,9 @@ the bundle root, independent of Chrome's in-place `app.icns` rewrite:
 ```
 
 It applies `packaging/icon-green.icns` to `~/Applications/Chromium Apps.localized/NoTrace Browser.app`
-via `NSWorkspace setIcon:forFile:` and refreshes the Dock. Verified: the LaunchServices-resolved
-icon is full-bleed green and survives a PWA relaunch. Re-run only if a Chromium upgrade recreates
-the shim from scratch.
+via `NSWorkspace setIcon:forFile:` and refreshes the Dock. The artwork is inset by about 2% so its
+optical size matches neighboring macOS Dock icons. Verified: the LaunchServices-resolved green
+icon survives a PWA relaunch. Re-run only if a Chromium upgrade recreates the shim from scratch.
 
 ## Microphone, Camera & Passkey (TCC)
 

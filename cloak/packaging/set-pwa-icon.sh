@@ -1,16 +1,16 @@
 #!/bin/bash
 set -euo pipefail
 
-# Force the NoTrace Browser PWA Dock/Finder icon to the full-bleed green ChatGPT icon,
-# overriding Chrome's white-inset PWA shim icon.
+# Force the NoTrace Browser PWA Dock/Finder icon to the optically balanced green
+# ChatGPT icon, overriding Chrome's white-inset PWA shim icon.
 #
 # Chrome renders the web app icon shrunk onto a white macOS squircle and writes that to
 # Contents/Resources/app.icns (the file the Dock reads for the running app). Two layers,
 # both applied here:
-#   1) Overwrite app.icns with the full-bleed green icns — what the running app's Dock
-#      tile uses. Verified to survive a normal quit/relaunch; Chrome only rewrites it
-#      when it *rebuilds the shim* (Chromium upgrade, or the web app's icon/title/
-#      start_url changes).
+#   1) Overwrite app.icns with the green icns, inset by about 2% to match neighboring macOS
+#      Dock icons — this is what the running app's Dock tile uses. Verified to survive
+#      a normal quit/relaunch; Chrome only rewrites it when it *rebuilds the shim*
+#      (Chromium upgrade, or the web app's icon/title/start_url changes).
 #   2) Set a Finder *custom icon* (kHasCustomIcon + bundle-root "Icon\r") via
 #      NSWorkspace setIcon:forFile: — covers Finder / Launchpad / Get-Info.
 # Re-run after a Chromium upgrade or if the shim is ever rebuilt.
@@ -60,7 +60,7 @@ fi
 /usr/bin/osascript -e 'tell application "NoTrace Browser" to quit' >/dev/null 2>&1 || true
 /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
 
-# 1) Overwrite the Dock-read shim icon with the full-bleed green icns, then verify it
+# 1) Overwrite the Dock-read shim icon with the optically sized green icns, then verify it
 # stuck. If a shim rebuild raced us and rewrote it teal, re-kill the loader and retry —
 # without this check the script prints "done" even when Chrome silently won the race.
 copied=""
