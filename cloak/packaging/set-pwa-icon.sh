@@ -52,11 +52,18 @@ fi
 [[ -d "$PWA_APP" ]] || { printf 'error: PWA bundle not found: %s\n' "$PWA_APP" >&2; exit 1; }
 
 # Quit the shim so it can't rewrite app.icns mid-edit, AND so the Dock re-reads the
-# icon on next launch. The AppleScript quit only lands if the shim is registered
+# icon on next launch. Remember whether it was running so only this PWA can be
+# reopened afterward; never restart Dock or iconservices globally because other apps
+# may use runtime-selected Dock icons.
+# The AppleScript quit only lands if the shim is registered
 # under its display name; a Chrome shim *rebuild* (install-as-app, Chromium upgrade,
 # or a web-app icon/title/start_url change) respawns the loader and rewrites app.icns
 # back to the teal shim icon. So also kill the loader by its exact path — surgical,
 # this never matches the main browser or any other PWA.
+was_running=0
+if /usr/bin/pgrep -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1; then
+  was_running=1
+fi
 /usr/bin/osascript -e 'tell application "NoTrace Browser" to quit' >/dev/null 2>&1 || true
 /usr/bin/pkill -f "$PWA_APP/Contents/MacOS/app_mode_loader" >/dev/null 2>&1 || true
 
@@ -85,9 +92,22 @@ OSA
 printf 'setIcon -> %s\n' "$ok"
 [[ "$ok" == "true" ]] || { printf 'error: setIcon failed (%s)\n' "$ok" >&2; exit 1; }
 
-# Confirm the custom-icon resource landed, then refresh Dock icon presentation.
+# Confirm the custom-icon resource landed, then refresh only this app's
+# LaunchServices registration. A global Dock/iconservices restart would reset
+# unrelated apps that select their Dock icon at runtime.
 if [[ -f "$PWA_APP/Icon"$'\r' ]]; then printf 'custom icon resource: present\n'; else printf 'warning: Icon resource missing\n' >&2; fi
 /usr/bin/touch "$PWA_APP"
-/usr/bin/killall Dock >/dev/null 2>&1 || true
+lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+if [[ -x "$lsregister" ]]; then
+  "$lsregister" -f "$PWA_APP" >/dev/null 2>&1
+  printf 'LaunchServices registration: refreshed\n'
+fi
+
+if [[ "$was_running" == "1" ]]; then
+  /usr/bin/open "$PWA_APP"
+  printf 'NoTrace Browser: reopened to refresh its Dock tile\n'
+else
+  printf 'Dock tile: the new icon will be read on the next NoTrace Browser launch\n'
+fi
 
 printf 'done: %s now uses %s\n' "$PWA_APP" "$ICON"
