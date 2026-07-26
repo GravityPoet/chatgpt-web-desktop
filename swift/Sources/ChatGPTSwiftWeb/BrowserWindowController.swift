@@ -148,16 +148,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
-        runRenderedContentProbe(reason: "reload action", recoverIfBlank: false) { [weak self] isBlank in
-            guard let self else {
-                return
-            }
-            if isBlank {
-                self.recoverFromBlankContent(reason: "reload action blank probe")
-            } else {
-                self.webView.reload()
-            }
-        }
+        // Reload immediately instead of waiting for a JS probe round-trip: when the page's main
+        // thread is busy (exactly when users reach for reload) the probe callback is delayed and the
+        // reload feels stuck. Blank pages are still caught by the scheduled post-navigation probe.
+        webView.reload()
     }
 
     /// True when the web view has no live, loaded content — the content process crashed, a provisional
@@ -1708,7 +1702,18 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         '#challenge-stage',
         '[data-cf-challenge]'
       ].join(','));
-      const textLength = body ? String(body.textContent || '').trim().length : 0;
+      // Sample text length with an early exit instead of materializing body.textContent: long
+      // conversations make the full concatenation a multi-megabyte main-thread pause, while the
+      // blank verdict only needs to know whether at least 8 characters exist.
+      let textLength = 0;
+      if (body) {
+        const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT);
+        while (textLength < 64) {
+          const node = walker.nextNode();
+          if (!node) break;
+          textLength += String(node.nodeValue || '').trim().length;
+        }
+      }
 
       let visibleElements = 0;
       if (body && textLength < 8 && !cloudflareChallenge) {
@@ -1817,11 +1822,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       if (!isChatGPTPage || isCloudflareChallenge || window.__chatgptSwiftCompletionObserverInstalled) return;
       window.__chatgptSwiftCompletionObserverInstalled = true;
 
+      // The scan forces synchronous layout (rect/computed style/innerText), so it must stay rare
+      // and cheap: rect short-circuits before computed style, candidates are capped, and scans run
+      // through requestIdleCallback so streaming-mutation storms never reflow every frame.
       const visible = (element) => {
         if (!element) return false;
         const rect = element.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) return false;
         const style = window.getComputedStyle(element);
-        return rect.width > 0 && rect.height > 0 && style.visibility !== 'hidden' && style.display !== 'none';
+        return style.visibility !== 'hidden' && style.display !== 'none';
       };
       const textOf = (element) => String(
         element?.getAttribute?.('aria-label') ||
@@ -1839,6 +1848,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
           '[role="button"][aria-label*="stop" i]',
           '[role="button"][aria-label*="停止"]'
         ].join(',')))
+          .slice(0, 12)
           .filter(visible);
         for (const element of candidates) {
           const text = textOf(element);
@@ -1859,19 +1869,25 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       };
 
       let lastBusy = null;
-      let publishTimer = 0;
+      let scanScheduled = false;
+      const scheduleIdleScan = window.requestIdleCallback
+        ? ((scan) => window.requestIdleCallback(scan, { timeout: 500 }))
+        : ((scan) => window.setTimeout(scan, 250));
       const publish = () => {
-        if (publishTimer) return;
-        publishTimer = window.setTimeout(() => {
-          publishTimer = 0;
-          const reason = busyReason();
-          const busy = reason.length > 0;
-          if (busy === lastBusy) return;
-          lastBusy = busy;
-          try {
-            window.webkit.messageHandlers.completionState.postMessage({ busy, reason });
-          } catch (_) {}
-        }, 350);
+        if (scanScheduled) return;
+        scanScheduled = true;
+        window.setTimeout(() => {
+          scheduleIdleScan(() => {
+            scanScheduled = false;
+            const reason = busyReason();
+            const busy = reason.length > 0;
+            if (busy === lastBusy) return;
+            lastBusy = busy;
+            try {
+              window.webkit.messageHandlers.completionState.postMessage({ busy, reason });
+            } catch (_) {}
+          });
+        }, 600);
       };
 
       publish();
@@ -1881,7 +1897,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         attributes: true,
         attributeFilter: ['aria-label', 'aria-busy', 'data-testid', 'disabled']
       });
-      window.setInterval(publish, 3000);
+      // Poll only while a generation is in flight; an idle page costs nothing until the
+      // MutationObserver reports activity again.
+      window.setInterval(() => {
+        if (lastBusy) publish();
+      }, 3000);
     })()
     """
 
