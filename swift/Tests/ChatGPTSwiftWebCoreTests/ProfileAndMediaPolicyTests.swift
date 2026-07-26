@@ -20,7 +20,7 @@ final class ProfileAndMediaPolicyTests: XCTestCase {
                 isDefault: false,
                 mode: .profileName
             ),
-            "ChatGPT Swift — lance_barques6m"
+            "ChatGPT Swift — demo_user01"
         )
         XCTAssertEqual(
             ProfileWindowTitle.format(profileName: "工作号", isDefault: false, mode: .profileName),
