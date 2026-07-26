@@ -44,10 +44,10 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 输出：
 
 ```text
-dist/ChatGPT Swift.app
+dist/ChatGPT Swift.zip
 ```
 
-> 不要提交 `.build/`、`dist/`、`.app`、`.dmg` 或 cookie/session 导出文件。
+低层 App 仅在 DMG、安装或调试流程存活，并在退出时物理删除；`.build` 中的 Sparkle Helper 属于依赖组件，不单独删除，只通过构建根索引隔离。不要提交 `.build/`、`dist/`、`.app`、`.dmg` 或 cookie/session 导出文件。
 
 ## 生成 DMG
 
@@ -191,10 +191,10 @@ https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/appc
 ## 安装到 Applications
 
 ```bash
-rm -rf "/Applications/ChatGPT Swift.app"
-cp -R "dist/ChatGPT Swift.app" /Applications/
-open "/Applications/ChatGPT Swift.app"
+./packaging/install-local-app.sh
 ```
+
+该脚本使用 ZIP 回滚、原子替换和唯一性验收；完成后只允许 `/Applications/ChatGPT Swift.app` 作为产品 App。
 
 ## 原生聊天架构边界
 
