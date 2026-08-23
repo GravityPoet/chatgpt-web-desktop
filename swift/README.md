@@ -8,7 +8,7 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 
 - 独立 bundle id：`local.chatgpt-web.swift`
 - 独立 Cookie / WebsiteDataStore，与 Chrome、Tauri 版隔离
-- 每个账号空间默认写入 ChatGPT 官方“拒绝非必要 Cookie”Consent 偏好，保留登录、安全和功能性 Cookie，并可在“设置 > 隐私”关闭
+- 每个账号空间默认写入 ChatGPT 官方“拒绝非必要 Cookie”Consent 偏好，保留登录、安全和功能性 Cookie；关闭时只清理本 App 预置的四个 Consent Cookie，不触碰登录态或其他网站 Cookie
 - 原生 `NSWindow`，窗口大小和位置由 macOS `setFrameAutosaveName` 记住
 - 原生 Dock / App 图标 / 菜单 / 轻量工具栏，toolbar 自定义布局会保存
 - `WKWebView` 加载 `https://chatgpt.com/`

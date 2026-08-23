@@ -42,10 +42,34 @@ enum CookieConsentSettings {
     static func rejectionIsApplied(in cookies: [HTTPCookie]) -> Bool {
         rejectionCookieNames.allSatisfy { expectedName in
             cookies.contains { cookie in
-                cookie.name == expectedName
+                isManagedRejectionCookie(cookie)
+                    && cookie.name == expectedName
                     && cookie.value.lowercased() == "false"
-                    && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == "chatgpt.com"
             }
+        }
+    }
+
+    /// Removes only the consent cookies this app seeds. Login, security, and other site cookies
+    /// are intentionally left untouched so turning the default policy off cannot sign the user out.
+    static func clearManagedRejectionCookies(
+        from dataStore: WKWebsiteDataStore,
+        completion: @escaping () -> Void
+    ) {
+        dataStore.httpCookieStore.getAllCookies { cookies in
+            let managedCookies = cookies.filter(isManagedRejectionCookie)
+            guard !managedCookies.isEmpty else {
+                DispatchQueue.main.async(execute: completion)
+                return
+            }
+
+            let group = DispatchGroup()
+            for cookie in managedCookies {
+                group.enter()
+                dataStore.httpCookieStore.delete(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main, execute: completion)
         }
     }
 
@@ -74,5 +98,10 @@ enum CookieConsentSettings {
             }
         }
         group.notify(queue: .main, execute: completion)
+    }
+
+    private static func isManagedRejectionCookie(_ cookie: HTTPCookie) -> Bool {
+        rejectionCookieNames.contains(cookie.name)
+            && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == "chatgpt.com"
     }
 }

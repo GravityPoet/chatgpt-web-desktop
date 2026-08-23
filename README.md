@@ -68,7 +68,7 @@ Runtime login state is stored by the operating system WebView at runtime. The Sw
 
 The Swift app also includes a clear website data action for resetting this app's WebView cookies, login state, cache, localStorage, IndexedDB, service workers, and other local website data before reloading ChatGPT.
 
-By default, each Swift WebView profile records ChatGPT's official consent preference as rejecting non-essential cookies while preserving the cookies required for sign-in, security, and service functionality. This behavior can be disabled under Settings > Privacy; existing choices can still be changed through ChatGPT's Cookie Preferences.
+By default, each Swift WebView profile records ChatGPT's official consent preference as rejecting non-essential cookies while preserving the cookies required for sign-in, security, and service functionality. Settings > Privacy can disable this behavior; disabling it removes only the four consent cookies seeded by this app, never login or other site cookies, and existing choices can still be changed through ChatGPT's Cookie Preferences.
 
 The Swift app additionally provides optional, off-by-default fingerprint controls for a consistent per-profile browser identity: a stable Safari-family navigator/screen profile, enhanced-privacy noise for Canvas/WebGL/Audio, and WebRTC leak protection. The default profile preserves the native WebKit timezone and never rebuilds a live page after a GeoIP refresh. When a fingerprint preset is explicitly enabled, egress-derived timezone data is refreshed only for the next newly created WebView.
 

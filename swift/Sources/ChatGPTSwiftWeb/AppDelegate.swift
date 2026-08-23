@@ -584,12 +584,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func setRejectNonEssentialCookiesFromSettings(_ enabled: Bool) {
         CookieConsentSettings.setEnabled(enabled)
-        guard enabled, let controller = mainController else {
+        guard let controller = mainController else {
             refreshNativeUtilityWindows()
             return
         }
-        controller.applyDefaultCookieConsent { [weak self, weak controller] in
-            controller?.setStatus("已默认拒绝非必要 Cookie；下次页面加载生效", showsProgress: false)
+
+        if enabled {
+            controller.applyDefaultCookieConsent { [weak self, weak controller] in
+                controller?.setStatus("已默认拒绝非必要 Cookie；下次页面加载生效", showsProgress: false)
+                self?.refreshNativeUtilityWindows()
+            }
+            return
+        }
+
+        CookieConsentSettings.clearManagedRejectionCookies(
+            from: controller.webView.configuration.websiteDataStore
+        ) { [weak self, weak controller] in
+            controller?.setStatus("已取消默认拒绝；下次页面加载可在 Cookie Preferences 中选择", showsProgress: false)
             self?.refreshNativeUtilityWindows()
         }
     }
