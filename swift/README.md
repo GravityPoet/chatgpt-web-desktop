@@ -1,6 +1,6 @@
 # ChatGPT Swift
 
-原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，把 ChatGPT Web 放进独立 macOS 桌面窗口，并保留独立 WebView 账号空间、macOS 12 兼容、网页优先的模型 / 工具体验、下载桥、诊断和隐私控制；也用于和 Tauri/Rust 版并排对比。
+原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，把 ChatGPT Web 放进独立 macOS 桌面窗口，并保留独立 WebView 账号空间、macOS 12 兼容、网页优先的模型 / 工具体验、下载桥、诊断和隐私控制；默认交付同时支持 Apple Silicon 与 Intel 的 universal App，也用于和 Tauri/Rust 版并排对比。
 
 OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 保留为 ChatGPT Classic；官方公布的 macOS 要求现为 macOS 14+，同时支持 Apple Silicon 与 Intel，而本项目的 Swift 版仍支持 macOS 12+。本项目不以替代官方 App 为目标，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。参考：[ChatGPT 发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)、[macOS 系统要求](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app)。
 
@@ -48,12 +48,20 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 dist/ChatGPT Swift.zip
 ```
 
+打包脚本会显式为 `arm64` 和 `x86_64` 构建并合并 universal 主程序，验证两个 slice 的最低系统版本均为 macOS 12.0，并检查 Sparkle 内嵌可执行文件也包含两种架构。默认继续使用本机统一的 `ChatGPT Rust Local Code Signing` 自签名证书；签名身份可通过 `CHATGPT_SWIFT_CODESIGN_IDENTITY` 覆盖。
+
 低层 App 仅在 DMG、安装或调试流程存活，并在退出时物理删除；`.build` 中的 Sparkle Helper 属于依赖组件，不单独删除，只通过构建根索引隔离。不要提交 `.build/`、`dist/`、`.app`、`.dmg` 或 cookie/session 导出文件。
 
 ## 生成 DMG
 
 ```bash
 ./packaging/make-dmg.sh
+```
+
+源码 / 工作流静态检查（本机需要 Homebrew 的 `actionlint` 与 `shellcheck`）：
+
+```bash
+./script/check-source.sh
 ```
 
 输出：
@@ -126,6 +134,7 @@ Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA �
 - 在打包前运行 `swift test` 和真实 App 启动/render smoke；任一失败都会停止发布
 - 新 release tag 固定指向本次 `GITHUB_SHA`；只允许同一提交重跑 draft，已发布 release 不会被静默覆盖
 - 默认用本地自签名构建 GitHub Release DMG，不需要 Apple Developer 账号
+- App、ZIP、DMG 和最终安装都会验收 `arm64+x86_64`、两个 slice 的 macOS 12.0 deployment target 及完整 codesign
 - 如果选择 `distribution=developer-id`，才导入 Developer ID Application `.p12`、notarize 并 staple DMG
 - 如果开启 `enable_sparkle=true`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`
 - 上传 `ChatGPT Swift.dmg` 到指定 GitHub Release；开启 Sparkle 时额外上传 `appcast.xml`

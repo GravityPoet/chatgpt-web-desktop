@@ -30,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        RemoteImageLoader.cleanupStaleTemporaryFiles()
         let smokeTestRun = SmokeTestEnvironment.isEnabled
         didFinishLaunchingAt = Date()
         if smokeTestRun {
@@ -791,7 +792,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             windowTitleDisplayMode: WindowTitleSettings.mode(),
             notesAutomationStatus: "按需请求；首次插入选中备忘录正文时由 macOS 弹出授权。",
             updateStatus: updateCheckStatus,
-            distributionStatus: "\(sparkleStatus)。本地构建已走 codesign；Developer ID 分发需执行 packaging/notarize-dmg.sh 并 stapler。"
+            distributionStatus: "\(sparkleStatus)。当前交付采用本地统一自签名；打包与安装脚本会验收 codesign、universal 架构和最低系统版本。Developer ID 与公证仅是可选外部分发路径。"
         )
     }
 
@@ -979,7 +980,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("更新检查", updateCheckStatus),
             ("Sparkle", sparkleStatus),
             ("发行页", releasePageURL.absoluteString),
-            ("notarization", "运行时不能证明 DMG 是否已 stapled；用 packaging/notarize-dmg.sh / spctl / stapler 验证。"),
+            ("签名策略", "本地统一自签名；codesign、universal 架构和最低系统版本由打包与安装脚本验收。"),
+            ("可选外部分发", "仅选择 Developer ID 分发时才要求 notarization / stapler；不影响本地安装验收。"),
         ]))
 
         return DiagnosticRedactor.text(sections.joined(separator: "\n\n"))
@@ -1601,6 +1603,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
     }
 
+    @objc private func inspectOrphanedProfileDataStores(_ sender: Any?) {
+        guard #available(macOS 14.0, *) else {
+            presentInfo("遗留账号空间数据检测需要 macOS 14 或更新版本。")
+            return
+        }
+
+        let activeProfileIDs = ProfileStore.loadProfiles().map(\.id)
+        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { [weak self] allIdentifiers in
+            guard let self else {
+                return
+            }
+            let orphanedIdentifiers = ProfileDataStoreInventory.orphanedIdentifiers(
+                allIdentifiers: allIdentifiers,
+                activeProfileIDs: activeProfileIDs
+            )
+            guard !orphanedIdentifiers.isEmpty else {
+                self.presentInfo("没有发现已删除账号空间遗留的网站数据。")
+                return
+            }
+
+            let alert = NSAlert()
+            alert.messageText = "发现 \(orphanedIdentifiers.count) 份遗留账号空间数据"
+            alert.informativeText = "这些独立 WebKit 数据仓库已不属于当前账号空间，可能仍含 cookie、登录态、缓存与本地存储。清理后无法恢复；当前 \(activeProfileIDs.count) 个账号空间不会被删除。"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "清理遗留数据")
+            alert.addButton(withTitle: "保留")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                return
+            }
+
+            self.removeOrphanedProfileDataStores(orphanedIdentifiers[...], removedCount: 0, failedCount: 0)
+        }
+    }
+
+    @available(macOS 14.0, *)
+    private func removeOrphanedProfileDataStores(
+        _ remaining: ArraySlice<UUID>,
+        removedCount: Int,
+        failedCount: Int
+    ) {
+        guard let identifier = remaining.first else {
+            if failedCount == 0 {
+                presentInfo("已清理 \(removedCount) 份遗留账号空间数据。当前账号空间不受影响。")
+            } else {
+                presentError("已清理 \(removedCount) 份遗留数据，另有 \(failedCount) 份清理失败。请退出 App 后重试。")
+            }
+            return
+        }
+
+        WKWebsiteDataStore.remove(forIdentifier: identifier) { [weak self] error in
+            self?.removeOrphanedProfileDataStores(
+                remaining.dropFirst(),
+                removedCount: removedCount + (error == nil ? 1 : 0),
+                failedCount: failedCount + (error == nil ? 0 : 1)
+            )
+        }
+    }
+
     func menuNeedsUpdate(_ menu: NSMenu) {
         if menu === profilesMenu {
             rebuildProfilesMenu(menu)
@@ -1705,6 +1765,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         if currentID == defaultProfileID {
             deleteItem.toolTip = "删除内置空间会清空默认 WebView 数据仓库，并立即创建一个全新的内置空间。"
         }
+
+        menu.addItem(NSMenuItem.separator())
+        let inspectOrphansItem = menu.addItem(
+            withTitle: "检查遗留账号空间数据…",
+            action: #selector(inspectOrphanedProfileDataStores(_:)),
+            keyEquivalent: ""
+        )
+        inspectOrphansItem.target = self
+        inspectOrphansItem.isEnabled = isolationAvailable
 
         if !isolationAvailable {
             menu.addItem(NSMenuItem.separator())

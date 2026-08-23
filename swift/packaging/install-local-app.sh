@@ -80,14 +80,12 @@ trap 'exit 143' TERM
 : > "$VERIFY_ROOT/.metadata_never_index"
 remove_cached_product_apps
 CHATGPT_SWIFT_KEEP_TRANSIENT_APP=1 "$ROOT/packaging/make-app.sh" >/dev/null
-/usr/bin/codesign --verify --deep --strict "$APP_DIR"
-[[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$APP_DIR/Contents/Info.plist")" == "$BUNDLE_ID" ]]
-/usr/bin/lipo "$APP_DIR/Contents/MacOS/$BINARY_NAME" -verify_arch "$(uname -m)"
+"$ROOT/packaging/verify-app-bundle.sh" "$APP_DIR" >/dev/null
 
 rm -rf "$STAGE_APP" "$DISPLACED_APP"
 /usr/bin/ditto --noextattr --noqtn "$APP_DIR" "$STAGE_APP"
 /usr/bin/xattr -cr "$STAGE_APP"
-/usr/bin/codesign --verify --deep --strict "$STAGE_APP"
+"$ROOT/packaging/verify-app-bundle.sh" "$STAGE_APP" >/dev/null
 
 if [[ -d "$INSTALL_APP" ]]; then
   HAD_PREVIOUS=1
@@ -122,10 +120,9 @@ if [[ "$HAD_PREVIOUS" -eq 1 ]]; then
   mv "$INSTALL_APP" "$DISPLACED_APP"
 fi
 mv "$STAGE_APP" "$INSTALL_APP"
-/usr/bin/codesign --verify --deep --strict "$INSTALL_APP"
-[[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$INSTALL_APP/Contents/Info.plist")" == "$BUNDLE_ID" ]]
-/usr/bin/lipo "$INSTALL_APP/Contents/MacOS/$BINARY_NAME" -verify_arch "$(uname -m)"
+"$ROOT/packaging/verify-app-bundle.sh" "$INSTALL_APP" >/dev/null
 "$LSREGISTER" -f "$INSTALL_APP" >/dev/null 2>&1 || true
+/usr/bin/mdimport "$INSTALL_APP" >/dev/null 2>&1 || true
 
 /usr/bin/open "$INSTALL_APP"
 for _ in {1..15}; do
@@ -167,7 +164,7 @@ if [[ "$physical_paths" != "$INSTALL_APP" ]]; then
   exit 1
 fi
 
-for _ in {1..10}; do
+for _ in {1..20}; do
   spotlight_paths="$(/usr/bin/mdfind 'kMDItemCFBundleIdentifier == "local.chatgpt-web.swift"c' | sort -u)"
   [[ "$spotlight_paths" == "$INSTALL_APP" ]] && break
   /bin/sleep 1
@@ -179,6 +176,8 @@ if [[ "${spotlight_paths:-}" != "$INSTALL_APP" ]]; then
 fi
 
 launchservices_paths="$(
+  # Swift reads the bundle ID from the environment.
+  # shellcheck disable=SC2016
   FINAL_APP_BUNDLE_ID="$BUNDLE_ID" /usr/bin/swift -e '
     import Foundation
     import CoreServices
@@ -194,6 +193,8 @@ if [[ "$launchservices_paths" != "$INSTALL_APP" ]]; then
 fi
 
 dock_paths="$(
+  # Swift reads the bundle ID from the environment.
+  # shellcheck disable=SC2016
   FINAL_APP_BUNDLE_ID="$BUNDLE_ID" /usr/bin/swift -e '
     import Foundation
     let bundleID = ProcessInfo.processInfo.environment["FINAL_APP_BUNDLE_ID"]!
@@ -216,6 +217,8 @@ if [[ -n "$dock_paths" && "$dock_paths" != "$INSTALL_APP" ]]; then
   /usr/bin/killall Dock >/dev/null 2>&1 || true
   /bin/sleep 2
   dock_paths="$(
+    # Swift reads the bundle ID from the environment.
+    # shellcheck disable=SC2016
     FINAL_APP_BUNDLE_ID="$BUNDLE_ID" /usr/bin/swift -e '
       import Foundation
       let bundleID = ProcessInfo.processInfo.environment["FINAL_APP_BUNDLE_ID"]!

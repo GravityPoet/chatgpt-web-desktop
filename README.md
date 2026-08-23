@@ -56,7 +56,7 @@ cloak/
   Multi-account macOS launcher: one isolated CloakBrowser (Chromium) profile per account.
 ```
 
-The Swift version is a native macOS implementation. The Tauri version is the cross-platform implementation for desktop builds across macOS, Windows, and Linux.
+The Swift version is a native macOS implementation shipped as a single arm64+x86_64 universal app for macOS 12 and later. The Tauri version is the cross-platform implementation for desktop builds across macOS, Windows, and Linux.
 
 The cloak version targets people who run several ChatGPT accounts and want each one to stay fully separate. Every account gets its own isolated Chromium profile (independent storage and login state) launched through a CloakBrowser build, with a per-account fingerprint seed (navigator/UA/GPU/platform), an optional per-account proxy, and timezone, locale, and WebRTC-IP values derived from that account's own network egress so each identity stays internally consistent. A small Dock picker app lists the accounts and launches the selected one.
 
@@ -82,6 +82,8 @@ cd swift
 ./packaging/make-dmg.sh
 ```
 
+Both commands produce a locally self-signed universal build that is verified for Apple Silicon and Intel slices with a macOS 12.0 minimum deployment target.
+
 Tauri:
 
 ```bash
@@ -93,7 +95,7 @@ npm run build:signed-dmg
 
 ## Status
 
-- Swift wrapper: native macOS AppKit/WKWebView path; stable native defaults plus optional per-profile fingerprint controls and next-session VPN-egress timezone alignment.
+- Swift wrapper: native macOS AppKit/WKWebView path; arm64+x86_64 universal delivery for macOS 12+, stable native defaults plus optional per-profile fingerprint controls and next-session VPN-egress timezone alignment.
 - Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
 - Cloak launcher: macOS multi-account path; per-account isolated CloakBrowser profile, fingerprint seed, optional proxy, and egress-derived timezone/locale/WebRTC-IP, with a Dock account picker.
 - Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.

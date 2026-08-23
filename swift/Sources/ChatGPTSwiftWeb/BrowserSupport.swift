@@ -248,11 +248,61 @@ enum GeoIPResolver {
     }
 }
 
+enum SafariUserAgentPolicy {
+    private static let safariBundlePath = "/Applications/Safari.app"
+    private static let frozenSafariBuildToken = "605.1.15"
+
+    static func normalizedVersion(_ rawVersion: String?) -> String? {
+        guard let rawVersion else {
+            return nil
+        }
+        let version = rawVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = version.split(separator: ".", omittingEmptySubsequences: false)
+        guard !version.isEmpty,
+              version.count <= 24,
+              (1 ... 4).contains(components.count),
+              components.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) else {
+            return nil
+        }
+        return version
+    }
+
+    static func applicationName(safariVersion: String?) -> String? {
+        guard let version = normalizedVersion(safariVersion) else {
+            return nil
+        }
+        return "Version/\(version) Safari/\(frozenSafariBuildToken)"
+    }
+
+    static func completeMacUserAgent(safariVersion: String?) -> String? {
+        guard let applicationName = applicationName(safariVersion: safariVersion) else {
+            return nil
+        }
+        return "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/\(frozenSafariBuildToken) (KHTML, like Gecko) \(applicationName)"
+    }
+
+    static var installedSafariVersion: String? {
+        let bundle = Bundle(path: safariBundlePath)
+        return normalizedVersion(bundle?.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String)
+    }
+
+    static var currentApplicationName: String? {
+        applicationName(safariVersion: installedSafariVersion)
+    }
+
+    static var currentCompleteMacUserAgent: String? {
+        completeMacUserAgent(safariVersion: installedSafariVersion)
+    }
+}
+
 enum FingerprintCatalog {
     static let offPresetID = "off"
     static let defaultAcceptLanguages = ["zh-CN", "en-US"]
 
-    private static let macSafari17UserAgent = defaultSafariUserAgent
+    // Safari ships with macOS, so this uses the installed engine's product version. The fallback is
+    // only for a damaged/missing Safari bundle and remains confined to an explicitly selected preset.
+    private static let macSafariUserAgent = SafariUserAgentPolicy.currentCompleteMacUserAgent
+        ?? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko)"
     // iOS/iPadOS 26 freezes the UA OS token at 18_6 (like macOS freezes 10_15_7); the real OS major lives only in Version/ (26.0). Real devices report OS 18_6 — do NOT "correct" it to 26_0, that would be a detectable fake.
     private static let iPadSafari17UserAgent = "Mozilla/5.0 (iPad; CPU OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
     private static let iPhoneSafari17UserAgent = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1"
@@ -261,7 +311,7 @@ enum FingerprintCatalog {
         FingerprintProfile(
             presetID: "mba13",
             displayName: "MacBook Air 13\" M2",
-            userAgent: macSafari17UserAgent,
+            userAgent: macSafariUserAgent,
             acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 8,
@@ -276,7 +326,7 @@ enum FingerprintCatalog {
         FingerprintProfile(
             presetID: "mbp14",
             displayName: "MacBook Pro 14\" M3",
-            userAgent: macSafari17UserAgent,
+            userAgent: macSafariUserAgent,
             acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 10,
@@ -291,7 +341,7 @@ enum FingerprintCatalog {
         FingerprintProfile(
             presetID: "imac5k",
             displayName: "iMac 27\" 5K",
-            userAgent: macSafari17UserAgent,
+            userAgent: macSafariUserAgent,
             acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: 10,
@@ -803,7 +853,7 @@ enum FingerprintCatalog {
         return FingerprintProfile(
             presetID: "random-\(UUID().uuidString)",
             displayName: "随机：Mac Safari 稳定指纹",
-            userAgent: macSafari17UserAgent,
+            userAgent: macSafariUserAgent,
             acceptLanguages: defaultAcceptLanguages,
             platform: "MacIntel",
             hardwareConcurrency: cores,

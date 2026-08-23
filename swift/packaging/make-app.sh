@@ -73,7 +73,8 @@ fi
 unregister_app_bundle "$APP_DIR"
 rm -rf "$APP_DIR"
 
-swift build -c release
+swift build -c release --arch arm64 --arch x86_64
+UNIVERSAL_RELEASE_DIR="$(swift build -c release --arch arm64 --arch x86_64 --show-bin-path)"
 
 if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$("$REPO_ROOT/tauri/packaging/ensure-local-codesign-cert.sh")"
@@ -89,7 +90,7 @@ esac
 
 mkdir -p "$MACOS" "$RESOURCES" "$FRAMEWORKS"
 
-cp ".build/release/$BINARY_NAME" "$MACOS/$BINARY_NAME"
+cp "$UNIVERSAL_RELEASE_DIR/$BINARY_NAME" "$MACOS/$BINARY_NAME"
 cp "$ROOT/packaging/Info.plist" "$CONTENTS/Info.plist"
 
 if [[ -n "$SHORT_VERSION_OVERRIDE" ]]; then
@@ -120,7 +121,7 @@ fi
 
 SPARKLE_FRAMEWORK_SOURCE=""
 for candidate in \
-  "$ROOT/.build/release/Sparkle.framework" \
+  "$UNIVERSAL_RELEASE_DIR/Sparkle.framework" \
   "$ROOT/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 do
   if [[ -d "$candidate" ]]; then
@@ -165,8 +166,7 @@ if [[ "$SIGN_TIMESTAMP" == "1" ]]; then
 fi
 /usr/bin/codesign "${framework_codesign_args[@]}" "$FRAMEWORKS/Sparkle.framework"
 /usr/bin/codesign "${codesign_args[@]}" "$APP_DIR"
-/usr/bin/codesign --verify --deep --strict "$APP_DIR"
-/usr/bin/lipo "$MACOS/$BINARY_NAME" -verify_arch "$(uname -m)"
+"$ROOT/packaging/verify-app-bundle.sh" "$APP_DIR" >/dev/null
 
 if [[ "$KEEP_TRANSIENT_APP" == "1" ]]; then
   trap - EXIT INT TERM
@@ -182,8 +182,7 @@ VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt-swift-archive-verify.XXXXXX")"
 /usr/bin/ditto -x -k "$ARCHIVE" "$VERIFY_ROOT"
 VERIFY_APP="$VERIFY_ROOT/$APP_NAME.app"
 [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$VERIFY_APP/Contents/Info.plist" 2>/dev/null || true)" == "local.chatgpt-web.swift" ]]
-/usr/bin/codesign --verify --deep --strict "$VERIFY_APP"
-/usr/bin/lipo "$VERIFY_APP/Contents/MacOS/$BINARY_NAME" -verify_arch "$(uname -m)"
+"$ROOT/packaging/verify-app-bundle.sh" "$VERIFY_APP" >/dev/null
 rm -rf "$VERIFY_ROOT"
 VERIFY_ROOT=""
 unregister_app_bundle "$APP_DIR"

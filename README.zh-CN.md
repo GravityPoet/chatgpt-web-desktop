@@ -56,7 +56,7 @@ cloak/
   多账号 macOS 启动器：每个账号一个隔离的 CloakBrowser（Chromium）profile。
 ```
 
-Swift 版本是原生 macOS 实现。Tauri 版本是面向 macOS、Windows 和 Linux 桌面构建的跨平台实现。
+Swift 版本是原生 macOS 实现，以同一个支持 macOS 12+ 的 `arm64+x86_64` universal App 覆盖 Apple Silicon 与 Intel。Tauri 版本是面向 macOS、Windows 和 Linux 桌面构建的跨平台实现。
 
 cloak 版本面向需要同时运行多个 ChatGPT 账号、并希望各账号彻底隔离的用户。每个账号都有独立的 Chromium profile（独立的存储与登录态），通过 CloakBrowser 构建启动，配以每账号的指纹种子（navigator/UA/GPU/platform）、可选的每账号代理，以及由该账号自身网络出口推导的 timezone、locale 和 WebRTC-IP，使每个身份在内部保持一致。一个小型 Dock 选择器 App 列出账号并启动所选账号。
 
@@ -82,6 +82,8 @@ cd swift
 ./packaging/make-dmg.sh
 ```
 
+两个命令都会生成使用本机统一证书自签名的 universal 产物，并验收 Apple Silicon / Intel 两个 slice 的最低部署版本均为 macOS 12.0。
+
 Tauri：
 
 ```bash
@@ -93,7 +95,7 @@ npm run build:signed-dmg
 
 ## 状态
 
-- Swift wrapper：原生 macOS AppKit/WKWebView 路线；稳定的原生默认值，以及可选的每空间指纹控制和从下一次会话生效的 VPN 出口时区对齐。
+- Swift wrapper：原生 macOS AppKit/WKWebView 路线；macOS 12+ 的 `arm64+x86_64` universal 交付、稳定的原生默认值，以及可选的每空间指纹控制和从下一次会话生效的 VPN 出口时区对齐。
 - Tauri wrapper：Rust/Tauri v2 跨平台桌面路线。
 - Cloak launcher：macOS 多账号路线；每账号隔离的 CloakBrowser profile、指纹种子、可选代理，以及由出口推导的 timezone/locale/WebRTC-IP，配一个 Dock 账号选择器。
 - 打包辅助：已包含 macOS app/DMG 辅助脚本；其他桌面目标可以沿用标准 Tauri build flow。

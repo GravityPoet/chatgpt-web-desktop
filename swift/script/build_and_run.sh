@@ -2,6 +2,11 @@
 set -euo pipefail
 
 MODE="${1:-run}"
+SMOKE_ARCH="${CHATGPT_SWIFT_SMOKE_ARCH:-native}"
+if [[ "$MODE" == "--verify-x86_64" || "$MODE" == "verify-x86_64" ]]; then
+  MODE="--verify"
+  SMOKE_ARCH="x86_64"
+fi
 APP_NAME="ChatGPTSwiftWeb"
 BUNDLE_ID="local.chatgpt-web.swift"
 
@@ -100,9 +105,25 @@ case "$MODE" in
     elif [[ "$smoke_timeout" -gt 120 ]]; then
       smoke_timeout=120
     fi
+    case "$SMOKE_ARCH" in
+      native)
+        smoke_command=("$APP_BINARY")
+        ;;
+      arm64|x86_64)
+        if ! /usr/bin/arch -"$SMOKE_ARCH" /usr/bin/true >/dev/null 2>&1; then
+          echo "requested smoke architecture is unavailable: $SMOKE_ARCH" >&2
+          exit 2
+        fi
+        smoke_command=(/usr/bin/arch -"$SMOKE_ARCH" "$APP_BINARY")
+        ;;
+      *)
+        echo "invalid CHATGPT_SWIFT_SMOKE_ARCH: $SMOKE_ARCH (use native, arm64, or x86_64)" >&2
+        exit 2
+        ;;
+    esac
     CHATGPT_SWIFT_SMOKE_REPORT_PATH="$report_file" \
       CHATGPT_SWIFT_SMOKE_TIMEOUT_SECONDS="$smoke_timeout" \
-      "$APP_BINARY" &
+      "${smoke_command[@]}" &
     app_pid="$!"
     SMOKE_APP_PID="$app_pid"
     deadline=$((smoke_timeout + 10))
@@ -141,7 +162,7 @@ case "$MODE" in
     fi
     ;;
   *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--verify-x86_64]" >&2
     exit 2
     ;;
 esac

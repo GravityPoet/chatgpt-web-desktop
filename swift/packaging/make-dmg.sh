@@ -7,7 +7,6 @@ APP_DIR="$ROOT/dist/$APP_NAME.app"
 DMG_PATH="$ROOT/dist/$APP_NAME.dmg"
 STAGING="$ROOT/dist/dmg-staging"
 BUNDLE_ID="local.chatgpt-web.swift"
-BINARY_NAME="ChatGPTSwiftWeb"
 VERIFY_MOUNT="$ROOT/dist/.dmg-verify-$$"
 MOUNTED=0
 USE_DISKUTIL_IMAGE=0
@@ -87,8 +86,7 @@ fi
 MOUNTED=1
 VERIFY_APP="$VERIFY_MOUNT/$APP_NAME.app"
 [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$VERIFY_APP/Contents/Info.plist" 2>/dev/null || true)" == "$BUNDLE_ID" ]]
-/usr/bin/codesign --verify --deep --strict "$VERIFY_APP"
-/usr/bin/lipo "$VERIFY_APP/Contents/MacOS/$BINARY_NAME" -verify_arch "$(uname -m)"
+"$ROOT/packaging/verify-app-bundle.sh" "$VERIFY_APP" >/dev/null
 unregister_app_bundle "$VERIFY_APP"
 detach_verify_image >/dev/null
 MOUNTED=0
