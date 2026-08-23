@@ -55,7 +55,91 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(report["blank"] as? Bool, false)
     }
 
-    private func makeHarness(sink: ScriptMessageSink, html: String) throws -> WebViewHarness {
+    func testDraftRestoreWorksOnlyOnTrustedChatGPTOrigin() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let trusted = try makeHarness(
+            sink: sink,
+            html: Self.genericTextAreaHTML,
+            baseURL: try XCTUnwrap(URL(string: "https://chatgpt.com/"))
+        )
+        defer { trusted.close() }
+        wait(for: [trusted.navigationExpectation], timeout: 3)
+
+        let trustedReport = try dictionaryResult(
+            BrowserWindowController.restorePromptDraftScript(text: "private local draft"),
+            in: trusted.webView
+        )
+        XCTAssertEqual(trustedReport["restored"] as? Bool, true)
+        XCTAssertEqual(try stringResult("document.querySelector('textarea').value", in: trusted.webView), "private local draft")
+
+        let untrusted = try makeHarness(
+            sink: ScriptMessageSink(expectations: [:]),
+            html: Self.genericTextAreaHTML,
+            baseURL: try XCTUnwrap(URL(string: "https://example.com/"))
+        )
+        defer { untrusted.close() }
+        wait(for: [untrusted.navigationExpectation], timeout: 3)
+
+        let untrustedReport = try dictionaryResult(
+            BrowserWindowController.restorePromptDraftScript(text: "private local draft"),
+            in: untrusted.webView
+        )
+        XCTAssertEqual(untrustedReport["restored"] as? Bool, false)
+        XCTAssertEqual(untrustedReport["reason"] as? String, "untrusted origin")
+        XCTAssertEqual(try stringResult("document.querySelector('textarea').value", in: untrusted.webView), "")
+    }
+
+    func testNativeDraftRestoreGateRejectsThirdPartyAndNonHTTPSURLs() throws {
+        XCTAssertTrue(BrowserWindowController.canInjectPromptContent(
+            into: try XCTUnwrap(URL(string: "https://chatgpt.com/c/example"))
+        ))
+        XCTAssertTrue(BrowserWindowController.canInjectPromptContent(
+            into: try XCTUnwrap(URL(string: "https://chat.openai.com/"))
+        ))
+        XCTAssertFalse(BrowserWindowController.canInjectPromptContent(
+            into: try XCTUnwrap(URL(string: "https://example.com/"))
+        ))
+        XCTAssertFalse(BrowserWindowController.canInjectPromptContent(
+            into: try XCTUnwrap(URL(string: "http://chatgpt.com/"))
+        ))
+    }
+
+    func testNativePromptInjectionScriptRejectsThirdPartyOrigin() throws {
+        let trusted = try makeHarness(
+            sink: ScriptMessageSink(expectations: [:]),
+            html: Self.genericTextAreaHTML,
+            baseURL: try XCTUnwrap(URL(string: "https://chatgpt.com/"))
+        )
+        defer { trusted.close() }
+        wait(for: [trusted.navigationExpectation], timeout: 3)
+        let trustedReport = try dictionaryResult(
+            BrowserWindowController.insertPromptTextScript(text: "selected note"),
+            in: trusted.webView
+        )
+        XCTAssertEqual(trustedReport["ok"] as? Bool, true)
+        XCTAssertEqual(try stringResult("document.querySelector('textarea').value", in: trusted.webView), "selected note")
+
+        let untrusted = try makeHarness(
+            sink: ScriptMessageSink(expectations: [:]),
+            html: Self.genericTextAreaHTML,
+            baseURL: try XCTUnwrap(URL(string: "https://example.com/"))
+        )
+        defer { untrusted.close() }
+        wait(for: [untrusted.navigationExpectation], timeout: 3)
+        let untrustedReport = try dictionaryResult(
+            BrowserWindowController.insertPromptTextScript(text: "selected note"),
+            in: untrusted.webView
+        )
+        XCTAssertEqual(untrustedReport["ok"] as? Bool, false)
+        XCTAssertEqual(untrustedReport["reason"] as? String, "untrusted origin")
+        XCTAssertEqual(try stringResult("document.querySelector('textarea').value", in: untrusted.webView), "")
+    }
+
+    private func makeHarness(
+        sink: ScriptMessageSink,
+        html: String,
+        baseURL: URL? = URL(string: "https://chatgpt.com/")
+    ) throws -> WebViewHarness {
         let controller = WKUserContentController()
         controller.add(sink, name: "promptDraft")
         controller.add(sink, name: "completionState")
@@ -77,7 +161,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         let waiter = NavigationWaiter(expectation: expectation(description: "HTML loaded"))
         webView.navigationDelegate = waiter
 
-        webView.loadHTMLString(html, baseURL: try XCTUnwrap(URL(string: "https://chatgpt.com/")))
+        webView.loadHTMLString(html, baseURL: try XCTUnwrap(baseURL))
         return WebViewHarness(webView: webView, waiter: waiter)
     }
 
@@ -124,6 +208,12 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         <div id="prompt-textarea" data-testid="prompt-textarea" contenteditable="true"></div>
         <button data-testid="stop-button" aria-label="Stop generating">Stop</button>
       </main>
+    </body></html>
+    """
+
+    private static let genericTextAreaHTML = """
+    <!doctype html><html><body>
+      <main style="width:600px;height:400px"><textarea></textarea></main>
     </body></html>
     """
 }

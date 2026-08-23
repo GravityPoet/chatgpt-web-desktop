@@ -37,6 +37,20 @@ final class NavigationRulesTests: XCTestCase {
         XCTAssertTrue(NavigationRules.shouldOpenInsideApp(callback, sourceURL: source))
     }
 
+    func testGoogleLookalikeHostIsNotTreatedAsTrustedOAuth() throws {
+        let lookalike = try XCTUnwrap(URL(string: "https://accounts.google.evil.example/login"))
+        let source = try XCTUnwrap(URL(string: "https://chatgpt.com/"))
+
+        XCTAssertFalse(NavigationRules.isOAuthProviderHost("accounts.google.evil.example"))
+        XCTAssertFalse(NavigationRules.shouldOpenInsideApp(lookalike, sourceURL: source))
+        XCTAssertTrue(NavigationRules.shouldOpenInSystemBrowser(
+            lookalike,
+            sourceURL: source,
+            navigationType: .linkActivated,
+            keepThirdPartyLinksInApp: false
+        ))
+    }
+
     func testThirdPartyLinksRespectBrowserPreferenceAndNavigationType() throws {
         let thirdParty = try XCTUnwrap(URL(string: "https://example.com/article"))
         let source = try XCTUnwrap(URL(string: "https://chatgpt.com/"))

@@ -342,9 +342,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         let viewItem = NSMenuItem()
         let viewMenu = NSMenu(title: "视图")
-        viewMenu.addItem(withTitle: "放大", action: #selector(BrowserWindowController.zoomIn(_:)), keyEquivalent: "=")
-        viewMenu.addItem(withTitle: "缩小", action: #selector(BrowserWindowController.zoomOut(_:)), keyEquivalent: "-")
-        viewMenu.addItem(withTitle: "实际大小", action: #selector(BrowserWindowController.resetZoom(_:)), keyEquivalent: "0")
+        let zoomInItem = viewMenu.addItem(withTitle: "放大", action: #selector(zoomInAction(_:)), keyEquivalent: "=")
+        zoomInItem.target = self
+        let zoomOutItem = viewMenu.addItem(withTitle: "缩小", action: #selector(zoomOutAction(_:)), keyEquivalent: "-")
+        zoomOutItem.target = self
+        let resetZoomItem = viewMenu.addItem(withTitle: "实际大小", action: #selector(resetZoomAction(_:)), keyEquivalent: "0")
+        resetZoomItem.target = self
         viewItem.submenu = viewMenu
         mainMenu.addItem(viewItem)
 
@@ -999,7 +1002,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return String(format: "%.3fs", max(0, end.timeIntervalSince(start)))
     }
 
-    private static func runProcess(
+    static func runProcess(
         executable: String,
         arguments: [String],
         currentDirectory: URL?
@@ -1016,13 +1019,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         do {
             try process.run()
-            process.waitUntilExit()
         } catch {
             return ProcessRunResult(exitCode: 127, output: "", errorOutput: error.localizedDescription)
         }
 
-        let output = String(data: outputPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let errorOutput = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let outputCollector = ProcessOutputCollector()
+        let errorCollector = ProcessOutputCollector()
+        let drainGroup = DispatchGroup()
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            outputCollector.drain(outputPipe.fileHandleForReading)
+            drainGroup.leave()
+        }
+        drainGroup.enter()
+        DispatchQueue.global(qos: .utility).async {
+            errorCollector.drain(errorPipe.fileHandleForReading)
+            drainGroup.leave()
+        }
+
+        process.waitUntilExit()
+        drainGroup.wait()
+        let output = outputCollector.stringValue
+        let errorOutput = errorCollector.stringValue
         return ProcessRunResult(exitCode: process.terminationStatus, output: output, errorOutput: errorOutput)
     }
 
@@ -1090,6 +1108,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 return
             }
             let profileID = ProfileStore.currentProfileID()
+            PromptDraftStore.clearDraft(for: profileID)
             ProfileStore.disableFingerprint(for: profileID)
             self.rebuildMainController()
             self.presentInfo("已焚烧当前空间浏览现场，并恢复为默认 Safari 指纹。空间名称、首页和增强隐私设置已保留。")
@@ -1165,10 +1184,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             message: "输入 https:// 开头的网址。该网址将在当前账号空间内加载，cookie 和登录态与其他空间相互隔离。",
             initial: initial
         ) { [weak self] url in
-            guard let url else {
+            guard let self, let url else {
                 return
             }
-            self?.rebuildMainController(initialURL: url)
+            self.mainController?.navigate(to: url)
         }
     }
 
@@ -1181,8 +1200,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func goHomeAction(_ sender: Any?) {
-        let profile = ProfileStore.currentProfile()
-        rebuildMainController(initialURL: ProfileStore.homepageURL(for: profile.id))
+        (BrowserWindowController.keyWindowController() ?? mainController)?.goHome(sender)
     }
 
     @objc private func reloadAction(_ sender: Any?) {
@@ -1190,6 +1208,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return
         }
         controller.reload(sender)
+    }
+
+    @objc private func zoomInAction(_ sender: Any?) {
+        (BrowserWindowController.keyWindowController() ?? mainController)?.zoomIn(sender)
+    }
+
+    @objc private func zoomOutAction(_ sender: Any?) {
+        (BrowserWindowController.keyWindowController() ?? mainController)?.zoomOut(sender)
+    }
+
+    @objc private func resetZoomAction(_ sender: Any?) {
+        (BrowserWindowController.keyWindowController() ?? mainController)?.resetZoom(sender)
     }
 
     @objc private func openCurrentURLInBrowserAction(_ sender: Any?) {
@@ -1270,15 +1300,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setProfileAsDefault(id: String) {
-        let previousCurrentID = ProfileStore.currentProfileID()
         guard ProfileStore.setStartupProfileID(id) else {
             presentError("设置启动默认空间失败：找不到目标空间。")
             return
         }
         profilesMenu.map(rebuildProfilesMenu(_:))
-        if previousCurrentID != id {
-            rebuildMainController()
-        }
         let profileName = ProfileStore.loadProfiles().first(where: { $0.id == id })?.name ?? "目标空间"
         presentInfo("已将「\(profileName)」设为启动默认空间。")
     }
@@ -1518,6 +1544,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         ProfileStore.removeHomepage(for: profile.id)
         ProfileStore.setFingerprint(nil, for: profile.id)
         ProfileStore.setEnhancedPrivacyEnabled(false, for: profile.id)
+        PromptDraftStore.clearDraft(for: profile.id)
         ProfileStore.clearStartupProfileIfNeeded(profile.id)
         profilesMenu.map(rebuildProfilesMenu(_:))
         if currentID == profile.id {
@@ -1546,6 +1573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             guard let self else {
                 return
             }
+            PromptDraftStore.clearDraft(for: defaultProfileID)
             ProfileStore.resetDefaultProfile()
             ProfileStore.setCurrentProfileID(isCurrent ? defaultProfileID : ProfileStore.currentProfileID())
             self.profilesMenu.map(self.rebuildProfilesMenu(_:))
@@ -1570,6 +1598,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return BrowserWindowController.keyWindowController()?.canGoBack ?? false
         case #selector(goForwardAction(_:)):
             return BrowserWindowController.keyWindowController()?.canGoForward ?? false
+        case #selector(zoomInAction(_:)), #selector(zoomOutAction(_:)), #selector(resetZoomAction(_:)):
+            return (BrowserWindowController.keyWindowController() ?? mainController) != nil
         case #selector(switchToProfile(_:)):
             guard let id = menuItem.representedObject as? String else {
                 return false
@@ -1781,6 +1811,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         controller.show()
         updateWebRTCProtectionMenuItem()
         updateEnhancedPrivacyMenuItem()
+        refreshNativeUtilityWindows()
     }
 
     func recoverBlankContent(in controller: BrowserWindowController) {

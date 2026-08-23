@@ -60,6 +60,7 @@ final class AppSettingsWindowController: NSWindowController {
     private var selectedSection = Section.general
     private let sidebarStack = NSStackView()
     private let contentStack = NSStackView()
+    let contentScrollView = NSScrollView()
     private var sectionButtons: [NSButton] = []
 
     init(state: AppSettingsState, callbacks: AppSettingsCallbacks) {
@@ -68,7 +69,7 @@ final class AppSettingsWindowController: NSWindowController {
 
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 720, height: 560),
-            styleMask: [.titled, .closable, .miniaturizable],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
@@ -138,12 +139,23 @@ final class AppSettingsWindowController: NSWindowController {
         contentArea.translatesAutoresizingMaskIntoConstraints = false
         root.addSubview(contentArea)
 
+        contentScrollView.borderType = .noBorder
+        contentScrollView.drawsBackground = false
+        contentScrollView.hasVerticalScroller = true
+        contentScrollView.autohidesScrollers = true
+        contentScrollView.translatesAutoresizingMaskIntoConstraints = false
+        contentArea.addSubview(contentScrollView)
+
+        let contentDocument = FlippedDocumentView()
+        contentDocument.translatesAutoresizingMaskIntoConstraints = false
+        contentScrollView.documentView = contentDocument
+
         contentStack.orientation = .vertical
         contentStack.alignment = .leading
         contentStack.spacing = 12
         contentStack.edgeInsets = NSEdgeInsets(top: 22, left: 28, bottom: 24, right: 28)
         contentStack.translatesAutoresizingMaskIntoConstraints = false
-        contentArea.addSubview(contentStack)
+        contentDocument.addSubview(contentStack)
 
         NSLayoutConstraint.activate([
             root.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -165,10 +177,20 @@ final class AppSettingsWindowController: NSWindowController {
             contentArea.topAnchor.constraint(equalTo: root.topAnchor),
             contentArea.bottomAnchor.constraint(equalTo: root.bottomAnchor),
 
-            contentStack.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
-            contentStack.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
-            contentStack.topAnchor.constraint(equalTo: contentArea.topAnchor),
-            contentStack.bottomAnchor.constraint(lessThanOrEqualTo: contentArea.bottomAnchor)
+            contentScrollView.leadingAnchor.constraint(equalTo: contentArea.leadingAnchor),
+            contentScrollView.trailingAnchor.constraint(equalTo: contentArea.trailingAnchor),
+            contentScrollView.topAnchor.constraint(equalTo: contentArea.topAnchor),
+            contentScrollView.bottomAnchor.constraint(equalTo: contentArea.bottomAnchor),
+
+            contentDocument.leadingAnchor.constraint(equalTo: contentScrollView.contentView.leadingAnchor),
+            contentDocument.trailingAnchor.constraint(equalTo: contentScrollView.contentView.trailingAnchor),
+            contentDocument.topAnchor.constraint(equalTo: contentScrollView.contentView.topAnchor),
+            contentDocument.widthAnchor.constraint(equalTo: contentScrollView.contentView.widthAnchor),
+
+            contentStack.leadingAnchor.constraint(equalTo: contentDocument.leadingAnchor),
+            contentStack.trailingAnchor.constraint(equalTo: contentDocument.trailingAnchor),
+            contentStack.topAnchor.constraint(equalTo: contentDocument.topAnchor),
+            contentStack.bottomAnchor.constraint(equalTo: contentDocument.bottomAnchor)
         ])
     }
 
@@ -439,6 +461,10 @@ final class AppSettingsWindowController: NSWindowController {
     @objc private func openReleasePage(_ sender: Any?) {
         callbacks.openReleasePage()
     }
+}
+
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
 }
 
 private extension NSWindow {

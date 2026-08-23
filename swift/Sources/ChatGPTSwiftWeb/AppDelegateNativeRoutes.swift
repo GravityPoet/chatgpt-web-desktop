@@ -12,6 +12,10 @@ extension AppDelegate {
         guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
             return
         }
+        guard BrowserWindowController.canInjectPromptContent(into: controller.currentURL()) else {
+            presentNotesContextError("为保护备忘录内容，请先在当前窗口打开 ChatGPT 页面。", for: controller)
+            return
+        }
         controller.setStatus("正在读取备忘录…", showsProgress: false)
         NotesContextReader.readSelectedNote { result in
             DispatchQueue.main.async {

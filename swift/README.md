@@ -2,7 +2,7 @@
 
 原生 macOS AppKit + WKWebView 的 ChatGPT 网页壳，把 ChatGPT Web 放进独立 macOS 桌面窗口，并保留独立 WebView 账号空间、macOS 12 兼容、网页优先的模型 / 工具体验、下载桥、诊断和隐私控制；也用于和 Tauri/Rust 版并排对比。
 
-OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 保留为 ChatGPT Classic；官方公布的 macOS 要求仍是 macOS 14 + Apple Silicon。本项目不以替代官方 App 为目标，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。参考：[ChatGPT 发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)、[macOS 系统要求](https://help.openai.com/en/articles/9275200-downloading-the-chatgpt-macos-app)。
+OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 保留为 ChatGPT Classic；官方公布的 macOS 要求现为 macOS 14+，同时支持 Apple Silicon 与 Intel，而本项目的 Swift 版仍支持 macOS 12+。本项目不以替代官方 App 为目标，而是提供一个轻量、可审计、独立 profile、可在旧 macOS 上运行的 Web 端桌面壳。参考：[ChatGPT 发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)、[macOS 系统要求](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app)。
 
 ## 特点
 

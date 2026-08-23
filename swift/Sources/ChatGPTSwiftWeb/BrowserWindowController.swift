@@ -463,7 +463,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func confirmBurnCurrentProfileData(completion: @escaping () -> Void) {
         let alert = NSAlert()
         alert.messageText = "焚烧当前空间？"
-        alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并恢复默认 Safari 指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
+        alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据和本机未发送草稿，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并恢复默认 Safari 指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
         alert.alertStyle = .warning
         alert.addButton(withTitle: "焚烧并重建")
         alert.addButton(withTitle: "取消")
@@ -755,24 +755,32 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
-        if Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL) {
-            if navigationAction.targetFrame?.isMainFrame == true,
-               Self.canRewriteForPrivacy(navigationAction.request),
-                Self.needsPrivacyRewrite(request: navigationAction.request, cleanedURL: cleanedURL, sourceURL: webView.url, profileID: profileID) {
-                webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: webView.url, profileID: profileID))
-                decisionHandler(.cancel)
-                return
-            }
-            decisionHandler(.allow)
-        } else if Self.shouldOpenInSystemBrowser(cleanedURL, sourceURL: sourceURL, navigationType: navigationAction.navigationType) {
+        let staysInsideTrustedSurface = Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL)
+        if !staysInsideTrustedSurface,
+           Self.shouldOpenInSystemBrowser(cleanedURL, sourceURL: sourceURL, navigationType: navigationAction.navigationType) {
             browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
             NSWorkspace.shared.open(cleanedURL)
             decisionHandler(.cancel)
-        } else {
-            // Non-trusted but not a deliberate third-party click (e.g. an auto-redirect or scripted
-            // navigation): keep it in-app rather than bouncing the whole session to the system browser.
-            decisionHandler(.allow)
+            return
         }
+
+        // Apply the same tracking cleanup, privacy headers, language override and referrer trimming to
+        // every main-frame request that remains in this WebView, including third-party redirects and
+        // destinations the user explicitly chose to keep in-app.
+        if navigationAction.targetFrame?.isMainFrame == true,
+           Self.canRewriteForPrivacy(navigationAction.request),
+           Self.needsPrivacyRewrite(
+               request: navigationAction.request,
+               cleanedURL: cleanedURL,
+               sourceURL: sourceURL,
+               profileID: profileID
+           ) {
+            webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: sourceURL, profileID: profileID))
+            decisionHandler(.cancel)
+            return
+        }
+
+        decisionHandler(.allow)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1152,7 +1160,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func restorePromptDraftIfAvailable(reason: String) {
         guard persistent,
-              PromptDraftStore.isRestoreEnabled() else {
+              PromptDraftStore.isRestoreEnabled(),
+              Self.canInjectPromptContent(into: webView.url) else {
             return
         }
 
@@ -1905,10 +1914,29 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     })()
     """
 
-    private static func restorePromptDraftScript(text: String) -> String {
+    static func canInjectPromptContent(into url: URL?) -> Bool {
+        guard url?.scheme?.lowercased() == "https",
+              let host = url?.host?.lowercased() else {
+            return false
+        }
+        return NavigationRules.isChatGPTHost(host)
+    }
+
+    static func restorePromptDraftScript(text: String) -> String {
         let textLiteral = javascriptStringLiteral(text)
         return """
         (() => {
+          const host = String(location.hostname || '').toLowerCase();
+          const isChatGPTPage = location.protocol === 'https:' && (
+            host === 'chatgpt.com' ||
+            host.endsWith('.chatgpt.com') ||
+            host === 'chat.openai.com' ||
+            host.endsWith('.chat.openai.com')
+          );
+          if (!isChatGPTPage) {
+            return { restored: false, reason: 'untrusted origin' };
+          }
+
           const text = \(textLiteral);
           const visible = (element) => {
             if (!element) return false;

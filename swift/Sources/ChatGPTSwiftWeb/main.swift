@@ -15,8 +15,6 @@ let latestReleaseAPIURL = URL(string: "https://api.github.com/repos/GravityPoet/
 let browserLogger = Logger(subsystem: appBundleIdentifier, category: "Browser")
 let mainFrameDefaultsKey = "ChatGPTSwiftWeb.MainWindowFrame"
 let webZoomDefaultsKey = "ChatGPTSwiftWeb.WebViewZoom"
-let promptDraftRestoreDefaultsKey = "ChatGPTSwiftWeb.PromptDraftRestoreEnabled"
-let promptDraftDefaultsPrefix = "ChatGPTSwiftWeb.PromptDraft."
 let backgroundCompletionNotificationsDefaultsKey = "ChatGPTSwiftWeb.BackgroundCompletionNotificationsEnabled"
 let lastRunStartedAtDefaultsKey = "ChatGPTSwiftWeb.LastRunStartedAt"
 let lastRunEndedAtDefaultsKey = "ChatGPTSwiftWeb.LastRunEndedAt"
@@ -24,7 +22,6 @@ let lastRunCleanExitDefaultsKey = "ChatGPTSwiftWeb.LastRunCleanExit"
 let minimumWebZoom: CGFloat = 0.85
 let maximumWebZoom: CGFloat = 1.40
 let webZoomStep: CGFloat = 0.05
-let maximumPromptDraftCharacters = 12_000
 let maximumCookieImportBytes = 2 * 1024 * 1024
 let maximumChatGPTCookieHeaderBytes = 6 * 1024
 let maximumBridgeDownloadBytes = 200 * 1024 * 1024
@@ -79,6 +76,25 @@ struct ProcessRunResult {
     let exitCode: Int32
     let output: String
     let errorOutput: String
+}
+
+final class ProcessOutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func drain(_ fileHandle: FileHandle) {
+        let collected = fileHandle.readDataToEndOfFile()
+        lock.lock()
+        data = collected
+        lock.unlock()
+    }
+
+    var stringValue: String {
+        lock.lock()
+        let collected = data
+        lock.unlock()
+        return String(data: collected, encoding: .utf8) ?? ""
+    }
 }
 
 struct PerformanceSample {
@@ -226,57 +242,6 @@ final class ProcessPerformanceMonitor {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: date)
-    }
-}
-
-enum PromptDraftStore {
-    static func isRestoreEnabled() -> Bool {
-        if UserDefaults.standard.object(forKey: promptDraftRestoreDefaultsKey) == nil {
-            return true
-        }
-        return UserDefaults.standard.bool(forKey: promptDraftRestoreDefaultsKey)
-    }
-
-    static func setRestoreEnabled(_ enabled: Bool) {
-        UserDefaults.standard.set(enabled, forKey: promptDraftRestoreDefaultsKey)
-    }
-
-    static func draft(for profileID: String?) -> String {
-        UserDefaults.standard.string(forKey: draftKey(profileID: profileID)) ?? ""
-    }
-
-    static func draftSummary(for profileID: String?) -> String {
-        let draft = draft(for: profileID)
-        guard !draft.isEmpty else {
-            return "无"
-        }
-        return "\(draft.count) 个字符，仅保存在本机偏好中"
-    }
-
-    static func saveDraft(_ rawText: String, profileID: String?) {
-        let text = normalizedDraft(rawText)
-        let key = draftKey(profileID: profileID)
-        if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            UserDefaults.standard.removeObject(forKey: key)
-        } else {
-            UserDefaults.standard.set(text, forKey: key)
-        }
-    }
-
-    static func clearDraft(for profileID: String?) {
-        UserDefaults.standard.removeObject(forKey: draftKey(profileID: profileID))
-    }
-
-    private static func draftKey(profileID: String?) -> String {
-        promptDraftDefaultsPrefix + (profileID ?? defaultProfileID)
-    }
-
-    private static func normalizedDraft(_ rawText: String) -> String {
-        let text = rawText.replacingOccurrences(of: "\r\n", with: "\n")
-        if text.count <= maximumPromptDraftCharacters {
-            return text
-        }
-        return String(text.prefix(maximumPromptDraftCharacters))
     }
 }
 
