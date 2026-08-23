@@ -454,6 +454,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     setWebRTCProtection: { [weak self] enabled in
                         self?.setWebRTCProtectionFromSettings(enabled)
                     },
+                    setRejectNonEssentialCookies: { [weak self] enabled in
+                        self?.setRejectNonEssentialCookiesFromSettings(enabled)
+                    },
                     setThirdPartyLinksInApp: { [weak self] enabled in
                         self?.setThirdPartyLinksInAppFromSettings(enabled)
                     },
@@ -576,6 +579,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func setThirdPartyLinksInAppFromSettings(_ enabled: Bool) {
         PrivacySettings.setKeepThirdPartyLinksInApp(enabled)
         refreshNativeUtilityWindows()
+    }
+
+    private func setRejectNonEssentialCookiesFromSettings(_ enabled: Bool) {
+        CookieConsentSettings.setEnabled(enabled)
+        guard enabled, let controller = mainController else {
+            refreshNativeUtilityWindows()
+            return
+        }
+        controller.applyDefaultCookieConsent { [weak self, weak controller] in
+            controller?.setStatus("已默认拒绝非必要 Cookie；下次页面加载生效", showsProgress: false)
+            self?.refreshNativeUtilityWindows()
+        }
     }
 
     private func setWindowTitleDisplayModeFromSettings(_ mode: WindowTitleDisplayMode) {
@@ -771,6 +786,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             fingerprintName: fingerprintName,
             enhancedPrivacyEnabled: ProfileStore.isEnhancedPrivacyEnabled(for: profile.id),
             webRTCProtectionEnabled: PrivacySettings.isWebRTCProtectionEnabled(),
+            rejectNonEssentialCookiesEnabled: CookieConsentSettings.isEnabled(),
             keepThirdPartyLinksInApp: PrivacySettings.keepThirdPartyLinksInApp(),
             windowTitleDisplayMode: WindowTitleSettings.mode(),
             notesAutomationStatus: "按需请求；首次插入选中备忘录正文时由 macOS 弹出授权。",
@@ -944,6 +960,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ("启动默认空间", startupProfileLabel),
             ("本机草稿恢复", PromptDraftStore.isRestoreEnabled() ? "开启" : "关闭"),
             ("当前空间草稿", PromptDraftStore.draftSummary(for: profile.id)),
+            ("非必要 Cookie 默认拒绝", CookieConsentSettings.isEnabled() ? "开启" : "关闭"),
             ("后台完成通知", BackgroundCompletionNotifications.isEnabled() ? "开启" : "关闭"),
             ("通知权限", notificationPermissionStatus),
             ("指纹预设", fingerprintName),

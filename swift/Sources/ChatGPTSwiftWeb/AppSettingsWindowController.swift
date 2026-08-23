@@ -14,6 +14,7 @@ struct AppSettingsState {
     let fingerprintName: String
     let enhancedPrivacyEnabled: Bool
     let webRTCProtectionEnabled: Bool
+    let rejectNonEssentialCookiesEnabled: Bool
     let keepThirdPartyLinksInApp: Bool
     let windowTitleDisplayMode: WindowTitleDisplayMode
     let notesAutomationStatus: String
@@ -25,6 +26,7 @@ struct AppSettingsCallbacks {
     let setPromptDraftRestore: (Bool) -> Void
     let setBackgroundCompletionNotifications: (Bool) -> Void
     let setWebRTCProtection: (Bool) -> Void
+    let setRejectNonEssentialCookies: (Bool) -> Void
     let setThirdPartyLinksInApp: (Bool) -> Void
     let setWindowTitleDisplayMode: (WindowTitleDisplayMode) -> Void
     let setEnhancedPrivacy: (Bool) -> Void
@@ -262,6 +264,12 @@ final class AppSettingsWindowController: NSWindowController {
             action: #selector(toggleWebRTC(_:))
         )
         addToggle(
+            "默认拒绝 ChatGPT 非必要 Cookie",
+            detail: "默认开启。为每个隔离空间预置 ChatGPT 官方 Consent Cookie 的拒绝值，保留登录、安全和功能所需 Cookie；关闭后可在网页 Cookie Preferences 中自行选择。",
+            state: state.rejectNonEssentialCookiesEnabled,
+            action: #selector(toggleRejectNonEssentialCookies(_:))
+        )
+        addToggle(
             "第三方链接在 App 内打开",
             detail: "关闭后，用户点击的非 OpenAI 链接会交给系统浏览器。",
             state: state.keepThirdPartyLinksInApp,
@@ -421,6 +429,10 @@ final class AppSettingsWindowController: NSWindowController {
 
     @objc private func toggleWebRTC(_ sender: NSButton) {
         callbacks.setWebRTCProtection(sender.state == .on)
+    }
+
+    @objc private func toggleRejectNonEssentialCookies(_ sender: NSButton) {
+        callbacks.setRejectNonEssentialCookies(sender.state == .on)
     }
 
     @objc private func togglePromptDraftRestore(_ sender: NSButton) {
