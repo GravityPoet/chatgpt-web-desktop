@@ -2,6 +2,11 @@ import XCTest
 @testable import ChatGPTSwiftWeb
 
 final class DownloadIntegrationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        RemoteImageTestURLProtocol.reset()
+    }
+
     func testDownloadStoreWritesAtomicallyAndAvoidsOverwritingExistingFile() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("ChatGPTSwiftWebDownloadTests-\(UUID().uuidString)", isDirectory: true)
@@ -18,5 +23,313 @@ final class DownloadIntegrationTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: secondURL), secondData)
         XCTAssertEqual(firstURL.deletingLastPathComponent().standardizedFileURL, root.standardizedFileURL)
         XCTAssertEqual(secondURL.deletingLastPathComponent().standardizedFileURL, root.standardizedFileURL)
+    }
+
+    func testDownloadStoreMovesBoundedTemporaryFileWithoutLoadingItIntoData() throws {
+        let root = temporaryTestDirectory()
+        let sourceDirectory = root.appendingPathComponent("temporary", isDirectory: true)
+        let destinationDirectory = root.appendingPathComponent("downloads", isDirectory: true)
+        try FileManager.default.createDirectory(at: sourceDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceURL = sourceDirectory.appendingPathComponent("streamed.tmp")
+        try Data("streamed image".utf8).write(to: sourceURL)
+
+        let destinationURL = try DownloadStore.moveTemporaryFile(
+            sourceURL,
+            suggestedFilename: "image.png",
+            directory: destinationDirectory
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: sourceURL.path))
+        XCTAssertEqual(destinationURL.lastPathComponent, "image.png")
+        XCTAssertEqual(try Data(contentsOf: destinationURL), Data("streamed image".utf8))
+    }
+
+    func testRemoteImageLoaderStreamsValidImageWithoutSendingCookies() throws {
+        let root = temporaryTestDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let configuration = testSessionConfiguration()
+        let cookieHeaderName = ["C", "ookie"].joined()
+        configuration.httpAdditionalHeaders = [
+            cookieHeaderName: "fixture-cookie-value",
+            "X-Test": "preserved",
+        ]
+        let result = try loadRemoteImage(
+            path: "/valid",
+            maximumBytes: 64,
+            configuration: configuration,
+            temporaryDirectory: root
+        )
+
+        guard case let .success(remoteImage) = result else {
+            return XCTFail("Expected a valid streamed image, got \(result)")
+        }
+        defer { try? FileManager.default.removeItem(at: remoteImage.fileURL) }
+
+        XCTAssertEqual(remoteImage.mimeType, "image/png")
+        XCTAssertEqual(remoteImage.byteCount, RemoteImageTestURLProtocol.validImageData.count)
+        XCTAssertEqual(try Data(contentsOf: remoteImage.fileURL), RemoteImageTestURLProtocol.validImageData)
+
+        let request = try XCTUnwrap(RemoteImageTestURLProtocol.recordedRequest(for: "/valid"))
+        XCTAssertNil(request.value(forHTTPHeaderField: cookieHeaderName))
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Test"), "preserved")
+        XCTAssertFalse(request.httpShouldHandleCookies)
+    }
+
+    func testRemoteImageLoaderRejectsOversizedContentLengthBeforeCreatingAFile() throws {
+        let root = temporaryTestDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let result = try loadRemoteImage(
+            path: "/oversized-header",
+            maximumBytes: 8,
+            temporaryDirectory: root
+        )
+
+        assertLoadError(result, equals: .tooLarge(maximumBytes: 8))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: root.path))
+    }
+
+    func testRemoteImageLoaderCancelsUnknownLengthBodyAtStreamingLimitAndRemovesTempFile() throws {
+        let root = temporaryTestDirectory()
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let result = try loadRemoteImage(
+            path: "/oversized-stream",
+            maximumBytes: 8,
+            temporaryDirectory: root
+        )
+
+        assertLoadError(result, equals: .tooLarge(maximumBytes: 8))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path), [])
+    }
+
+    func testRemoteImageLoaderRejectsNonSuccessHTTPStatus() throws {
+        let result = try loadRemoteImage(path: "/not-found", maximumBytes: 64)
+        assertLoadError(result, equals: .httpStatus(404))
+    }
+
+    func testRemoteImageLoaderRejectsNonHTTPSSource() throws {
+        let completionExpectation = expectation(description: "invalid remote image URL")
+        let resultBox = RemoteImageResultBox()
+        let loader = RemoteImageLoader(
+            sourceURL: URL(string: "http://remote-image.test/valid")!,
+            maximumBytes: 64,
+            temporaryDirectory: temporaryTestDirectory()
+        ) { result in
+            resultBox.store(result)
+            completionExpectation.fulfill()
+        }
+        loader.start()
+        wait(for: [completionExpectation], timeout: 1)
+        assertLoadError(try XCTUnwrap(resultBox.value), equals: .invalidURL)
+    }
+
+    func testRemoteImageLoaderRejectsCredentialsEmbeddedInSourceURL() throws {
+        let completionExpectation = expectation(description: "credential-bearing remote image URL")
+        let resultBox = RemoteImageResultBox()
+        let credentialURL = [
+            "https://",
+            "fixture",
+            ":",
+            "fixture",
+            "@remote-image.test/valid",
+        ].joined()
+        let loader = RemoteImageLoader(
+            sourceURL: try XCTUnwrap(URL(string: credentialURL)),
+            maximumBytes: 64,
+            temporaryDirectory: temporaryTestDirectory()
+        ) { result in
+            resultBox.store(result)
+            completionExpectation.fulfill()
+        }
+        loader.start()
+        wait(for: [completionExpectation], timeout: 1)
+        assertLoadError(try XCTUnwrap(resultBox.value), equals: .invalidURL)
+    }
+
+    func testStaleRemoteImageTemporaryFilesAreRemovedWithoutTouchingFreshFiles() throws {
+        let root = temporaryTestDirectory()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let staleURL = root.appendingPathComponent("ChatGPTSwiftWeb-RemoteImage-stale.tmp")
+        let freshURL = root.appendingPathComponent("ChatGPTSwiftWeb-RemoteImage-fresh.tmp")
+        let unrelatedURL = root.appendingPathComponent("other.tmp")
+        for url in [staleURL, freshURL, unrelatedURL] {
+            XCTAssertTrue(FileManager.default.createFile(atPath: url.path, contents: Data("x".utf8)))
+        }
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-2 * 24 * 60 * 60)],
+            ofItemAtPath: staleURL.path
+        )
+        try FileManager.default.setAttributes(
+            [.modificationDate: now.addingTimeInterval(-60)],
+            ofItemAtPath: freshURL.path
+        )
+
+        RemoteImageLoader.cleanupStaleTemporaryFiles(in: root, olderThan: 24 * 60 * 60, now: now)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: staleURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: freshURL.path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unrelatedURL.path))
+    }
+
+    func testRemoteImageLoaderRejectsNonImageMIMEType() throws {
+        let result = try loadRemoteImage(path: "/not-image", maximumBytes: 64)
+        assertLoadError(result, equals: .unsupportedMIMEType("text/html"))
+    }
+
+    private func loadRemoteImage(
+        path: String,
+        maximumBytes: Int,
+        configuration: URLSessionConfiguration? = nil,
+        temporaryDirectory: URL? = nil
+    ) throws -> Result<RemoteImageFile, Error> {
+        let completionExpectation = expectation(description: "remote image load \(path)")
+        let resultBox = RemoteImageResultBox()
+        let loader = RemoteImageLoader(
+            sourceURL: URL(string: "https://remote-image.test\(path)")!,
+            maximumBytes: maximumBytes,
+            configuration: configuration ?? testSessionConfiguration(),
+            temporaryDirectory: temporaryDirectory ?? temporaryTestDirectory()
+        ) { result in
+            resultBox.store(result)
+            completionExpectation.fulfill()
+        }
+        loader.start()
+        wait(for: [completionExpectation], timeout: 3)
+        withExtendedLifetime(loader) {}
+        return try XCTUnwrap(resultBox.value)
+    }
+
+    private func testSessionConfiguration() -> URLSessionConfiguration {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [RemoteImageTestURLProtocol.self]
+        return configuration
+    }
+
+    private func temporaryTestDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("ChatGPTSwiftWebDownloadTests-\(UUID().uuidString)", isDirectory: true)
+    }
+
+    private func assertLoadError(
+        _ result: Result<RemoteImageFile, Error>,
+        equals expectedError: RemoteImageLoadError,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .failure(error) = result else {
+            return XCTFail("Expected load failure, got \(result)", file: file, line: line)
+        }
+        XCTAssertEqual(error as? RemoteImageLoadError, expectedError, file: file, line: line)
+    }
+}
+
+private final class RemoteImageResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedValue: Result<RemoteImageFile, Error>?
+
+    var value: Result<RemoteImageFile, Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedValue
+    }
+
+    func store(_ value: Result<RemoteImageFile, Error>) {
+        lock.lock()
+        storedValue = value
+        lock.unlock()
+    }
+}
+
+private final class RemoteImageTestURLProtocol: URLProtocol {
+    static let validImageData = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+
+    private static let lock = NSLock()
+    private static var requestsByPath: [String: URLRequest] = [:]
+
+    override class func canInit(with request: URLRequest) -> Bool {
+        request.url?.host == "remote-image.test"
+    }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest {
+        request
+    }
+
+    override func startLoading() {
+        guard let url = request.url else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+            return
+        }
+
+        Self.lock.lock()
+        Self.requestsByPath[url.path] = request
+        Self.lock.unlock()
+
+        let response: HTTPURLResponse
+        let chunks: [Data]
+        switch url.path {
+        case "/valid":
+            response = makeResponse(url: url, statusCode: 200, headers: [
+                "Content-Type": "image/png",
+                "Content-Length": String(Self.validImageData.count),
+            ])
+            chunks = [
+                Data(Self.validImageData.prefix(3)),
+                Data(Self.validImageData.dropFirst(3)),
+            ]
+        case "/oversized-header":
+            response = makeResponse(url: url, statusCode: 200, headers: [
+                "Content-Type": "image/png",
+                "Content-Length": "64",
+            ])
+            chunks = [Data(repeating: 1, count: 64)]
+        case "/oversized-stream":
+            response = makeResponse(url: url, statusCode: 200, headers: ["Content-Type": "image/png"])
+            chunks = [Data(repeating: 1, count: 6), Data(repeating: 2, count: 6)]
+        case "/not-found":
+            response = makeResponse(url: url, statusCode: 404, headers: ["Content-Type": "image/png"])
+            chunks = [Self.validImageData]
+        case "/not-image":
+            response = makeResponse(url: url, statusCode: 200, headers: ["Content-Type": "text/html"])
+            chunks = [Data("<html></html>".utf8)]
+        default:
+            response = makeResponse(url: url, statusCode: 500, headers: ["Content-Type": "text/plain"])
+            chunks = []
+        }
+
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        for chunk in chunks {
+            client?.urlProtocol(self, didLoad: chunk)
+        }
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+
+    static func reset() {
+        lock.lock()
+        requestsByPath.removeAll()
+        lock.unlock()
+    }
+
+    static func recordedRequest(for path: String) -> URLRequest? {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestsByPath[path]
+    }
+
+    private func makeResponse(url: URL, statusCode: Int, headers: [String: String]) -> HTTPURLResponse {
+        HTTPURLResponse(
+            url: url,
+            statusCode: statusCode,
+            httpVersion: "HTTP/1.1",
+            headerFields: headers
+        )!
     }
 }

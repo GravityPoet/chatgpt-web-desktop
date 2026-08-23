@@ -25,6 +25,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
     var isDisposing = false
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
     private var renderProbeGeneration = 0
     var lastRenderProbeWasBlank = false
     private var blankRecoveryAttempts = 0
@@ -73,15 +74,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         Self.controllers.append(self)
 
         let webConfiguration = configuration ?? Self.makeConfiguration(messageHandler: self, persistent: persistent, profileID: profileID)
+        let fingerprint = ProfileStore.fingerprint(for: profileID)
+        if fingerprint == nil {
+            // Popup configurations supplied by WKUIDelegate do not pass through makeConfiguration;
+            // apply the same engine-consistent Safari product token to every native-profile WebView.
+            webConfiguration.applicationNameForUserAgent = SafariUserAgentPolicy.currentApplicationName
+        }
 
         webView = WKWebView(frame: .zero, configuration: webConfiguration)
-        if let fingerprint = ProfileStore.fingerprint(for: profileID) {
+        if let fingerprint {
             webView.customUserAgent = fingerprint.userAgent
-        } else {
-            // Default profile (no fingerprint preset): override the truncated native WKWebView UA
-            // with a complete Safari UA. Setting it here on the web view covers the main window,
-            // incognito windows, and OAuth popups, which all flow through this initializer.
-            webView.customUserAgent = defaultSafariUserAgent
         }
         webView.navigationDelegate = self
         webView.uiDelegate = self
@@ -528,6 +530,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func dispose() {
         cancelScheduledMainWindowFramePersistence()
+        cancelRemoteImageLoads()
         webViewObservations.removeAll()
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
@@ -555,6 +558,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func windowWillClose(_ notification: Notification) {
         cancelScheduledMainWindowFramePersistence()
+        cancelRemoteImageLoads()
         persistMainWindowFrame()
         Self.controllers.removeAll { $0 === self }
         closeHandler?()
@@ -751,7 +755,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         updateNativeChromeStatus()
     }
 
-    func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
+    @MainActor
+    func webView(
+        _ webView: WKWebView,
+        decidePolicyFor navigationAction: WKNavigationAction,
+        decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
+    ) {
         guard let url = navigationAction.request.url else {
             decisionHandler(.allow)
             return
@@ -896,7 +905,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
     }
 
-    func webView(_ webView: WKWebView, runOpenPanelWith parameters: WKOpenPanelParameters, initiatedByFrame frame: WKFrameInfo, completionHandler: @escaping ([URL]?) -> Void) {
+    @MainActor
+    func webView(
+        _ webView: WKWebView,
+        runOpenPanelWith parameters: WKOpenPanelParameters,
+        initiatedByFrame frame: WKFrameInfo,
+        completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void
+    ) {
         let panel = NSOpenPanel()
         panel.title = "选择要上传的文件"
         panel.prompt = "上传"
@@ -915,12 +930,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @available(macOS 12.0, *)
+    @MainActor
     func webView(
         _ webView: WKWebView,
         requestMediaCapturePermissionFor origin: WKSecurityOrigin,
         initiatedByFrame frame: WKFrameInfo,
         type: WKMediaCaptureType,
-        decisionHandler: @escaping (WKPermissionDecision) -> Void
+        decisionHandler: @escaping @MainActor @Sendable (WKPermissionDecision) -> Void
     ) {
         let kind: MediaCaptureKind
         switch type {
@@ -978,7 +994,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @available(macOS 11.3, *)
-    func download(_ download: WKDownload, decideDestinationUsing response: URLResponse, suggestedFilename: String, completionHandler: @escaping (URL?) -> Void) {
+    @MainActor
+    func download(
+        _ download: WKDownload,
+        decideDestinationUsing response: URLResponse,
+        suggestedFilename: String,
+        completionHandler: @escaping @MainActor @Sendable (URL?) -> Void
+    ) {
         let destination = uniqueDownloadURL(suggestedFilename: suggestedFilename)
         downloadDestinations[ObjectIdentifier(download)] = destination
         completionHandler(destination)
@@ -1166,6 +1188,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard let image = NSImage(data: data) else {
             throw NSError(domain: "ChatGPTSwiftWeb", code: 8, userInfo: [NSLocalizedDescriptionKey: "图像数据无法解码"])
         }
+        try writeImageToPasteboard(image)
+    }
+
+    private func writeImageToPasteboard(_ image: NSImage) throws {
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects([image])
@@ -1447,94 +1473,106 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
-        var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.httpShouldHandleCookies = false
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        loadRemoteImage(from: url) { [weak self] result in
             guard let self else {
                 return
             }
 
-            if let error {
-                DispatchQueue.main.async {
-                    self.presentError("保存下载失败：\(error.localizedDescription)")
-                }
-                return
-            }
-
-            guard let data, !data.isEmpty else {
-                DispatchQueue.main.async {
-                    self.presentError("保存下载失败：图像数据为空。")
-                }
-                return
-            }
-
-            guard data.count <= maximumBridgeDownloadBytes else {
-                DispatchQueue.main.async {
-                    self.presentError("保存下载失败：图像超过 \(maximumBridgeDownloadBytes / 1024 / 1024) MB。")
-                }
-                return
-            }
-
-            let filename = Self.remoteImageFilename(
-                suggestedFilename: suggestedFilename,
-                sourceURL: url,
-                mimeType: response?.mimeType
-            )
-
-            do {
-                let outputURL = try DownloadStore.save(data, suggestedFilename: filename)
-                DispatchQueue.main.async {
+            switch result {
+            case let .success(remoteImage):
+                defer { try? FileManager.default.removeItem(at: remoteImage.fileURL) }
+                let filename = Self.remoteImageFilename(
+                    suggestedFilename: suggestedFilename,
+                    sourceURL: url,
+                    mimeType: remoteImage.mimeType
+                )
+                do {
+                    let outputURL = try DownloadStore.moveTemporaryFile(
+                        remoteImage.fileURL,
+                        suggestedFilename: filename
+                    )
                     NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-                }
-            } catch {
-                DispatchQueue.main.async {
+                } catch {
                     self.presentError("保存下载失败：\(error.localizedDescription)")
                 }
+            case let .failure(error):
+                self.presentError("保存下载失败：\(error.localizedDescription)")
             }
-        }.resume()
+        }
     }
 
     private func copyRemoteImage(from url: URL) {
-        var request = URLRequest(url: url)
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.httpShouldHandleCookies = false
-
-        URLSession.shared.dataTask(with: request) { [weak self] data, _, error in
+        loadRemoteImage(from: url) { [weak self] result in
             guard let self else {
                 return
             }
 
-            if let error {
-                DispatchQueue.main.async {
-                    self.presentError("拷贝图像失败：\(error.localizedDescription)")
+            switch result {
+            case let .success(remoteImage):
+                let fileURL = remoteImage.fileURL
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    defer { try? FileManager.default.removeItem(at: fileURL) }
+                    do {
+                        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
+                        guard let image = NSImage(data: data) else {
+                            throw NSError(
+                                domain: "ChatGPTSwiftWeb",
+                                code: 8,
+                                userInfo: [NSLocalizedDescriptionKey: "图像数据无法解码"]
+                            )
+                        }
+                        DispatchQueue.main.async {
+                            guard let self, !self.isDisposing else {
+                                return
+                            }
+                            do {
+                                try self.writeImageToPasteboard(image)
+                            } catch {
+                                self.presentError("拷贝图像失败：\(error.localizedDescription)")
+                            }
+                        }
+                    } catch {
+                        DispatchQueue.main.async { [weak self] in
+                            self?.presentError("拷贝图像失败：\(error.localizedDescription)")
+                        }
+                    }
                 }
-                return
+            case let .failure(error):
+                self.presentError("拷贝图像失败：\(error.localizedDescription)")
             }
+        }
+    }
 
-            guard let data, !data.isEmpty else {
-                DispatchQueue.main.async {
-                    self.presentError("拷贝图像失败：图像数据为空。")
-                }
-                return
-            }
-
-            guard data.count <= maximumBridgeDownloadBytes else {
-                DispatchQueue.main.async {
-                    self.presentError("拷贝图像失败：图像超过 \(maximumBridgeDownloadBytes / 1024 / 1024) MB。")
-                }
-                return
-            }
-
+    private func loadRemoteImage(
+        from url: URL,
+        completion: @escaping (Result<RemoteImageFile, Error>) -> Void
+    ) {
+        let loaderID = UUID()
+        let loader = RemoteImageLoader(
+            sourceURL: url,
+            maximumBytes: maximumBridgeDownloadBytes
+        ) { [weak self] result in
             DispatchQueue.main.async {
-                do {
-                    try self.copyImageDataToPasteboard(data)
-                } catch {
-                    self.presentError("拷贝图像失败：\(error.localizedDescription)")
+                guard let self else {
+                    return
                 }
+                guard self.remoteImageLoaders.removeValue(forKey: loaderID) != nil else {
+                    return
+                }
+                guard !self.isDisposing else {
+                    return
+                }
+                completion(result)
             }
-        }.resume()
+        }
+        remoteImageLoaders[loaderID] = loader
+        loader.start()
+    }
+
+    private func cancelRemoteImageLoads() {
+        let loaders = Array(remoteImageLoaders.values)
+        remoteImageLoaders.removeAll()
+        loaders.forEach { $0.cancel() }
     }
 
     private static func remoteImageFilename(suggestedFilename: String?, sourceURL: URL, mimeType: String?) -> String {
@@ -2048,7 +2086,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         configuration.userContentController = userContentController
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
         configuration.allowsAirPlayForMediaPlayback = true
-
         if #available(macOS 14.0, *) {
             configuration.upgradeKnownHostsToHTTPS = true
         }
@@ -2846,7 +2883,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     </html>
     """
 
-    private static let downloadBridgeScript = """
+    static let downloadBridgeScript = """
     (() => {
       const marker = '__wkDownloadBridge';
       if (window[marker]) return;
@@ -3024,14 +3061,20 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
         const url = new URL(src, location.href);
         if (url.protocol !== 'https:') throw new Error('Only HTTPS images can be downloaded by URL');
-        try {
-          const response = await fetch(url.href, { credentials: 'include', cache: 'no-store' });
-          if (response.ok) {
-            return { filename, dataURL: await readBlob(await response.blob()) };
-          }
-        } catch (_) {}
-              return { filename, url: url.href };
+        if (url.origin === location.origin) {
+          try {
+            const response = await fetch(url.href, { credentials: 'same-origin', cache: 'no-store' });
+            if (response.ok) {
+              return { filename, dataURL: await readBlob(await response.blob()) };
             }
+          } catch (_) {}
+        } else {
+          // Never let a page-origin cookie cross to an image CDN or another OpenAI/third-party host.
+          // The native fallback uses an isolated, cookie-free URLSession for these URLs.
+          return { filename, url: url.href };
+        }
+        return { filename, url: url.href };
+      }
 
             const installPageHooks = () => {
               if (looksLikeCloudflareChallenge()) return;

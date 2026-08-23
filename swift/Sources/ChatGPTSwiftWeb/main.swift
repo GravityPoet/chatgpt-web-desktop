@@ -38,11 +38,6 @@ let webRTCProtectionDefaultsKey = "ChatGPTSwiftWeb.WebRTCProtectionEnabled"
 let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPartyLinksInApp"
 let smokeReportPathEnvironmentKey = "CHATGPT_SWIFT_SMOKE_REPORT_PATH"
 let smokeTimeoutEnvironmentKey = "CHATGPT_SWIFT_SMOKE_TIMEOUT_SECONDS"
-// WKWebView's native user agent stops at "(KHTML, like Gecko)" with no "Version/.. Safari/.."
-// token. Cloudflare reads that truncated UA as a non-standard client and issues repeated
-// challenges. This is the complete, engine-consistent Safari UA used when no fingerprint preset
-// overrides it, so the WebKit engine presents as the real Safari it actually is.
-let defaultSafariUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Safari/605.1.15"
 let processStartedAt = Date()
 var singleInstanceLockFileDescriptor: CInt = -1
 

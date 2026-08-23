@@ -88,11 +88,23 @@ jobs:
           fi
           ./packaging/check-release-readiness.sh --env --distribution "$CHATGPT_SWIFT_DISTRIBUTION" --sparkle "$sparkle"
 
+      - name: Run source and workflow checks
+        run: |
+          brew list actionlint >/dev/null 2>&1 || brew install actionlint
+          brew list shellcheck >/dev/null 2>&1 || brew install shellcheck
+          ./script/check-source.sh
+
       - name: Run Swift tests
         run: swift test
 
+      - name: Run Swift strict-concurrency tests
+        run: swift test -Xswiftc -strict-concurrency=complete
+
       - name: Smoke-test the real app bundle
         run: ./script/build_and_run.sh --verify
+
+      - name: Smoke-test the Intel slice through Rosetta
+        run: ./script/build_and_run.sh --verify-x86_64
 
       - name: Import Developer ID certificate
         if: ${{ inputs.distribution == 'developer-id' }}
@@ -157,7 +169,7 @@ jobs:
           mounted=1
           app_path="$verify_mount/ChatGPT Swift.app"
           test -d "$app_path"
-          /usr/bin/codesign --verify --deep --strict "$app_path"
+          ./packaging/verify-app-bundle.sh "$app_path"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_SHORT_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_BUILD_NUMBER"
           if [[ "$DISTRIBUTION" == "developer-id" ]]; then
@@ -170,8 +182,14 @@ jobs:
             /usr/bin/xmllint --noout "$appcast_path"
             /usr/bin/grep -q 'sparkle:edSignature=' "$appcast_path"
           else
-            ! plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
-            ! plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
+            if plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist" >/dev/null 2>&1; then
+              echo "error: Sparkle feed URL is present while Sparkle updates are disabled" >&2
+              exit 1
+            fi
+            if plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist" >/dev/null 2>&1; then
+              echo "error: Sparkle public key is present while Sparkle updates are disabled" >&2
+              exit 1
+            fi
           fi
           cleanup_verify_mount
           trap - EXIT

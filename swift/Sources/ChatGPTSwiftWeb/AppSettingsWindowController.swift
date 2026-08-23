@@ -335,9 +335,9 @@ final class AppSettingsWindowController: NSWindowController {
     }
 
     private func renderDistribution() {
-        addHeader("分发", "这里显示真实分发状态。配置 Sparkle appcast 和 EdDSA 公钥后可走自动更新；未配置时保留 GitHub Releases 手动检查。")
+        addHeader("分发", "本地统一自签名是当前正式交付方式。配置 Sparkle appcast 和 EdDSA 公钥后可走自动更新；未配置时保留 GitHub Releases 手动检查。")
         addKeyValue("更新状态", state.updateStatus)
-        addKeyValue("签名 / notarization", state.distributionStatus)
+        addKeyValue("签名策略", state.distributionStatus)
         let buttonRow = NSStackView()
         buttonRow.orientation = .horizontal
         buttonRow.alignment = .centerY
