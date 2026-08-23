@@ -39,6 +39,12 @@ cleanup() {
   if [[ "$MOUNTED" -eq 1 ]]; then
     detach_verify_image >/dev/null 2>&1 || true
   fi
+  # The copied bundle is only DMG input. LaunchServices can index it while the
+  # image is being assembled, so unregister it before removing the staging tree
+  # or the same bundle ID can remain associated with a dead path.
+  if [[ -d "$STAGING/$APP_NAME.app/Contents" ]]; then
+    unregister_app_bundle "$STAGING/$APP_NAME.app"
+  fi
   unregister_app_bundle "$APP_DIR"
   rm -rf "$APP_DIR" "$STAGING" "$VERIFY_MOUNT"
   rm -f "$ROOT/dist/.metadata_never_index"
@@ -52,6 +58,7 @@ CHATGPT_SWIFT_KEEP_TRANSIENT_APP=1 "$ROOT/packaging/make-app.sh" >/dev/null
 
 rm -rf "$STAGING" "$DMG_PATH"
 mkdir -p "$STAGING"
+: > "$STAGING/.metadata_never_index"
 /usr/bin/ditto "$APP_DIR" "$STAGING/$APP_NAME.app"
 ln -s /Applications "$STAGING/Applications"
 
