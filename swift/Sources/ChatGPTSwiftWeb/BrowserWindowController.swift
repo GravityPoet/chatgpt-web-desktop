@@ -129,7 +129,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         observeWebViewState()
 
         if let initialURL {
-            webView.load(Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID))
+            let initialRequest = Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID)
+            applyDefaultCookieConsent { [weak self] in
+                guard let self, !self.isDisposing else {
+                    return
+                }
+                self.webView.load(initialRequest)
+            }
         }
 
         updateNativeChromeStatus()
@@ -210,6 +216,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.url
     }
 
+    func applyDefaultCookieConsent(completion: @escaping () -> Void) {
+        CookieConsentSettings.applyIfEnabled(
+            to: webView.configuration.websiteDataStore,
+            completion: completion
+        )
+    }
+
     func notificationContextText() -> String {
         if let title = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines),
            !title.isEmpty {
@@ -267,8 +280,21 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 completion(false, "controller=deallocated")
                 return
             }
-            let snapshot = self.smokeTestSnapshot()
-            completion(snapshot.passed, snapshot.report)
+            self.webView.configuration.websiteDataStore.httpCookieStore.getAllCookies { [weak self] cookies in
+                DispatchQueue.main.async {
+                    guard let self else {
+                        completion(false, "controller=deallocated")
+                        return
+                    }
+                    let snapshot = self.smokeTestSnapshot()
+                    let consentDefaultEnabled = CookieConsentSettings.isEnabled()
+                    let rejectionApplied = CookieConsentSettings.rejectionIsApplied(in: cookies)
+                    let consentHealthy = !consentDefaultEnabled || rejectionApplied
+                    let consentState = consentDefaultEnabled ? String(rejectionApplied) : "disabled"
+                    let report = snapshot.report + "\ncookieConsentRejectionApplied=\(consentState)"
+                    completion(snapshot.passed && consentHealthy, report)
+                }
+            }
         }
     }
 
