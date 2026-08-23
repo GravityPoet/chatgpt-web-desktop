@@ -265,7 +265,7 @@ final class AppSettingsWindowController: NSWindowController {
         )
         addToggle(
             "默认拒绝 ChatGPT 非必要 Cookie",
-            detail: "默认开启。为每个隔离空间预置 ChatGPT 官方 Consent Cookie 的拒绝值，保留登录、安全和功能所需 Cookie；关闭后可在网页 Cookie Preferences 中自行选择。",
+            detail: "默认开启。为每个隔离空间预置 ChatGPT 官方 Consent Cookie 的拒绝值，保留登录、安全和功能所需 Cookie；关闭时只清理本 App 预置的四个 Consent Cookie，随后可在网页 Cookie Preferences 中自行选择。",
             state: state.rejectNonEssentialCookiesEnabled,
             action: #selector(toggleRejectNonEssentialCookies(_:))
         )

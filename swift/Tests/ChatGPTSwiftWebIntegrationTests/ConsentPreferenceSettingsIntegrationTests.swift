@@ -73,4 +73,44 @@ final class CookieConsentSettingsIntegrationTests: XCTestCase {
 
         XCTAssertTrue(capturedCookies.isEmpty)
     }
+
+    func testClearingManagedCookiesPreservesOtherChatGPTCookies() throws {
+        let store = WKWebsiteDataStore.nonPersistent()
+        let seeded = expectation(description: "managed consent cookies seeded")
+        CookieConsentSettings.applyIfEnabled(to: store) {
+            seeded.fulfill()
+        }
+        wait(for: [seeded], timeout: 3)
+
+        let unrelatedCookie = try XCTUnwrap(HTTPCookie(properties: [
+            .domain: ".chatgpt.com",
+            .name: "session-preserved-for-test",
+            .path: "/",
+            .value: "keep-me",
+        ]))
+        let inserted = expectation(description: "unrelated cookie inserted")
+        store.httpCookieStore.setCookie(unrelatedCookie) {
+            inserted.fulfill()
+        }
+        wait(for: [inserted], timeout: 3)
+
+        let cleared = expectation(description: "managed consent cookies cleared")
+        CookieConsentSettings.clearManagedRejectionCookies(from: store) {
+            cleared.fulfill()
+        }
+        wait(for: [cleared], timeout: 3)
+
+        let inspected = expectation(description: "cookies inspected")
+        var remainingCookies: [HTTPCookie] = []
+        store.httpCookieStore.getAllCookies { cookies in
+            remainingCookies = cookies
+            inspected.fulfill()
+        }
+        wait(for: [inspected], timeout: 3)
+
+        XCTAssertFalse(CookieConsentSettings.rejectionIsApplied(in: remainingCookies))
+        XCTAssertTrue(remainingCookies.contains {
+            $0.name == "session-preserved-for-test" && $0.value == "keep-me"
+        })
+    }
 }
