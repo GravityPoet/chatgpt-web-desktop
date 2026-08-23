@@ -166,8 +166,8 @@ public enum NavigationRules {
     }
 
     public static func isOAuthProviderHost(_ host: String) -> Bool {
-        host == "accounts.google.com"
-            || host.hasPrefix("accounts.google.")
+        let host = host.lowercased()
+        return host == "accounts.google.com"
             || host == "appleid.apple.com"
             || host == "login.microsoftonline.com"
             || host == "login.live.com"

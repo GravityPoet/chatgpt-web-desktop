@@ -4,7 +4,7 @@
 
 把 ChatGPT Web 封装成独立桌面应用，保留网页端最新的 Chat / Work、模型选择器和工具体验，同时提供隔离 profile、旧 macOS 兼容和轻量原生集成。
 
-这个项目最初解决的是一个具体痛点：ChatGPT Web 有时会比原生桌面 App 更早提供模型或推理控制。2026 年 7 月 9 日，OpenAI 已推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 则保留为 ChatGPT Classic；官方公布的 macOS 要求仍是 macOS 14+ 与 Apple Silicon。可参考[最新桌面版发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)和[macOS 系统要求](https://help.openai.com/en/articles/9275200-downloading-the-chatgpt-macos-app)。
+这个项目最初解决的是一个具体痛点：ChatGPT Web 有时会比原生桌面 App 更早提供模型或推理控制。2026 年 7 月 9 日，OpenAI 已推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 则保留为 ChatGPT Classic；官方公布的 macOS 要求现为 macOS 14+，同时支持 Apple Silicon 与 Intel，而本项目的 Swift 版仍支持 macOS 12+。可参考[最新桌面版发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)和[macOS 系统要求](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app)。
 
 因此，这个 wrapper 不再以“替代官方 App”为目标。它更适合被理解为一个小型、可审计的 WebView 桌面壳：把完整 ChatGPT Web 放进独立窗口，提供与主浏览器分离的存储、可预测的外链/下载处理，以及可选的隐私与多空间控制。
 

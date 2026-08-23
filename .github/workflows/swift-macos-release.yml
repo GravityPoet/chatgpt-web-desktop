@@ -139,12 +139,24 @@ jobs:
           ENABLE_SPARKLE: ${{ inputs.enable_sparkle }}
           FEED_URL: ${{ inputs.feed_url }}
         run: |
-          app_path="dist/ChatGPT Swift.app"
           dmg_path="dist/ChatGPT Swift.dmg"
           appcast_path="dist/sparkle-appcast/appcast.xml"
+          verify_mount="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/chatgpt-swift-release-verify.XXXXXX")"
+          mounted=0
+          cleanup_verify_mount() {
+            if [[ "$mounted" == "1" ]]; then
+              /usr/bin/hdiutil detach "$verify_mount" >/dev/null 2>&1 || true
+            fi
+            rm -rf "$verify_mount"
+          }
+          trap cleanup_verify_mount EXIT
 
-          test -d "$app_path"
           test -f "$dmg_path"
+          /usr/bin/hdiutil verify "$dmg_path"
+          /usr/bin/hdiutil attach -readonly -nobrowse -mountpoint "$verify_mount" "$dmg_path" >/dev/null
+          mounted=1
+          app_path="$verify_mount/ChatGPT Swift.app"
+          test -d "$app_path"
           /usr/bin/codesign --verify --deep --strict "$app_path"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_SHORT_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_BUILD_NUMBER"
@@ -161,6 +173,8 @@ jobs:
             ! plutil -extract SUFeedURL raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
             ! plutil -extract SUPublicEDKey raw -o - "$app_path/Contents/Info.plist" 2>/dev/null
           fi
+          cleanup_verify_mount
+          trap - EXIT
 
       - name: Publish GitHub release assets
         env:

@@ -34,7 +34,15 @@ build_app() {
 cleanup_transient_app() {
   status=$?
   trap - EXIT INT TERM
-  stop_app
+  if [[ "$MODE" == "--verify" || "$MODE" == "verify" ]]; then
+    smoke_pid="${SMOKE_APP_PID:-}"
+    if [[ -n "$smoke_pid" ]] && kill -0 "$smoke_pid" >/dev/null 2>&1; then
+      kill "$smoke_pid" >/dev/null 2>&1 || true
+      wait "$smoke_pid" >/dev/null 2>&1 || true
+    fi
+  else
+    stop_app
+  fi
   unregister_app_bundle "$APP_BUNDLE"
   rm -rf "$APP_BUNDLE"
   rm -f "$ROOT_DIR/dist/.metadata_never_index"
@@ -96,6 +104,7 @@ case "$MODE" in
       CHATGPT_SWIFT_SMOKE_TIMEOUT_SECONDS="$smoke_timeout" \
       "$APP_BINARY" &
     app_pid="$!"
+    SMOKE_APP_PID="$app_pid"
     deadline=$((smoke_timeout + 10))
     elapsed=0
     while [[ "$elapsed" -lt "$deadline" ]]; do
@@ -120,6 +129,7 @@ case "$MODE" in
       kill -KILL "$app_pid" >/dev/null 2>&1 || true
     fi
     wait "$app_pid" >/dev/null 2>&1 || true
+    SMOKE_APP_PID=""
     if [[ ! -f "$report_file" ]]; then
       echo "smoke test failed: app exited without writing report" >&2
       exit 1

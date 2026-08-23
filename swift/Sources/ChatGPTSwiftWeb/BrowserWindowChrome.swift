@@ -160,12 +160,22 @@ extension BrowserWindowController {
         } else if lastRenderProbeWasBlank {
             setStatus("页面空白，点击恢复", showsProgress: false)
         } else {
-            let host = webView.url?.host ?? "chatgpt.com"
+            let location = Self.statusLocationText(for: webView.url)
             let zoom = Int(round(currentZoom * 100))
-            setStatus("\(host) · \(zoom)%", showsProgress: false)
+            setStatus("\(location) · \(zoom)%", showsProgress: false)
         }
 
         window.toolbar?.validateVisibleItems()
+    }
+
+    static func statusLocationText(for url: URL?) -> String {
+        if let host = url?.host, !host.isEmpty {
+            return host
+        }
+        if let scheme = url?.scheme, !scheme.isEmpty {
+            return "\(scheme.lowercased()):"
+        }
+        return "未载入"
     }
 
     func setStatus(_ text: String, showsProgress: Bool) {

@@ -3,12 +3,20 @@ import WebKit
 
 extension BrowserWindowController {
     func focusPromptComposer(completion: ((String?) -> Void)? = nil) {
+        guard Self.canInjectPromptContent(into: webView.url) else {
+            completion?("请先打开 ChatGPT 页面")
+            return
+        }
         show()
         setStatus("正在聚焦输入框…", showsProgress: true)
         focusPromptComposer(attemptsRemaining: 8, completion: completion)
     }
 
     func insertTextIntoPrompt(_ text: String, completion: @escaping (String?) -> Void) {
+        guard Self.canInjectPromptContent(into: webView.url) else {
+            completion("为保护本机内容，只能向 ChatGPT 页面插入文本")
+            return
+        }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             completion("没有可插入的文本")
@@ -25,6 +33,10 @@ extension BrowserWindowController {
         attemptsRemaining: Int,
         completion: @escaping (String?) -> Void
     ) {
+        guard Self.canInjectPromptContent(into: webView.url) else {
+            completion("页面已经离开 ChatGPT，已取消插入")
+            return
+        }
         webView.evaluateJavaScript(Self.insertPromptTextScript(text: text)) { [weak self] result, error in
             guard let self else {
                 return
@@ -57,6 +69,11 @@ extension BrowserWindowController {
     }
 
     private func focusPromptComposer(attemptsRemaining: Int, completion: ((String?) -> Void)? = nil) {
+        guard Self.canInjectPromptContent(into: webView.url) else {
+            setStatus("请先打开 ChatGPT 页面", showsProgress: false)
+            completion?("请先打开 ChatGPT 页面")
+            return
+        }
         webView.evaluateJavaScript(Self.focusPromptComposerScript) { [weak self] result, error in
             guard let self else {
                 return
@@ -91,8 +108,19 @@ extension BrowserWindowController {
         }
     }
 
-    private static let focusPromptComposerScript = """
+    static let focusPromptComposerScript = """
     (() => {
+      const host = String(location.hostname || '').toLowerCase();
+      const isChatGPTPage = location.protocol === 'https:' && (
+        host === 'chatgpt.com' ||
+        host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' ||
+        host.endsWith('.chat.openai.com')
+      );
+      if (!isChatGPTPage) {
+        return { ok: false, reason: 'untrusted origin' };
+      }
+
       const visible = (element) => {
         if (!element) return false;
         const rect = element.getBoundingClientRect();
@@ -119,10 +147,21 @@ extension BrowserWindowController {
     })()
     """
 
-    private static func insertPromptTextScript(text: String) -> String {
+    static func insertPromptTextScript(text: String) -> String {
         let textLiteral = promptJavaScriptStringLiteral(text)
         return """
         (() => {
+          const host = String(location.hostname || '').toLowerCase();
+          const isChatGPTPage = location.protocol === 'https:' && (
+            host === 'chatgpt.com' ||
+            host.endsWith('.chatgpt.com') ||
+            host === 'chat.openai.com' ||
+            host.endsWith('.chat.openai.com')
+          );
+          if (!isChatGPTPage) {
+            return { ok: false, reason: 'untrusted origin' };
+          }
+
           const text = \(textLiteral);
           const visible = (element) => {
             if (!element) return false;

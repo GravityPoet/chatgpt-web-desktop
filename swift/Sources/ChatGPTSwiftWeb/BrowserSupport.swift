@@ -941,7 +941,6 @@ enum ProfileStore {
         profiles.insert(profile, at: 0)
         save(profiles)
         UserDefaults.standard.set(id, forKey: startupProfileDefaultsKey)
-        UserDefaults.standard.set(id, forKey: currentProfileDefaultsKey)
         return true
     }
 
