@@ -72,7 +72,7 @@
 
 ### 方式一：直接下载安装包（推荐）
 
-1. **下载** 最新版 [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg)（约 2.7 MB）。
+1. **下载** 最新版 [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg)（约 2.7 MB）；亦可在 [Releases 发布页面](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest) 查看所有版本与 SHA-256 校验码。
 2. 打开 DMG 文件，将 **ChatGPT Swift** 拖入 `Applications` 应用程序文件夹。
 3. 打开 `ChatGPT Swift` 并登录你的 ChatGPT 账号即可使用。
 
