@@ -138,6 +138,7 @@ Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA �
 - 默认用本地自签名构建 GitHub Release DMG，不需要 Apple Developer 账号
 - CI 会验收 DMG 内 App 的 `arm64+x86_64`、两个 slice 的 macOS 12.0 deployment target 及完整 codesign；本机 `make-app.sh` 另行生成并验收 ZIP，安装脚本验收替换、回滚、启动和 Spotlight/LaunchServices 唯一性
 - Universal App 声明 `LSRequiresNativeExecution=true` 并优先选择 `arm64`，避免 Apple silicon 机器误走 Rosetta；Intel 仍保留 `x86_64` 原生 slice
+- CI 自签名使用 runner 临时钥匙串，并在构建成功或失败后恢复原用户钥匙串搜索列表，避免本地模拟 CI 污染后续签名
 - 如果选择 `distribution=developer-id`，才导入 Developer ID Application `.p12`、notarize 并 staple DMG
 - 如果开启 `enable_sparkle=true`，必须同时选择 `distribution=developer-id`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`
 - 上传 `ChatGPT Swift.dmg` 到指定 GitHub Release；开启 Sparkle 时额外上传 `appcast.xml`
