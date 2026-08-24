@@ -1,105 +1,114 @@
+<h2 align="center">🌐 <a href="./README.zh-CN.md">中文用户：点击查看中文版本</a></h2>
+
 # ChatGPT Web Desktop
 
-Languages: English | [简体中文](README.zh-CN.md)
+<p align="center">
+  <strong>ChatGPT Web superpowers in a fast, private 2.7 MB native macOS desktop app.</strong><br>
+  <em>Full web model controls, isolated cookies, background completion alerts, and 1-click Apple Notes context — running on macOS 12+ (Intel & Apple Silicon).</em>
+</p>
 
-Use ChatGPT Web as a desktop app with isolated profiles, web-first feature parity, and lightweight native desktop integration.
+<p align="center">
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/GravityPoet/chatgpt-web-desktop?label=Latest%20Release&color=007AFF" alt="Latest Release"></a>
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest"><img src="https://img.shields.io/badge/macOS-12.0%2B%20Universal-34C759" alt="macOS 12+ Universal"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License: MIT"></a>
+</p>
 
-This project started from one specific pain point: ChatGPT Web sometimes exposed model or reasoning controls before the native desktop app did. On July 9, 2026, OpenAI launched a new desktop app that brings Chat, Work, and Codex together; the previous macOS app remains available as ChatGPT Classic. OpenAI's published macOS requirements now target macOS 14+ on either Apple Silicon or Intel, while this Swift wrapper still supports macOS 12+. See the [current desktop release notes](https://help.openai.com/en/articles/6825453-chatgpt-release-notes) and [macOS requirements](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app).
+<p align="center">
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg">
+    <img src="https://img.shields.io/badge/Download-ChatGPT.Swift.dmg%20(2.7MB)-007AFF?style=for-the-badge&logo=apple&logoColor=white" alt="Download ChatGPT Swift DMG">
+  </a>
+</p>
 
-This wrapper is now best understood as a small, auditable WebView desktop shell: it keeps the full ChatGPT Web surface available inside a dedicated window, with separate WebView storage, predictable link/download handling, and optional privacy/profile controls.
+---
 
-It does not bypass ChatGPT subscriptions, usage limits, or account permissions. It simply wraps the official ChatGPT web app in a desktop shell, using your own ChatGPT account.
+## Why ChatGPT Web Desktop?
 
-## What This Solves
+Stop losing ChatGPT in a sea of browser tabs or getting blocked by official desktop app limitations:
 
-- Keeps ChatGPT Web's current Chat/Work surface, model picker, and web-first controls in a desktop app.
-- Provides a macOS 12-compatible Swift implementation for machines that cannot run the current official macOS app requirements.
-- Lets you deliberately spend more reasoning effort on coding, analysis, writing, planning, research, and other high-stakes tasks.
-- Avoids losing web-only controls just because you prefer a desktop-window workflow.
-- Uses a dedicated app window instead of a normal browser tab.
-- Keeps its WebView storage separate from Chrome, Safari, and other wrappers.
-- Preserves login/OAuth flows inside the app when possible.
-- Lets you choose whether third-party links stay in the app or open in the system browser.
-- Adds desktop conveniences such as window restore, single-instance behavior, zoom shortcuts, and download handling.
+- **Web-First Controls Without Tab Chaos**: ChatGPT Web gets the newest model pickers, advanced reasoning effort sliders, Canvas, and Work features first. This app brings the complete web experience into a dedicated, distraction-free desktop window.
+- **Runs on macOS 12+ (Monterey & Ventura)**: OpenAI's official macOS desktop app requires macOS 14+ Sonoma. This native Swift implementation supports macOS 12.0 and later on both Apple Silicon and Intel Macs.
+- **100% Isolated & Private**: Separate WebView storage keeps your ChatGPT session completely isolated from Safari, Chrome, and system tracking. It automatically rejects non-essential cookies by default while keeping you logged in.
+- **Featherweight Native Performance**: A tiny ~2.7 MB DMG download built with native AppKit and WKWebView — no Electron bloat or heavy memory footprint.
 
-## Why Use This
+## Before vs. After
 
-Use it when ChatGPT is part of your daily workflow and a normal browser tab is not enough.
+| Feature | Browser Tab / Official App | ChatGPT Web Desktop |
+|---|---|---|
+| **macOS Compatibility** | Official app locked to macOS 14+ | **macOS 12.0+ (Monterey, Ventura, Sonoma, Sequoia)** |
+| **Download & App Size** | Electron wrappers often > 150 MB | **~2.7 MB DMG** (Native Swift universal binary) |
+| **Workspace Focus** | Easily lost among dozens of open tabs | **Dedicated Dock tile**, saved window position & single-instance lock |
+| **Context Insertion** | Manual copy-pasting from notes | **1-click Apple Notes integration** (`Cmd+Option+N`) |
+| **Generation Alerts** | Must keep switching tabs to check progress | **Native background notifications** when answers finish |
+| **Cookie Isolation** | Shares cookies with main browser | **Isolated profile store**; auto-opts out of tracking cookies |
+| **File Downloads** | Web `blob:`/`data:` links frequently fail | **Native download bridge** auto-saves straight to `~/Downloads` |
+| **Crash Protection** | Accidental refresh loses unsent prompt | **Automatic input draft recovery** restores unsent text |
 
-- You want access to ChatGPT Web's newest controls without waiting for a native desktop client to match them.
-- You want to choose advanced/high thinking for hard work instead of being forced into a faster, lighter default mode.
-- You want answers that can be more precise because the model is allowed to spend more effort on difficult prompts.
-- You want a focused ChatGPT workspace that does not get buried among browser tabs.
-- You want a separate WebView profile, useful for keeping ChatGPT login state isolated from your main browser.
-- You want ChatGPT to feel like a real desktop app: Dock/taskbar presence, restored window position, zoom shortcuts, single-instance behavior, and predictable external-link handling.
-- You want a lightweight open-source wrapper that does not proxy your traffic, collect your credentials, or replace the official ChatGPT web app.
-- You want both a native macOS reference implementation and a Tauri/Rust implementation that can serve as a cross-platform base.
+## Killer Features
 
-## Good For
+### 1. Web-First Power in a Focused Desktop Shell
+Experience the complete ChatGPT Web interface — model selection, deep reasoning effort, Voice, Canvas, and Work tools — directly inside a native macOS window. Single-instance management prevents cluttered duplicate windows, and your exact window size and position are remembered across launches.
 
-- Developers who want stronger reasoning for debugging, architecture review, refactors, and code generation.
-- Writers and researchers who want longer, more careful answers without leaving a desktop workspace.
-- Power users who rely on ChatGPT Web features but prefer app-like window management.
-- People who use multiple browsers or accounts and want a clean, isolated ChatGPT surface.
-- Builders who want a small reference project for wrapping a complex web app with Swift/WKWebView or Tauri.
+### 2. Native macOS Integrations for Daily Flow
+- **Apple Notes Bridge (`Cmd+Option+N`)**: Instantly pulls the title and body of your currently selected Apple Note directly into the prompt box without manual copy-pasting.
+- **Background Completion Alerts**: Sends a macOS notification when ChatGPT finishes generating long responses or deep-thinking tasks while you work in another app.
+- **Smart Download Bridge**: Automatically handles `blob:` and `data:` download links generated by ChatGPT and saves them cleanly to `~/Downloads`.
+- **Draft Recovery**: Preserves unsent prompt text through page reloads or WebKit process restarts so you never lose complex prompts.
+
+### 3. Isolated Storage & Privacy-First Defaults
+- **Independent Cookie Jar**: Keeps your ChatGPT login credentials completely separated from Safari, Chrome, or other browsers.
+- **Automatic Consent Rejection**: Pre-sets official consent preferences to reject non-essential tracking cookies while preserving authentication.
+- **Zero Intermediaries**: Connects directly to official OpenAI endpoints with zero proxying, zero credential collection, and zero telemetry.
+
+## Quick Start
+
+> **Prerequisites**: macOS 12.0+ (Apple Silicon M-Series or Intel Mac) and an active ChatGPT account.
+
+### Option 1: Direct Download (Fastest)
+
+1. **Download** the latest [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg) (~2.7 MB).
+2. Open the DMG and drag **ChatGPT Swift** into your `Applications` folder.
+3. Launch `ChatGPT Swift` and sign in with your OpenAI account.
+
+*(Note: On first launch of local self-signed builds, if macOS displays a developer verification prompt, click "Open Anyway" in **System Settings > Privacy & Security**).*
+
+### Option 2: Build from Source
+
+```bash
+git clone https://github.com/GravityPoet/chatgpt-web-desktop.git
+cd chatgpt-web-desktop/swift
+./packaging/make-app.sh
+```
+
+The universal app will be created at `dist/ChatGPT Swift.zip`.
+
+## Who Needs This?
+
+- **Developers & Engineers**: Maximize reasoning effort on hard coding tasks, refactors, and architecture design in a clean, isolated workspace.
+- **Writers & Researchers**: Seamlessly insert research from Apple Notes and receive background alerts when deep reasoning finishes.
+- **Users on macOS 12 / 13**: Continue using a native-feeling ChatGPT desktop client on Monterey and Ventura without upgrading hardware or OS.
+- **Multi-Account Power Users**: Maintain clean session boundaries between personal and work accounts without browser profile clutter.
 
 ## Implementations
 
-```text
-swift/
-  Native macOS AppKit + WKWebView implementation.
+- **`swift/` (Primary macOS App)**: Native macOS AppKit + WKWebView wrapper. Universal arm64 + x86_64 binary for macOS 12+. (Recommended for Mac users).
+- **`tauri/` (Cross-Platform)**: Rust + Tauri v2 implementation for macOS, Windows, and Linux desktop builds.
+- **`cloak/` (Multi-Account)**: Specialized launcher for power users running multiple ChatGPT accounts with isolated Chromium profiles, fingerprint seeds, and network-derived timezone alignment.
 
-tauri/
-  Rust + Tauri v2 cross-platform desktop implementation.
+## Trust & Privacy
 
-cloak/
-  Multi-account macOS launcher: one isolated CloakBrowser (Chromium) profile per account.
-```
-
-The Swift version is a native macOS implementation shipped as a single arm64+x86_64 universal app for macOS 12 and later. The Tauri version is the cross-platform implementation for desktop builds across macOS, Windows, and Linux.
-
-The cloak version targets people who run several ChatGPT accounts and want each one to stay fully separate. Every account gets its own isolated Chromium profile (independent storage and login state) launched through a CloakBrowser build, with a per-account fingerprint seed (navigator/UA/GPU/platform), an optional per-account proxy, and timezone, locale, and WebRTC-IP values derived from that account's own network egress so each identity stays internally consistent. A small Dock picker app lists the accounts and launches the selected one.
-
-## Privacy
-
-The repository does not include personal cookies, session data, tokens, or local browser profiles.
-
-Runtime login state is stored by the operating system WebView at runtime. The Swift app includes an optional cookie import flow for a user-selected local JSON file, but exported cookie files should never be committed or shared.
-
-The Swift app also includes a clear website data action for resetting this app's WebView cookies, login state, cache, localStorage, IndexedDB, service workers, and other local website data before reloading ChatGPT.
-
-By default, each Swift WebView profile records ChatGPT's official consent preference as rejecting non-essential cookies while preserving the cookies required for sign-in, security, and service functionality. Settings > Privacy can disable this behavior; disabling it removes only the four consent cookies seeded by this app, never login or other site cookies, and existing choices can still be changed through ChatGPT's Cookie Preferences.
-
-The Swift app additionally provides optional, off-by-default fingerprint controls for a consistent per-profile browser identity: a stable Safari-family navigator/screen profile, enhanced-privacy noise for Canvas/WebGL/Audio, and WebRTC leak protection. The default profile preserves the native WebKit timezone and never rebuilds a live page after a GeoIP refresh. When a fingerprint preset is explicitly enabled, egress-derived timezone data is refreshed only for the next newly created WebView.
-
-## Build
-
-Swift:
-
-```bash
-cd swift
-./packaging/make-app.sh
-./packaging/make-dmg.sh
-```
-
-Both commands produce a locally self-signed universal build that is verified for Apple Silicon and Intel slices with a macOS 12.0 minimum deployment target.
-
-Tauri:
-
-```bash
-cd tauri
-npm install
-npm run build
-npm run build:signed-dmg
-```
-
-## Status
-
-- Swift wrapper: native macOS AppKit/WKWebView path; arm64+x86_64 universal delivery for macOS 12+, stable native defaults plus optional per-profile fingerprint controls and next-session VPN-egress timezone alignment.
-- Tauri wrapper: Rust/Tauri v2 cross-platform desktop path.
-- Cloak launcher: macOS multi-account path; per-account isolated CloakBrowser profile, fingerprint seed, optional proxy, and egress-derived timezone/locale/WebRTC-IP, with a Dock account picker.
-- Packaging helpers: macOS app/DMG helpers are included; other desktop targets can use the standard Tauri build flow.
+- **Local Storage Only**: Session tokens and cookies are managed directly by Apple's secure system WKWebView on your Mac.
+- **No Third-Party Servers**: Traffic routes directly between your computer and `chatgpt.com`. No analytics, proxy relays, or tracking servers are used.
+- **Cookie Consent**: Automatically sets official OpenAI cookie preferences to reject non-essential cookies by default.
 
 ## Disclaimer
 
-This is an unofficial project and is not affiliated with, endorsed by, or sponsored by OpenAI. ChatGPT, OpenAI, and related marks belong to OpenAI. References to ChatGPT and OpenAI are used only to describe compatibility with the official ChatGPT web app.
+This is an independent open-source project and is not affiliated with, endorsed by, or sponsored by OpenAI. ChatGPT, OpenAI, and associated trademarks belong to OpenAI.
+
+---
+
+<p align="center">
+  <strong>Ready to upgrade your ChatGPT desktop experience?</strong><br><br>
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg">
+    <img src="https://img.shields.io/badge/Download-ChatGPT.Swift.dmg%20(2.7MB)-007AFF?style=for-the-badge&logo=apple&logoColor=white" alt="Download ChatGPT Swift DMG">
+  </a>
+</p>

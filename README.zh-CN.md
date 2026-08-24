@@ -1,105 +1,114 @@
+<h2 align="center">🌐 <a href="./README.md">Switch to the English version</a></h2>
+
 # ChatGPT Web Desktop
 
-语言：[English](README.md) | 简体中文
+<p align="center">
+  <strong>将 ChatGPT Web 满血能力装进 2.7 MB 的轻量原生 macOS 桌面 App。</strong><br>
+  <em>保留网页端最新模型与深度思考控制、独立 Cookie 隔离、后台生成完成通知、一键 Apple Notes 提示词导入 — 原生支持 macOS 12+（Intel 与 Apple Silicon）。</em>
+</p>
 
-把 ChatGPT Web 封装成独立桌面应用，保留网页端最新的 Chat / Work、模型选择器和工具体验，同时提供隔离 profile、旧 macOS 兼容和轻量原生集成。
+<p align="center">
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest"><img src="https://img.shields.io/github/v/release/GravityPoet/chatgpt-web-desktop?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=007AFF" alt="最新版本"></a>
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest"><img src="https://img.shields.io/badge/macOS-12.0%2B%20Universal-34C759" alt="macOS 12+ 通用架构"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/%E5%BC%80%E6%BA%90%E5%8D%8F%E8%AE%AE-MIT-blue.svg" alt="开源协议: MIT"></a>
+</p>
 
-这个项目最初解决的是一个具体痛点：ChatGPT Web 有时会比原生桌面 App 更早提供模型或推理控制。2026 年 7 月 9 日，OpenAI 已推出把 Chat、Work 和 Codex 合并到一起的新桌面 App，旧版 macOS App 则保留为 ChatGPT Classic；官方公布的 macOS 要求现为 macOS 14+，同时支持 Apple Silicon 与 Intel，而本项目的 Swift 版仍支持 macOS 12+。可参考[最新桌面版发布说明](https://help.openai.com/en/articles/6825453-chatgpt-release-notes)和[macOS 系统要求](https://help.openai.com/en/articles/9395554-what-are-the-system-requirements-for-the-chatgpt-macos-app)。
+<p align="center">
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg">
+    <img src="https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-ChatGPT.Swift.dmg%20(2.7MB)-007AFF?style=for-the-badge&logo=apple&logoColor=white" alt="下载 ChatGPT Swift DMG">
+  </a>
+</p>
 
-因此，这个 wrapper 不再以“替代官方 App”为目标。它更适合被理解为一个小型、可审计的 WebView 桌面壳：把完整 ChatGPT Web 放进独立窗口，提供与主浏览器分离的存储、可预测的外链/下载处理，以及可选的隐私与多空间控制。
+---
 
-它不会绕过 ChatGPT 订阅、使用额度或账号权限。它只是用你自己的 ChatGPT 账号，在桌面壳里打开官方 ChatGPT Web。
+## 为什么需要 ChatGPT Web Desktop？
 
-## 解决什么问题
+告别在数十个浏览器标签页中翻找 ChatGPT，也不再被官方桌面客户端的高系统门槛阻拦：
 
-- 在桌面 App 里保留 ChatGPT Web 当前的 Chat / Work、模型选择器和网页优先控制。
-- 提供 macOS 12 兼容的 Swift 实现，覆盖无法运行官方当前系统要求的机器。
-- 让你可以主动为代码、分析、写作、规划、研究等高要求任务投入更多推理 effort。
-- 不会因为想用桌面窗口工作流，就丢掉网页版独有控制。
-- 使用独立应用窗口，而不是普通浏览器标签页。
-- WebView 存储与 Chrome、Safari 和其他 wrapper 隔离。
-- 尽量在 App 内保留登录 / OAuth 流程。
-- 第三方链接可由用户选择留在 App 内，或交给系统浏览器打开。
-- 增加桌面便利能力，例如窗口恢复、单实例、缩放快捷键和下载处理。
+- **网页端最新特性零时差**：ChatGPT Web 永远最先获得最新模型选择器、深度思考强度滑块、Canvas 和 Work 工具。本项目将完整的网页体验封装在专注、干净的原生桌面窗口中。
+- **兼容 macOS 12+（Monterey 与 Ventura）**：OpenAI 官方桌面 App 强制要求 macOS 14+ Sonoma；而本项目的 Swift 原生 universal App 完美兼容 macOS 12.0 及以上系统（同时支持 Intel 与 Apple Silicon M 系列芯片）。
+- **100% 独立存储与隐私隔离**：独立的 WebView 存储空间，与 Safari、Chrome 的日常浏览 Cookie 和跨站追踪彻底隔离；默认自动写入拒绝非必要追踪 Cookie 偏好，保持登录态的同时保护隐私。
+- **极致轻量无负担**：仅约 2.7 MB DMG 安装包，基于原生 AppKit 与系统 WKWebView 构建，绝无 Electron 的臃肿内存占用与冗余后台。
 
-## 为什么使用它
+## 痛点对比（Before vs. After）
 
-如果 ChatGPT 是你的日常工作流，而普通浏览器标签页又不够顺手，可以考虑使用它。
+| 体验维度 | 普通浏览器标签页 / 官方客户端 | ChatGPT Web Desktop |
+|---|---|---|
+| **系统兼容门槛** | 官方 App 强制要求 macOS 14+ | **原生支持 macOS 12.0+（Monterey, Ventura, Sonoma, Sequoia）** |
+| **安装包与体积** | 常见 Electron 封装动辄 150 MB+ | **~2.7 MB DMG**（Swift 原生通用架构） |
+| **工作流专注度** | 淹没在 50+ 浏览器标签页中 | **独立 Dock 图标**、自动记忆窗口位置、单实例防重复开启 |
+| **上下文快速输入** | 从备忘录手动复制粘贴文本 | **一键读取 Apple Notes 备忘录**（快捷键 `Cmd+Option+N`） |
+| **长回答进度感知** | 必须频繁切回标签页查看是否生成完毕 | **后台完成通知**：AI 生成完毕后自动发送 macOS 原生通知 |
+| **Cookie 与隐私** | 与主浏览器混用 Cookie，容易被追踪 | **完全独立的 Profile 存储**，默认自动拒绝非必要追踪 Cookie |
+| **文件下载支持** | 网页生成的 `blob:` / `data:` 经常在 WebView 卡死 | **原生下载桥接**，自动安全保存至 `~/Downloads` |
+| **未发送草稿保护** | 意外刷新或进程崩溃丢失刚写好的长 Prompt | **草稿自动恢复**，重新加载后自动还原输入框内容 |
 
-- 你想尽快使用 ChatGPT Web 的最新控制项，而不是等待原生桌面客户端跟进。
-- 你想在困难任务里选择 advanced / high thinking，而不是被限制在更快但更轻的默认模式。
-- 你希望模型被允许投入更多 effort，从而给出更精确的复杂问题答案。
-- 你想要一个专注的 ChatGPT 工作窗口，不被浏览器标签页淹没。
-- 你想要独立 WebView profile，把 ChatGPT 登录态和主浏览器隔离。
-- 你希望 ChatGPT 更像真正的桌面应用：Dock / taskbar、窗口位置恢复、缩放快捷键、单实例和可预测的外链处理。
-- 你想要一个轻量开源 wrapper，不代理你的流量，不收集你的凭据，也不替换官方 ChatGPT Web。
-- 你想同时保留原生 macOS 参考实现，以及可作为跨平台基础的 Tauri/Rust 实现。
+## 三大核心杀手级特性
 
-## 适合谁
+### 1. 网页版完整能力 + 原生桌面专注体验
+无需等待官方桌面客户端跟进功能，第一时间使用网页版模型选择、思考强度调节、语音输入、Canvas 及 Work。单实例机制防止重复打开多窗口，窗口位置与大小自动记忆，让 ChatGPT 成为常驻 Dock 的得力生产力助手。
 
-- 开发者：用于调试、架构审查、重构和代码生成时获得更强推理。
-- 写作者和研究者：在桌面工作区内获得更长、更谨慎的回答。
-- 重度用户：依赖 ChatGPT Web 功能，但更喜欢应用化窗口管理。
-- 多浏览器或多账号用户：想要一个干净、隔离的 ChatGPT 使用面。
-- 构建者：想参考如何用 Swift/WKWebView 或 Tauri 包装复杂 Web App。
+### 2. 深度融入 macOS 工作流的原生集成
+- **Apple Notes 一键导入（`Cmd+Option+N`）**：在备忘录选中内容后，一键自动提取标题与正文填入 ChatGPT 输入框，免去繁琐复制粘贴。
+- **后台完成通知**：处理长文生成或深度思考推理时，切换到其他工作窗口；回答生成完毕后系统自动弹出 macOS 横幅通知。
+- **智能下载桥接**：完美支持 ChatGPT 生成的各类文件、代码与图片，自动桥接保存至系统 `~/Downloads` 目录。
+- **输入草稿防丢保护**：页面刷新、白屏恢复或 WebKit 渲染进程重启后，自动尝试将未发送的 Prompt 还原到输入框。
 
-## 实现版本
+### 3. 独立空间与开箱即用的隐私保护
+- **独立 Cookie 存储库**：ChatGPT 登录凭证与 Safari、Chrome 完全隔离，多账号互不干扰。
+- **默认拒绝追踪 Cookie**：自动配置 OpenAI 官方 Cookie Consent 偏好为拒绝非必要追踪 Cookie，同时保留正常登录态。
+- **无中转、无劫持**：所有流量直连 OpenAI 官方服务器，绝不代理流量、不收集密码、不收集任何敏感数据。
 
-```text
-swift/
-  原生 macOS AppKit + WKWebView 实现。
+## 极简上手（60 秒搞定）
 
-tauri/
-  Rust + Tauri v2 跨平台桌面实现。
+> **前置要求**：macOS 12.0+（Apple Silicon 或 Intel Mac），以及有效的 ChatGPT 账号。
 
-cloak/
-  多账号 macOS 启动器：每个账号一个隔离的 CloakBrowser（Chromium）profile。
-```
+### 方式一：直接下载安装包（推荐）
 
-Swift 版本是原生 macOS 实现，以同一个支持 macOS 12+ 的 `arm64+x86_64` universal App 覆盖 Apple Silicon 与 Intel。Tauri 版本是面向 macOS、Windows 和 Linux 桌面构建的跨平台实现。
+1. **下载** 最新版 [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg)（约 2.7 MB）。
+2. 打开 DMG 文件，将 **ChatGPT Swift** 拖入 `Applications` 应用程序文件夹。
+3. 打开 `ChatGPT Swift` 并登录你的 ChatGPT 账号即可使用。
 
-cloak 版本面向需要同时运行多个 ChatGPT 账号、并希望各账号彻底隔离的用户。每个账号都有独立的 Chromium profile（独立的存储与登录态），通过 CloakBrowser 构建启动，配以每账号的指纹种子（navigator/UA/GPU/platform）、可选的每账号代理，以及由该账号自身网络出口推导的 timezone、locale 和 WebRTC-IP，使每个身份在内部保持一致。一个小型 Dock 选择器 App 列出账号并启动所选账号。
+*(注：由于本包使用统一自签名，若 macOS 首次打开时提示未验证开发者，前往“系统设置 > 隐私与安全性”点击“仍要打开”即可)*
 
-## 隐私
-
-仓库不包含个人 cookie、session 数据、token 或本地浏览器 profile。
-
-运行时登录态由操作系统 WebView 在本机保存。Swift App 包含一个可选 cookie 导入流程，用于用户主动选择本地 JSON 文件；但导出的 cookie 文件绝不能提交或分享。
-
-Swift App 也提供清空网站数据的菜单动作，可以在重新加载 ChatGPT 前重置本 App WebView 保存的 cookie、登录态、缓存、localStorage、IndexedDB、Service Worker 和其他本地网站数据。
-
-默认情况下，每个 Swift WebView 账号空间都会把 ChatGPT 官方 Cookie Consent 偏好记录为“拒绝非必要 Cookie”，同时保留登录、安全和服务功能所需 Cookie。可在“设置 > 隐私”关闭这一默认行为；关闭时只清理本 App 预置的四个 Consent Cookie，不触碰登录态或其他网站 Cookie；已有选择仍可通过 ChatGPT 网页底部的 Cookie Preferences 修改。
-
-Swift App 还提供一组默认关闭的指纹控制项，用于在每个空间维持一致的浏览器身份：稳定的 Safari 家族 navigator/screen 画像、针对 Canvas/WebGL/Audio 的增强隐私扰动，以及 WebRTC 泄露防护。默认 Profile 保留原生 WebKit 时区，并且不会在 GeoIP 刷新后重建正在使用的页面。只有用户显式选择指纹预设时，出口时区才会后台刷新并从下一次新建 WebView 起生效。
-
-## 构建
-
-Swift：
+### 方式二：从源码构建
 
 ```bash
-cd swift
+git clone https://github.com/GravityPoet/chatgpt-web-desktop.git
+cd chatgpt-web-desktop/swift
 ./packaging/make-app.sh
-./packaging/make-dmg.sh
 ```
 
-两个命令都会生成使用本机统一证书自签名的 universal 产物，并验收 Apple Silicon / Intel 两个 slice 的最低部署版本均为 macOS 12.0。
+构建好的通用架构应用位于 `dist/ChatGPT Swift.zip`。
 
-Tauri：
+## 适用人群与场景
 
-```bash
-cd tauri
-npm install
-npm run build
-npm run build:signed-dmg
-```
+- **开发者与算法工程师**：在独立、无干扰的桌面窗口中为架构设计、代码审查和复杂 Debug 调用最高推理强度。
+- **写作者与研究人员**：通过 Apple Notes 快速导入研究笔记，并在长篇回答生成时放心切换窗口，依靠后台通知获知完成状态。
+- **仍在 macOS 12 / 13 系统的用户**：无需升级整机系统即可畅享丝滑的 ChatGPT 原生桌面级体验。
+- **多账号与注重隐私的用户**：拥有独立的账号 Profile 与 Cookie 存储，杜绝浏览器追踪与数据混杂。
 
-## 状态
+## 仓库内实现路线
 
-- Swift wrapper：原生 macOS AppKit/WKWebView 路线；macOS 12+ 的 `arm64+x86_64` universal 交付、稳定的原生默认值，以及可选的每空间指纹控制和从下一次会话生效的 VPN 出口时区对齐。
-- Tauri wrapper：Rust/Tauri v2 跨平台桌面路线。
-- Cloak launcher：macOS 多账号路线；每账号隔离的 CloakBrowser profile、指纹种子、可选代理，以及由出口推导的 timezone/locale/WebRTC-IP，配一个 Dock 账号选择器。
-- 打包辅助：已包含 macOS app/DMG 辅助脚本；其他桌面目标可以沿用标准 Tauri build flow。
+- **`swift/`（macOS 主力推荐）**：基于 AppKit + WKWebView 的原生 macOS 封装，提供 `arm64 + x86_64` 通用二进制产物（推荐 Mac 用户直接使用）。
+- **`tauri/`（跨平台）**：基于 Rust + Tauri v2 的轻量跨平台桌面封装，面向 macOS、Windows 与 Linux 构建。
+- **`cloak/`（多账号隔离）**：面向多账号用户的独立启动器，通过每账号隔离的 Chromium Profile、指纹种子与出口时区推导实现账号环境隔离。
+
+## 隐私承诺与数据安全
+
+- **仅限本机存储**：Session 与 Cookie 均由 macOS 系统底层 WKWebView 安全沙盒保存在本机。
+- **零第三方服务器**：所有网络请求直接在你的电脑与 `chatgpt.com` 之间传输，无任何自建代理、无按键记录、无数据收集。
+- **官方 Cookie 偏好**：开箱即默认向 OpenAI 提交拒绝非必要追踪 Cookie 偏好。
 
 ## 免责声明
 
-这是非官方项目，不隶属于 OpenAI，也未获得 OpenAI 背书、认可或赞助。ChatGPT、OpenAI 及相关标识归 OpenAI 所有。本文中提到 ChatGPT 和 OpenAI，仅用于说明与官方 ChatGPT Web 的兼容性。
+本项目为独立开源项目，不隶属于 OpenAI，亦未获得 OpenAI 的认可、背书或赞助。ChatGPT、OpenAI 及相关标识均为 OpenAI 的注册商标。
+
+---
+
+<p align="center">
+  <strong>准备好升级你的 ChatGPT 桌面体验了吗？</strong><br><br>
+  <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg">
+    <img src="https://img.shields.io/badge/%E7%AB%8B%E5%8D%B3%E4%B8%8B%E8%BD%BD-ChatGPT.Swift.dmg%20(2.7MB)-007AFF?style=for-the-badge&logo=apple&logoColor=white" alt="下载 ChatGPT Swift DMG">
+  </a>
+</p>
