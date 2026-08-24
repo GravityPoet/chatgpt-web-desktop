@@ -444,7 +444,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 return
             }
 
-            let boundedCookies = Self.boundedCookiesForProfileTransfer(transferableCookies)
+            let boundedCookies = CookieImportParser.boundedCookiesForTransfer(transferableCookies)
             let skippedCount = transferableCookies.count - boundedCookies.count
             let boundedIdentities = Set(boundedCookies.map(CookieIdentity.init))
             let essentialSkipped = transferableCookies.contains { cookie in
@@ -1600,9 +1600,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             presentError("Cookie 导入失败：未发现关键 ChatGPT 登录 cookie。为避免请求头过大导致白屏，已拒绝导入低价值 cookie。")
             return
         }
-        let importedHeaderBytes = Self.cookieHeaderBytes(importableCookies)
-        guard importedHeaderBytes <= maximumChatGPTCookieHeaderBytes else {
-            presentError("Cookie 导入失败：关键登录 cookie 总大小超过 \(maximumChatGPTCookieHeaderBytes / 1024) KB，已拒绝写入以避免页面白屏。")
+        let importedHeaderBytes = CookieImportParser.cookieHeaderBytes(importableCookies)
+        guard CookieImportParser.essentialCookieHeaderIsWithinSafetyLimit(importableCookies) else {
+            presentError("Cookie 导入失败：关键登录 cookie 总大小超过 \(CookieImportParser.maximumEssentialCookieHeaderBytes / 1024) KB，已拒绝写入异常大的凭证文件。")
             return
         }
 
@@ -1674,6 +1674,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                         if prunedCount > 0 {
                             lines.append("已清理 \(prunedCount) 个低价值旧 cookie，避免请求头过大。")
                         }
+                        if importedHeaderBytes > CookieImportParser.preferredCookieHeaderBytes {
+                            lines.append("关键登录 cookie 总大小约 \(max(1, Int(ceil(Double(importedHeaderBytes) / 1024.0)))) KB，已保留完整登录分片；仅清理低价值旧 cookie。")
+                        }
 
                         if !missingCookies.isEmpty {
                             let names = missingCookies.prefix(8).map(\.name).joined(separator: ", ")
@@ -1707,8 +1710,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 finish(0)
                 return
             }
-            let headerBytes = Self.cookieHeaderBytes(storedCookies.filter(Self.isChatGPTRelatedCookie))
-            guard headerBytes > maximumChatGPTCookieHeaderBytes else {
+            let headerBytes = CookieImportParser.cookieHeaderBytes(storedCookies.filter(Self.isChatGPTRelatedCookie))
+            guard headerBytes > CookieImportParser.preferredCookieHeaderBytes else {
                 finish(0)
                 return
             }
@@ -1736,33 +1739,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private static func isChatGPTRelatedCookie(_ cookie: HTTPCookie) -> Bool {
         isAllowedCookieDomain(cookie.domain)
-    }
-
-    private static func boundedCookiesForProfileTransfer(_ cookies: [HTTPCookie]) -> [HTTPCookie] {
-        let prioritized = cookies.sorted { lhs, rhs in
-            let leftEssential = CookieImportParser.isEssentialCookieName(lhs.name)
-            let rightEssential = CookieImportParser.isEssentialCookieName(rhs.name)
-            if leftEssential != rightEssential {
-                return leftEssential && !rightEssential
-            }
-            return lhs.name < rhs.name
-        }
-        var selected: [HTTPCookie] = []
-        for cookie in prioritized {
-            guard cookie.value.utf8.count <= CookieImportParser.maximumCookieValueBytes,
-                  Self.cookieHeaderBytes(selected + [cookie]) <= maximumChatGPTCookieHeaderBytes else {
-                continue
-            }
-            selected.append(cookie)
-        }
-        return selected
-    }
-
-    private static func cookieHeaderBytes(_ cookies: [HTTPCookie]) -> Int {
-        cookies.enumerated().reduce(0) { total, item in
-            let (index, cookie) = item
-            return total + cookie.name.utf8.count + cookie.value.utf8.count + 1 + (index == 0 ? 0 : 2)
-        }
     }
 
     fileprivate static func isAllowedCookieDomain(_ domain: String) -> Bool {
