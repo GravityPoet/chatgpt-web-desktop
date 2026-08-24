@@ -72,7 +72,7 @@ Access the complete ChatGPT Web surface — model picker, deep thinking controls
 
 ### Option 1: Direct Download (Recommended)
 
-1. **Download** the latest [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg) (~2.7 MB).
+1. **Download** the latest [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg) (~2.7 MB) or visit the [Releases Page](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest) to inspect checksums and changelogs.
 2. Open the DMG and drag **ChatGPT Swift** into your `Applications` folder.
 3. Launch `ChatGPT Swift` and sign in with your OpenAI account.
 
