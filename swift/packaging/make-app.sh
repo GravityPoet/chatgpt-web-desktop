@@ -25,6 +25,10 @@ KEEP_TRANSIENT_APP="${CHATGPT_SWIFT_KEEP_TRANSIENT_APP:-0}"
 EXPECTED_SPARKLE_VERSION="2.9.6"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 VERIFY_ROOT=""
+CI_LOCAL_KEYCHAIN=""
+if [[ "${GITHUB_ACTIONS:-}" == "true" && -z "${CHATGPT_RUST_CODESIGN_KEYCHAIN:-}" ]]; then
+  CI_LOCAL_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/chatgpt-rust-local-signing.keychain-db"
+fi
 
 unregister_app_bundle() {
   app_bundle="$1"
@@ -34,6 +38,12 @@ unregister_app_bundle() {
     done < <(find "$app_bundle/Contents" -type d -name '*.app' -prune -print0 2>/dev/null)
   fi
   "$LSREGISTER" -u "$app_bundle" >/dev/null 2>&1 || true
+}
+
+cleanup_ci_keychain() {
+  if [[ -n "$CI_LOCAL_KEYCHAIN" ]]; then
+    /usr/bin/security delete-keychain "$CI_LOCAL_KEYCHAIN" >/dev/null 2>&1 || true
+  fi
 }
 
 cleanup_failed_build() {
@@ -48,6 +58,7 @@ cleanup_failed_build() {
     rm -f "$ARCHIVE_TMP"
     rm -f "$ROOT/dist/.metadata_never_index"
   fi
+  cleanup_ci_keychain
   exit "$status"
 }
 trap cleanup_failed_build EXIT
@@ -190,6 +201,7 @@ fi
 "$ROOT/packaging/verify-app-bundle.sh" "$APP_DIR" "$SIGNING_DISTRIBUTION" >/dev/null
 
 if [[ "$KEEP_TRANSIENT_APP" == "1" ]]; then
+  cleanup_ci_keychain
   trap - EXIT INT TERM
   echo "$APP_DIR"
   exit 0
@@ -210,5 +222,6 @@ mv -f "$ARCHIVE_TMP" "$ARCHIVE"
 unregister_app_bundle "$APP_DIR"
 rm -rf "$APP_DIR"
 rm -f "$ROOT/dist/.metadata_never_index"
+cleanup_ci_keychain
 trap - EXIT INT TERM
 echo "$ARCHIVE"

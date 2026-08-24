@@ -7,7 +7,7 @@ final class AppSettingsWindowControllerTests: XCTestCase {
     func testSettingsContentRemainsReachableWhenItExceedsWindowHeight() {
         let controller = AppSettingsWindowController(
             state: AppSettingsState(
-                appVersion: "0.1.3 (3)",
+                appVersion: "0.1.4 (4)",
                 currentProfileName: String(repeating: "很长的账号空间名称", count: 8),
                 startupProfileName: "默认",
                 homepage: "https://chatgpt.com/" + String(repeating: "long-path/", count: 20),
