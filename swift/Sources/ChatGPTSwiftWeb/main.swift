@@ -24,7 +24,6 @@ let maximumWebZoom: CGFloat = 1.40
 let webZoomStep: CGFloat = 0.05
 let maximumCookieImportBytes = 2 * 1024 * 1024
 let maximumProfileImportBytes = 1 * 1024 * 1024
-let maximumChatGPTCookieHeaderBytes = 6 * 1024
 let maximumBridgeDownloadBytes = 64 * 1024 * 1024
 let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
 let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"

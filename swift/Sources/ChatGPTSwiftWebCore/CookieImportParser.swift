@@ -8,7 +8,62 @@ public enum CookieImportParser {
     public static let maximumCookieValueBytes = 64 * 1024
     public static let maximumCookieDomainBytes = 255
     public static let maximumCookiePathBytes = 4096
+    /// A soft budget used when adding non-essential cookies. Login cookies may be
+    /// split across several session-token cookies and must not be dropped merely
+    /// because their combined header is larger than this target.
+    public static let preferredCookieHeaderBytes = 6 * 1024
+    /// A hard safety ceiling for the complete essential-cookie set accepted from
+    /// an import. This prevents pathological files from filling a WebKit request
+    /// header while allowing normal multi-part ChatGPT session tokens.
+    public static let maximumEssentialCookieHeaderBytes = 64 * 1024
     private static let defaultHeaderCookieImportDomain = ".chatgpt.com"
+
+    public static func cookieHeaderBytes(_ cookies: [HTTPCookie]) -> Int {
+        cookies.enumerated().reduce(0) { total, item in
+            let (index, cookie) = item
+            return total + cookie.name.utf8.count + cookie.value.utf8.count + 1 + (index == 0 ? 0 : 2)
+        }
+    }
+
+    /// Keep every essential cookie, even when the soft header budget is exceeded,
+    /// and use the budget only to bound lower-value cookies during profile copies.
+    public static func boundedCookiesForTransfer(_ cookies: [HTTPCookie]) -> [HTTPCookie] {
+        let prioritized = cookies.sorted { lhs, rhs in
+            let leftEssential = isEssentialCookieName(lhs.name)
+            let rightEssential = isEssentialCookieName(rhs.name)
+            if leftEssential != rightEssential {
+                return leftEssential && !rightEssential
+            }
+            if lhs.name != rhs.name {
+                return lhs.name < rhs.name
+            }
+            if lhs.domain != rhs.domain {
+                return lhs.domain < rhs.domain
+            }
+            return lhs.path < rhs.path
+        }
+
+        var selected: [HTTPCookie] = []
+        for cookie in prioritized {
+            guard cookie.value.utf8.count <= maximumCookieValueBytes else {
+                continue
+            }
+            let candidateHeaderBytes = cookieHeaderBytes(selected + [cookie])
+            if isEssentialCookieName(cookie.name) {
+                guard candidateHeaderBytes <= maximumEssentialCookieHeaderBytes else {
+                    continue
+                }
+            } else if candidateHeaderBytes > preferredCookieHeaderBytes {
+                continue
+            }
+            selected.append(cookie)
+        }
+        return selected
+    }
+
+    public static func essentialCookieHeaderIsWithinSafetyLimit(_ cookies: [HTTPCookie]) -> Bool {
+        cookieHeaderBytes(cookies) <= maximumEssentialCookieHeaderBytes
+    }
 
     public static func parse(data: Data) throws -> [HTTPCookie] {
         guard data.count <= maximumImportBytes else {

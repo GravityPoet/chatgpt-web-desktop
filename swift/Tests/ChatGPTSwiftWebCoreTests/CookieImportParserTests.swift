@@ -3,6 +3,16 @@ import XCTest
 @testable import ChatGPTSwiftWebCore
 
 final class CookieImportParserTests: XCTestCase {
+    private func makeCookie(name: String, valueLength: Int, domain: String = ".chatgpt.com") throws -> HTTPCookie {
+        try XCTUnwrap(HTTPCookie(properties: [
+            .domain: domain,
+            .name: name,
+            .path: "/",
+            .value: String(repeating: "x", count: valueLength),
+            .secure: "TRUE",
+        ]))
+    }
+
     func testParsesHeaderCookiePairsWithDefaultChatGPTDomain() throws {
         let cookies = try CookieImportParser.parse(data: Data("Cookie: cf_clearance=clear; oai-sc=scope".utf8))
 
@@ -75,5 +85,37 @@ final class CookieImportParserTests: XCTestCase {
         XCTAssertThrowsError(try CookieImportParser.parse(data: Data("session=ok\u{0001}".utf8))) { error in
             XCTAssertTrue(CookieImportParser.safeMessage(error).contains("控制字符"))
         }
+    }
+
+    func testEssentialSessionCookieShardsMayExceedSoftHeaderBudget() throws {
+        let sessionZero = try makeCookie(name: "__Secure-next-auth.session-token.0", valueLength: 3_500)
+        let sessionOne = try makeCookie(name: "__Secure-next-auth.session-token.1", valueLength: 3_500)
+        let nonEssential = try makeCookie(name: "_ga", valueLength: 20)
+        let essential = [sessionZero, sessionOne]
+
+        XCTAssertGreaterThan(
+            CookieImportParser.cookieHeaderBytes(essential),
+            CookieImportParser.preferredCookieHeaderBytes
+        )
+        XCTAssertTrue(CookieImportParser.essentialCookieHeaderIsWithinSafetyLimit(essential))
+
+        let bounded = CookieImportParser.boundedCookiesForTransfer([nonEssential, sessionOne, sessionZero])
+        XCTAssertEqual(
+            bounded.map(\.name),
+            ["__Secure-next-auth.session-token.0", "__Secure-next-auth.session-token.1"]
+        )
+    }
+
+    func testRejectsPathologicallyLargeEssentialCookieHeader() throws {
+        let oversizedSessionSet = try (0..<20).map { index in
+            try makeCookie(
+                name: "__Secure-next-auth.session-token.\(index)",
+                valueLength: 3_500
+            )
+        }
+
+        XCTAssertFalse(
+            CookieImportParser.essentialCookieHeaderIsWithinSafetyLimit(oversizedSessionSet)
+        )
     }
 }
