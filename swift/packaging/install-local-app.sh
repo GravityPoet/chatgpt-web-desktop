@@ -21,8 +21,9 @@ STAGE_APP="/Applications/.ChatGPT-Swift-stage-$$"
 DISPLACED_APP="/Applications/.ChatGPT-Swift-displaced-$$"
 VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt-swift-install-verify.XXXXXX")"
 SPARKLE_GENERATE_APPCAST_CACHE="$HOME/Library/Caches/Sparkle_generate_appcast"
-REPLACEMENT_STARTED=0
 HAD_PREVIOUS=0
+DISPLACED_READY=0
+INSTALL_REPLACED=0
 
 unregister_app_bundle() {
   app_bundle="$1"
@@ -56,16 +57,32 @@ remove_cached_product_apps() {
   done < <(find "$SPARKLE_GENERATE_APPCAST_CACHE" -type d -name "$APP_NAME.app" -prune -print0 2>/dev/null)
 }
 
+stop_canonical_process() {
+  /usr/bin/osascript -e 'tell application id "local.chatgpt-web.swift" to quit' >/dev/null 2>&1 || true
+  for _ in {1..5}; do
+    if ! /usr/bin/pgrep -f "$PROCESS_PATTERN" >/dev/null; then
+      return 0
+    fi
+    /bin/sleep 1
+  done
+  /usr/bin/pkill -TERM -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+  /bin/sleep 1
+  /usr/bin/pkill -KILL -f "$PROCESS_PATTERN" >/dev/null 2>&1 || true
+}
+
 cleanup_or_rollback() {
   status=$?
   trap - EXIT INT TERM
   unregister_app_bundle "$APP_DIR"
   rm -rf "$APP_DIR" "$STAGE_APP" "$VERIFY_ROOT"
   rm -f "$ROOT/dist/.metadata_never_index"
-  if [[ "$status" -ne 0 && "$REPLACEMENT_STARTED" -eq 1 ]]; then
-    unregister_app_bundle "$INSTALL_APP"
-    rm -rf "$INSTALL_APP"
-    if [[ "$HAD_PREVIOUS" -eq 1 && -d "$DISPLACED_APP" ]]; then
+  if [[ "$status" -ne 0 ]]; then
+    if [[ "$INSTALL_REPLACED" -eq 1 ]]; then
+      stop_canonical_process
+      unregister_app_bundle "$INSTALL_APP"
+      rm -rf "$INSTALL_APP"
+    fi
+    if [[ "$DISPLACED_READY" -eq 1 && -d "$DISPLACED_APP" && ! -e "$INSTALL_APP" ]]; then
       mv "$DISPLACED_APP" "$INSTALL_APP"
       "$LSREGISTER" -f "$INSTALL_APP" >/dev/null 2>&1 || true
       /usr/bin/open "$INSTALL_APP" >/dev/null 2>&1 || true
@@ -114,12 +131,13 @@ if /usr/bin/pgrep -f "$PROCESS_PATTERN" >/dev/null; then
   exit 1
 fi
 
-REPLACEMENT_STARTED=1
 if [[ "$HAD_PREVIOUS" -eq 1 ]]; then
   "$LSREGISTER" -u "$INSTALL_APP" >/dev/null 2>&1 || true
   mv "$INSTALL_APP" "$DISPLACED_APP"
+  DISPLACED_READY=1
 fi
 mv "$STAGE_APP" "$INSTALL_APP"
+INSTALL_REPLACED=1
 "$ROOT/packaging/verify-app-bundle.sh" "$INSTALL_APP" >/dev/null
 "$LSREGISTER" -f "$INSTALL_APP" >/dev/null 2>&1 || true
 /usr/bin/mdimport "$INSTALL_APP" >/dev/null 2>&1 || true
@@ -245,7 +263,8 @@ if [[ -n "$dock_paths" && "$dock_paths" != "$INSTALL_APP" ]]; then
 fi
 
 rm -rf "$DISPLACED_APP"
-REPLACEMENT_STARTED=0
+DISPLACED_READY=0
+INSTALL_REPLACED=0
 trap - EXIT INT TERM
 printf 'INSTALLED_APP=%s\n' "$INSTALL_APP"
 if [[ -f "$BACKUP_ZIP" ]]; then

@@ -39,17 +39,85 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: swift-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
 jobs:
-  release:
-    name: Build and publish Swift macOS app
-    runs-on: macos-latest
+  intel-validation:
+    name: Validate Swift app on Intel
+    runs-on: macos-15-intel
+    permissions:
+      contents: read
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     defaults:
       run:
         working-directory: swift
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record Intel runner and toolchain
+        run: |
+          uname -a
+          uname -m
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+          test "$(uname -m)" = "x86_64"
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version | grep -q '^Xcode 16\.4'
+
+      - name: Build Intel release configuration
+        run: swift build -c release --arch x86_64
+
+      - name: Run Intel Swift tests
+        run: swift test --arch x86_64
+
+      - name: Run Intel strict-concurrency tests
+        run: swift test --arch x86_64 -Xswiftc -strict-concurrency=complete
+
+      - name: Smoke-test the native Intel app slice
+        env:
+          CHATGPT_SWIFT_SMOKE_ARCH: x86_64
+        run: ./script/build_and_run.sh --verify
+
+  release:
+    name: Build and publish Swift macOS app
+    needs: intel-validation
+    runs-on: macos-15
+    permissions:
+      contents: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        working-directory: swift
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record arm64 runner and toolchain
+        run: |
+          uname -a
+          uname -m
+          sw_vers
+          xcode-select -p
+          xcodebuild -version
+          swift --version
+          xcrun --sdk macosx --show-sdk-version
+          test "$(uname -m)" = "arm64"
+          test -d "$DEVELOPER_DIR"
+          xcodebuild -version | grep -q '^Xcode 16\.4'
 
       - name: Prepare release version
         env:
@@ -69,6 +137,38 @@ jobs:
             echo "CHATGPT_SWIFT_BUILD_NUMBER=$RUN_ID"
           } >>"$GITHUB_ENV"
 
+      - name: Validate tag target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          tag_error_file="$(mktemp -t chatgpt-swift-tag-error.XXXXXX)"
+          if tag_ref="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>"$tag_error_file")"; then
+            rm -f "$tag_error_file"
+            tag_type="$(jq -r '.object.type' <<<"$tag_ref")"
+            tag_sha="$(jq -r '.object.sha' <<<"$tag_ref")"
+            while [[ "$tag_type" == "tag" ]]; do
+              tag_object="$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha")"
+              tag_type="$(jq -r '.object.type' <<<"$tag_object")"
+              tag_sha="$(jq -r '.object.sha' <<<"$tag_object")"
+            done
+            if [[ "$tag_type" != "commit" || "$tag_sha" != "$GITHUB_SHA" ]]; then
+              echo "error: existing tag $TAG points to $tag_sha, but this run builds $GITHUB_SHA" >&2
+              exit 2
+            fi
+            echo "existing tag $TAG points to this commit: $GITHUB_SHA"
+          else
+            if grep -Eiq '(^|[^0-9])404([^0-9]|$)|not found|tag not found' "$tag_error_file"; then
+              rm -f "$tag_error_file"
+              echo "tag $TAG does not exist; a new tag will be created at $GITHUB_SHA"
+            else
+              cat "$tag_error_file" >&2
+              rm -f "$tag_error_file"
+              echo "error: unable to verify whether tag $TAG exists" >&2
+              exit 2
+            fi
+          fi
+
       - name: Validate release prerequisites
         env:
           CHATGPT_SWIFT_DISTRIBUTION: ${{ inputs.distribution }}
@@ -84,6 +184,10 @@ jobs:
         run: |
           sparkle="off"
           if [[ "$CHATGPT_SWIFT_ENABLE_SPARKLE" == "true" ]]; then
+            if [[ "$CHATGPT_SWIFT_DISTRIBUTION" != "developer-id" ]]; then
+              echo "error: Sparkle requires a stable Developer ID signature in CI; choose distribution=developer-id." >&2
+              exit 2
+            fi
             sparkle="on"
           fi
           ./packaging/check-release-readiness.sh --env --distribution "$CHATGPT_SWIFT_DISTRIBUTION" --sparkle "$sparkle"
@@ -103,7 +207,7 @@ jobs:
       - name: Smoke-test the real app bundle
         run: ./script/build_and_run.sh --verify
 
-      - name: Smoke-test the Intel slice through Rosetta
+      - name: Smoke-test the universal Intel slice through Rosetta
         run: ./script/build_and_run.sh --verify-x86_64
 
       - name: Import Developer ID certificate
@@ -169,7 +273,7 @@ jobs:
           mounted=1
           app_path="$verify_mount/ChatGPT Swift.app"
           test -d "$app_path"
-          ./packaging/verify-app-bundle.sh "$app_path"
+          ./packaging/verify-app-bundle.sh "$app_path" "$DISTRIBUTION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_SHORT_VERSION"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$CHATGPT_SWIFT_BUILD_NUMBER"
           if [[ "$DISTRIBUTION" == "developer-id" ]]; then
@@ -210,7 +314,9 @@ jobs:
             assets+=("$appcast_path")
           fi
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          release_error_file="$(mktemp -t chatgpt-swift-release-error.XXXXXX)"
+          if gh release view "$TAG" >/dev/null 2>"$release_error_file"; then
+            rm -f "$release_error_file"
             tag_sha="$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq .sha)"
             if [[ "$tag_sha" != "$GITHUB_SHA" ]]; then
               echo "error: existing release tag $TAG points to $tag_sha, but this run built $GITHUB_SHA" >&2
@@ -221,9 +327,29 @@ jobs:
               echo "error: refusing to replace assets on published release $TAG; create a new version instead" >&2
               exit 2
             fi
+            if [[ "$ENABLE_SPARKLE" != "true" ]]; then
+              # A draft may have been created by an earlier Sparkle-enabled run. Do not publish a
+              # stale appcast when this rerun intentionally disables Sparkle.
+              asset_names="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+              if printf '%s\n' "$asset_names" | grep -Fxq 'appcast.xml'; then
+                gh release delete-asset "$TAG" appcast.xml --yes
+                asset_names="$(gh release view "$TAG" --json assets --jq '.assets[].name')"
+                if printf '%s\n' "$asset_names" | grep -Fxq 'appcast.xml'; then
+                  echo "error: stale appcast.xml remains on release $TAG" >&2
+                  exit 2
+                fi
+              fi
+            fi
             gh release upload "$TAG" "${assets[@]}" --clobber
             gh release edit "$TAG" --draft="$DRAFT" --prerelease="$PRERELEASE" --target "$GITHUB_SHA" --title "$title"
             exit 0
+          elif grep -Eiq '(^|[^0-9])404([^0-9]|$)|not found|release not found' "$release_error_file"; then
+            rm -f "$release_error_file"
+          else
+            cat "$release_error_file" >&2
+            rm -f "$release_error_file"
+            echo "error: unable to determine whether release $TAG exists" >&2
+            exit 2
           fi
 
           release_args=(--title "$title" --generate-notes)

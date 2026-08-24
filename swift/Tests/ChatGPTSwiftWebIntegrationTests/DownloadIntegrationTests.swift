@@ -150,6 +150,99 @@ final class DownloadIntegrationTests: XCTestCase {
         assertLoadError(try XCTUnwrap(resultBox.value), equals: .invalidURL)
     }
 
+    func testRemoteImageLoaderRejectsLoopbackLiteralSource() throws {
+        let result = try loadRemoteImage(
+            sourceURL: URL(string: "https://127.0.0.1/valid")!
+        )
+
+        assertLoadError(result, equals: .blockedAddress)
+        XCTAssertNil(RemoteImageTestURLProtocol.recordedRequest(for: "/valid"))
+    }
+
+    func testRemoteImageLoaderRejectsIPv4MappedPrivateLiteralSource() throws {
+        let result = try loadRemoteImage(
+            sourceURL: URL(string: "https://[::ffff:192.168.1.2]/valid")!
+        )
+
+        assertLoadError(result, equals: .blockedAddress)
+        XCTAssertNil(RemoteImageTestURLProtocol.recordedRequest(for: "/valid"))
+    }
+
+    func testRemoteImageLoaderRejectsSpecialUseLiteralSources() throws {
+        let blockedURLs = [
+            "https://0.0.0.0/valid",
+            "https://192.0.2.1/valid",
+            "https://192.88.99.1/valid",
+            "https://198.18.0.1/valid",
+            "https://198.19.0.1/valid",
+            "https://198.51.100.1/valid",
+            "https://169.254.169.254/valid",
+            "https://203.0.113.1/valid",
+            "https://224.0.0.1/valid",
+            "https://[::]/valid",
+            "https://[fe80::1]/valid",
+            "https://[fd00::1]/valid",
+            "https://[ff02::1]/valid",
+        ]
+
+        for rawURL in blockedURLs {
+            let result = try loadRemoteImage(sourceURL: URL(string: rawURL)!)
+            assertLoadError(result, equals: .blockedAddress, file: #filePath, line: #line)
+        }
+    }
+
+    func testRemoteImageLoaderRejectsPrivateDNSResolutionBeforeRequest() throws {
+        let privateHost = "private-resolution.test"
+        let result = try loadRemoteImage(
+            sourceURL: URL(string: "https://\(privateHost)/valid")!,
+            hostResolver: { host in
+                XCTAssertEqual(host, privateHost)
+                return ["10.0.0.8"]
+            }
+        )
+
+        assertLoadError(result, equals: .blockedAddress)
+        XCTAssertNil(RemoteImageTestURLProtocol.recordedRequest(for: "/valid"))
+    }
+
+    func testRemoteImageLoaderRejectsPrivateRedirectTarget() throws {
+        let privateHost = "private-redirect.test"
+        let result = try loadRemoteImage(
+            path: "/redirect-to-private-host",
+            hostResolver: { host in
+                if host == "remote-image.test" {
+                    return ["93.184.216.34"]
+                }
+                XCTAssertEqual(host, privateHost)
+                return ["192.168.10.20"]
+            }
+        )
+
+        assertLoadError(result, equals: .blockedAddress)
+        XCTAssertNotNil(RemoteImageTestURLProtocol.recordedRequest(for: "/redirect-to-private-host"))
+        XCTAssertNil(RemoteImageTestURLProtocol.recordedRequest(for: "/final"))
+    }
+
+    func testRemoteImageLoaderRechecksDNSOnRedirectToPreventRebinding() throws {
+        let resolver = SequencedRemoteImageResolver(addresses: [
+            ["93.184.216.34"],
+            ["93.184.216.34"],
+            ["10.0.0.9"],
+        ])
+        let result = try loadRemoteImage(
+            path: "/redirect-same-host",
+            hostResolver: { host in
+                XCTAssertEqual(host, "remote-image.test")
+                return resolver.resolve()
+            }
+        )
+
+        assertLoadError(result, equals: .blockedAddress)
+        XCTAssertNotNil(RemoteImageTestURLProtocol.recordedRequest(for: "/redirect-same-host"))
+        XCTAssertNil(RemoteImageTestURLProtocol.recordedRequest(for: "/final"))
+        XCTAssertGreaterThanOrEqual(resolver.callCount, 3)
+    }
+
     func testStaleRemoteImageTemporaryFilesAreRemovedWithoutTouchingFreshFiles() throws {
         let root = temporaryTestDirectory()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -183,19 +276,42 @@ final class DownloadIntegrationTests: XCTestCase {
         assertLoadError(result, equals: .unsupportedMIMEType("text/html"))
     }
 
+    func testRemoteImageLoaderRejectsSVGToAvoidExternalResourceParsing() throws {
+        let result = try loadRemoteImage(path: "/svg-image", maximumBytes: 1024)
+        assertLoadError(result, equals: .unsupportedMIMEType("image/svg+xml"))
+    }
+
     private func loadRemoteImage(
         path: String,
-        maximumBytes: Int,
+        maximumBytes: Int = 64,
         configuration: URLSessionConfiguration? = nil,
-        temporaryDirectory: URL? = nil
+        temporaryDirectory: URL? = nil,
+        hostResolver: @escaping RemoteImageHostResolver = { _ in ["93.184.216.34"] }
     ) throws -> Result<RemoteImageFile, Error> {
-        let completionExpectation = expectation(description: "remote image load \(path)")
-        let resultBox = RemoteImageResultBox()
-        let loader = RemoteImageLoader(
+        try loadRemoteImage(
             sourceURL: URL(string: "https://remote-image.test\(path)")!,
             maximumBytes: maximumBytes,
+            configuration: configuration,
+            temporaryDirectory: temporaryDirectory,
+            hostResolver: hostResolver
+        )
+    }
+
+    private func loadRemoteImage(
+        sourceURL: URL,
+        maximumBytes: Int = 64,
+        configuration: URLSessionConfiguration? = nil,
+        temporaryDirectory: URL? = nil,
+        hostResolver: @escaping RemoteImageHostResolver = { _ in ["93.184.216.34"] }
+    ) throws -> Result<RemoteImageFile, Error> {
+        let completionExpectation = expectation(description: "remote image load \(sourceURL.absoluteString)")
+        let resultBox = RemoteImageResultBox()
+        let loader = RemoteImageLoader(
+            sourceURL: sourceURL,
+            maximumBytes: maximumBytes,
             configuration: configuration ?? testSessionConfiguration(),
-            temporaryDirectory: temporaryDirectory ?? temporaryTestDirectory()
+            temporaryDirectory: temporaryDirectory ?? temporaryTestDirectory(),
+            hostResolver: hostResolver
         ) { result in
             resultBox.store(result)
             completionExpectation.fulfill()
@@ -230,6 +346,26 @@ final class DownloadIntegrationTests: XCTestCase {
     }
 }
 
+private final class SequencedRemoteImageResolver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var addresses: [[String]]
+    private(set) var callCount = 0
+
+    init(addresses: [[String]]) {
+        self.addresses = addresses
+    }
+
+    func resolve() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        callCount += 1
+        if addresses.count > 1 {
+            return addresses.removeFirst()
+        }
+        return addresses.first ?? []
+    }
+}
+
 private final class RemoteImageResultBox: @unchecked Sendable {
     private let lock = NSLock()
     private var storedValue: Result<RemoteImageFile, Error>?
@@ -251,10 +387,15 @@ private final class RemoteImageTestURLProtocol: URLProtocol {
     static let validImageData = Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
 
     private static let lock = NSLock()
-    private static var requestsByPath: [String: URLRequest] = [:]
+    // URLProtocol callbacks arrive on a URLSession delegate queue; all accesses are protected by
+    // `lock`, so make the synchronization boundary explicit to Swift's strict-concurrency checker.
+    nonisolated(unsafe) private static var requestsByPath: [String: URLRequest] = [:]
 
     override class func canInit(with request: URLRequest) -> Bool {
-        request.url?.host == "remote-image.test"
+        guard let host = request.url?.host else {
+            return false
+        }
+        return host == "remote-image.test" || host == "private-redirect.test"
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest {
@@ -298,6 +439,23 @@ private final class RemoteImageTestURLProtocol: URLProtocol {
         case "/not-image":
             response = makeResponse(url: url, statusCode: 200, headers: ["Content-Type": "text/html"])
             chunks = [Data("<html></html>".utf8)]
+        case "/svg-image":
+            response = makeResponse(url: url, statusCode: 200, headers: ["Content-Type": "image/svg+xml"])
+            chunks = [Data("<svg></svg>".utf8)]
+        case "/redirect-to-private-host":
+            response = makeResponse(
+                url: url,
+                statusCode: 302,
+                headers: ["Location": "https://private-redirect.test/final"]
+            )
+            chunks = []
+        case "/redirect-same-host":
+            response = makeResponse(
+                url: url,
+                statusCode: 302,
+                headers: ["Location": "https://remote-image.test/final"]
+            )
+            chunks = []
         default:
             response = makeResponse(url: url, statusCode: 500, headers: ["Content-Type": "text/plain"])
             chunks = []

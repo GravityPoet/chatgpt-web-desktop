@@ -3,7 +3,8 @@ import WebKit
 
 extension BrowserWindowController {
     func focusPromptComposer(completion: ((String?) -> Void)? = nil) {
-        guard Self.canInjectPromptContent(into: webView.url) else {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              Self.canInjectPromptContent(into: webView.url) else {
             completion?("请先打开 ChatGPT 页面")
             return
         }
@@ -13,7 +14,8 @@ extension BrowserWindowController {
     }
 
     func insertTextIntoPrompt(_ text: String, completion: @escaping (String?) -> Void) {
-        guard Self.canInjectPromptContent(into: webView.url) else {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              Self.canInjectPromptContent(into: webView.url) else {
             completion("为保护本机内容，只能向 ChatGPT 页面插入文本")
             return
         }
@@ -33,12 +35,17 @@ extension BrowserWindowController {
         attemptsRemaining: Int,
         completion: @escaping (String?) -> Void
     ) {
-        guard Self.canInjectPromptContent(into: webView.url) else {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              Self.canInjectPromptContent(into: webView.url) else {
             completion("页面已经离开 ChatGPT，已取消插入")
             return
         }
         webView.evaluateJavaScript(Self.insertPromptTextScript(text: text)) { [weak self] result, error in
             guard let self else {
+                return
+            }
+            guard !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                completion("空间正在清理，已取消插入")
                 return
             }
             if let error {
@@ -69,13 +76,18 @@ extension BrowserWindowController {
     }
 
     private func focusPromptComposer(attemptsRemaining: Int, completion: ((String?) -> Void)? = nil) {
-        guard Self.canInjectPromptContent(into: webView.url) else {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              Self.canInjectPromptContent(into: webView.url) else {
             setStatus("请先打开 ChatGPT 页面", showsProgress: false)
             completion?("请先打开 ChatGPT 页面")
             return
         }
         webView.evaluateJavaScript(Self.focusPromptComposerScript) { [weak self] result, error in
             guard let self else {
+                return
+            }
+            guard !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                completion?("空间正在清理，已取消聚焦")
                 return
             }
             if let error {

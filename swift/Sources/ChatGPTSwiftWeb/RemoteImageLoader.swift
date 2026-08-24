@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct RemoteImageFile {
@@ -8,6 +9,8 @@ struct RemoteImageFile {
 
 enum RemoteImageLoadError: LocalizedError, Equatable {
     case invalidURL
+    case blockedAddress
+    case dnsResolutionFailed
     case invalidResponse
     case invalidRedirect
     case httpStatus(Int)
@@ -21,6 +24,10 @@ enum RemoteImageLoadError: LocalizedError, Equatable {
         switch self {
         case .invalidURL:
             return "图像地址必须是 HTTPS URL。"
+        case .blockedAddress:
+            return "为避免访问本机或内网地址，已阻止此图像请求。"
+        case .dnsResolutionFailed:
+            return "无法安全解析图像服务器地址。"
         case .invalidResponse:
             return "服务器没有返回有效的 HTTP 响应。"
         case .invalidRedirect:
@@ -44,6 +51,12 @@ enum RemoteImageLoadError: LocalizedError, Equatable {
     }
 }
 
+/// A resolver seam keeps SSRF checks deterministic in integration tests while production uses
+/// the system resolver. Every hostname is resolved again before following a redirect and before
+/// accepting a response, which reduces DNS-rebinding exposure. URLSession may resolve again when
+/// it opens the connection, so this is defense-in-depth rather than an absolute IP pin.
+typealias RemoteImageHostResolver = @Sendable (String) throws -> [String]
+
 /// Streams a single remote image into a bounded temporary file.
 ///
 /// The loader deliberately uses an isolated session with cookie and credential stores disabled.
@@ -58,6 +71,7 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
     private let completion: Completion
     private let temporaryDirectory: URL
     private let sessionConfiguration: URLSessionConfiguration
+    private let hostResolver: RemoteImageHostResolver
     private let delegateQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "ChatGPTSwiftWeb.RemoteImageLoader"
@@ -78,12 +92,14 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         maximumBytes: Int,
         configuration: URLSessionConfiguration = .ephemeral,
         temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        hostResolver: @escaping RemoteImageHostResolver = RemoteImageLoader.defaultHostResolver,
         completion: @escaping Completion
     ) {
         precondition(maximumBytes > 0)
         self.sourceURL = sourceURL
         self.maximumBytes = maximumBytes
         self.temporaryDirectory = temporaryDirectory
+        self.hostResolver = hostResolver
         self.completion = completion
 
         configuration.httpCookieStorage = nil
@@ -96,28 +112,31 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
     }
 
     func start() {
-        guard session == nil, !isFinished else {
-            return
+        delegateQueue.addOperation { [weak self] in
+            guard let self, self.session == nil, !self.isFinished else {
+                return
+            }
+
+            guard let validationError = self.validationError(for: self.sourceURL, isRedirect: false) else {
+                var request = URLRequest(url: self.sourceURL)
+                request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+                request.httpShouldHandleCookies = false
+                request.setValue(nil, forHTTPHeaderField: "Cookie")
+
+                let session = URLSession(
+                    configuration: self.sessionConfiguration,
+                    delegate: self,
+                    delegateQueue: self.delegateQueue
+                )
+                self.session = session
+                let task = session.dataTask(with: request)
+                self.dataTask = task
+                task.resume()
+                return
+            }
+
+            self.finish(.failure(validationError))
         }
-
-        guard sourceURL.scheme?.caseInsensitiveCompare("https") == .orderedSame,
-              sourceURL.host?.isEmpty == false,
-              sourceURL.user == nil,
-              sourceURL.password == nil else {
-            finish(.failure(RemoteImageLoadError.invalidURL))
-            return
-        }
-
-        var request = URLRequest(url: sourceURL)
-        request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.httpShouldHandleCookies = false
-        request.setValue(nil, forHTTPHeaderField: "Cookie")
-
-        let session = URLSession(configuration: sessionConfiguration, delegate: self, delegateQueue: delegateQueue)
-        self.session = session
-        let task = session.dataTask(with: request)
-        dataTask = task
-        task.resume()
     }
 
     func cancel() {
@@ -174,6 +193,30 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
             return
         }
 
+        if let validationError = validationError(for: httpResponse.url, isRedirect: false) {
+            completionHandler(.cancel)
+            finish(.failure(validationError))
+            return
+        }
+
+        let redirectStatusCodes: Set<Int> = [301, 302, 303, 307, 308]
+        if redirectStatusCodes.contains(httpResponse.statusCode) {
+            guard let location = httpResponse.value(forHTTPHeaderField: "Location"),
+                  let responseURL = httpResponse.url,
+                  let redirectURL = URL(string: location, relativeTo: responseURL)?.absoluteURL else {
+                completionHandler(.cancel)
+                finish(.failure(RemoteImageLoadError.invalidRedirect))
+                return
+            }
+            if let validationError = validationError(for: redirectURL, isRedirect: true) {
+                completionHandler(.cancel)
+                finish(.failure(validationError))
+                return
+            }
+            completionHandler(.allow)
+            return
+        }
+
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
             completionHandler(.cancel)
             finish(.failure(RemoteImageLoadError.httpStatus(httpResponse.statusCode)))
@@ -183,7 +226,8 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         let normalizedMIMEType = httpResponse.mimeType?.lowercased()
         guard let normalizedMIMEType,
               normalizedMIMEType.hasPrefix("image/"),
-              normalizedMIMEType.count > "image/".count else {
+              normalizedMIMEType.count > "image/".count,
+              normalizedMIMEType != "image/svg+xml" else {
             completionHandler(.cancel)
             finish(.failure(RemoteImageLoadError.unsupportedMIMEType(httpResponse.mimeType)))
             return
@@ -287,12 +331,15 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         willPerformHTTPRedirection newRequest: URLRequest,
         completionHandler: @escaping (URLRequest?) -> Void
     ) {
-        guard let redirectURL = newRequest.url,
-              redirectURL.scheme?.lowercased() == "https",
-              redirectURL.user == nil,
-              redirectURL.password == nil else {
+        guard let redirectURL = newRequest.url else {
             completionHandler(nil)
             finish(.failure(RemoteImageLoadError.invalidRedirect))
+            return
+        }
+
+        if let validationError = validationError(for: redirectURL, isRedirect: true) {
+            completionHandler(nil)
+            finish(.failure(validationError))
             return
         }
 
@@ -300,6 +347,39 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         sanitizedRequest.httpShouldHandleCookies = false
         sanitizedRequest.setValue(nil, forHTTPHeaderField: "Cookie")
         completionHandler(sanitizedRequest)
+    }
+
+    private func validationError(for url: URL?, isRedirect: Bool) -> RemoteImageLoadError? {
+        guard let url,
+              url.scheme?.caseInsensitiveCompare("https") == .orderedSame,
+              let host = url.host,
+              !host.isEmpty,
+              url.user == nil,
+              url.password == nil else {
+            return isRedirect ? .invalidRedirect : .invalidURL
+        }
+
+        if let endpoint = Self.parseIPAddress(host) {
+            return Self.isBlocked(endpoint) ? .blockedAddress : nil
+        }
+
+        do {
+            let resolvedAddresses = try hostResolver(host)
+            guard !resolvedAddresses.isEmpty else {
+                return .dnsResolutionFailed
+            }
+            for resolvedAddress in resolvedAddresses {
+                guard let endpoint = Self.parseIPAddress(resolvedAddress) else {
+                    return .dnsResolutionFailed
+                }
+                if Self.isBlocked(endpoint) {
+                    return .blockedAddress
+                }
+            }
+            return nil
+        } catch {
+            return .dnsResolutionFailed
+        }
     }
 
     private func finish(_ result: Result<RemoteImageFile, Error>) {
@@ -334,5 +414,167 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         return headers.filter { key, _ in
             String(describing: key).caseInsensitiveCompare("Cookie") != .orderedSame
         }
+    }
+
+    private enum ParsedIPAddress {
+        case ipv4([UInt8])
+        case ipv6([UInt8])
+    }
+
+    private static let defaultHostResolver: RemoteImageHostResolver = { host in
+        try resolveHost(host)
+    }
+
+    private static func resolveHost(_ host: String) throws -> [String] {
+        var hints = addrinfo()
+        hints.ai_family = AF_UNSPEC
+        hints.ai_socktype = Int32(SOCK_STREAM)
+
+        var result: UnsafeMutablePointer<addrinfo>?
+        let status = getaddrinfo(host, nil, &hints, &result)
+        guard status == 0, let firstResult = result else {
+            throw RemoteImageLoadError.dnsResolutionFailed
+        }
+        defer { freeaddrinfo(firstResult) }
+
+        var addresses: [String] = []
+        var current: UnsafeMutablePointer<addrinfo>? = firstResult
+        while let entry = current {
+            let addressInfo = entry.pointee
+            if let socketAddress = addressInfo.ai_addr {
+                var numericHost = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                let nameStatus = getnameinfo(
+                    socketAddress,
+                    addressInfo.ai_addrlen,
+                    &numericHost,
+                    socklen_t(numericHost.count),
+                    nil,
+                    0,
+                    NI_NUMERICHOST
+                )
+                if nameStatus == 0 {
+                    addresses.append(String(cString: numericHost))
+                }
+            }
+            current = addressInfo.ai_next
+        }
+
+        guard !addresses.isEmpty else {
+            throw RemoteImageLoadError.dnsResolutionFailed
+        }
+        return Array(Set(addresses))
+    }
+
+    private static func parseIPAddress(_ value: String) -> ParsedIPAddress? {
+        var normalized = value
+        if let zoneSeparator = normalized.firstIndex(of: "%") {
+            normalized = String(normalized[..<zoneSeparator])
+        }
+
+        var ipv4 = in_addr()
+        if normalized.withCString({ inet_pton(AF_INET, $0, &ipv4) }) == 1 {
+            let bytes = withUnsafeBytes(of: ipv4.s_addr) { Array($0) }
+            return .ipv4(bytes)
+        }
+
+        var ipv6 = in6_addr()
+        if normalized.withCString({ inet_pton(AF_INET6, $0, &ipv6) }) == 1 {
+            let bytes = withUnsafeBytes(of: &ipv6) { Array($0.prefix(16)) }
+            return .ipv6(bytes)
+        }
+        return nil
+    }
+
+    private static func isBlocked(_ endpoint: ParsedIPAddress) -> Bool {
+        switch endpoint {
+        case let .ipv4(bytes):
+            return isBlockedIPv4(bytes)
+        case let .ipv6(bytes):
+            return isBlockedIPv6(bytes)
+        }
+    }
+
+    private static func isBlockedIPv4(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count == 4 else {
+            return true
+        }
+        let first = bytes[0]
+        let second = bytes[1]
+        let third = bytes[2]
+
+        // Unspecified, private, shared, loopback, link-local, multicast, and reserved space.
+        if first == 0 || first == 10 || first == 127 || first >= 224 {
+            return true
+        }
+        if first == 100, (64...127).contains(second) {
+            return true
+        }
+        if first == 169, second == 254 {
+            return true
+        }
+        if first == 172, (16...31).contains(second) {
+            return true
+        }
+        if first == 192, second == 168 {
+            return true
+        }
+        if first == 192, second == 0, third == 0 {
+            return true
+        }
+        // IETF special-use and benchmark ranges are not routable public image targets. Blocking
+        // them closes the remaining SSRF bypasses that are easy to miss when only RFC1918 ranges
+        // are considered.
+        if first == 192, second == 0, third == 2 {
+            return true
+        }
+        if first == 192, second == 88, third == 99 {
+            return true
+        }
+        if first == 198, (second == 18 || second == 19) {
+            return true
+        }
+        if first == 198, second == 51, third == 100 {
+            return true
+        }
+        if first == 203, second == 0, third == 113 {
+            return true
+        }
+        return false
+    }
+
+    private static func isBlockedIPv6(_ bytes: [UInt8]) -> Bool {
+        guard bytes.count == 16 else {
+            return true
+        }
+
+        if bytes.allSatisfy({ $0 == 0 }) || (bytes.dropLast().allSatisfy({ $0 == 0 }) && bytes[15] == 1) {
+            return true
+        }
+        if bytes[0] == 0xff || (bytes[0] & 0xfe) == 0xfc {
+            return true
+        }
+        if bytes[0] == 0xfe, (bytes[1] & 0xc0) == 0x80 {
+            return true
+        }
+        if bytes[0] == 0xfe, (bytes[1] & 0xc0) == 0xc0 {
+            return true
+        }
+
+        let isIPv4Mapped = bytes.prefix(10).allSatisfy({ $0 == 0 })
+            && bytes[10] == 0xff
+            && bytes[11] == 0xff
+        let isIPv4Compatible = bytes.prefix(12).allSatisfy({ $0 == 0 })
+        if isIPv4Mapped || isIPv4Compatible {
+            return isBlockedIPv4(Array(bytes.suffix(4)))
+        }
+
+        // 6to4 and the standard NAT64 prefix embed an IPv4 destination.
+        if bytes[0] == 0x20, bytes[1] == 0x02 {
+            return isBlockedIPv4(Array(bytes[2..<6]))
+        }
+        if bytes[0] == 0x00, bytes[1] == 0x64, bytes[2] == 0xff, bytes[3] == 0x9b {
+            return isBlockedIPv4(Array(bytes.suffix(4)))
+        }
+        return false
     }
 }

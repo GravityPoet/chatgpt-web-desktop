@@ -5,6 +5,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="ChatGPT Swift"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
 DMG_PATH="$ROOT/dist/$APP_NAME.dmg"
+DMG_TMP="$DMG_PATH.tmp.$$"
 STAGING="$ROOT/dist/dmg-staging"
 BUNDLE_ID="local.chatgpt-web.swift"
 VERIFY_MOUNT="$ROOT/dist/.dmg-verify-$$"
@@ -47,6 +48,7 @@ cleanup() {
   fi
   unregister_app_bundle "$APP_DIR"
   rm -rf "$APP_DIR" "$STAGING" "$VERIFY_MOUNT"
+  rm -f "$DMG_TMP"
   rm -f "$ROOT/dist/.metadata_never_index"
   exit "$status"
 }
@@ -56,7 +58,7 @@ trap 'exit 143' TERM
 
 CHATGPT_SWIFT_KEEP_TRANSIENT_APP=1 "$ROOT/packaging/make-app.sh" >/dev/null
 
-rm -rf "$STAGING" "$DMG_PATH"
+rm -rf "$STAGING" "$DMG_TMP"
 mkdir -p "$STAGING"
 : > "$STAGING/.metadata_never_index"
 /usr/bin/ditto "$APP_DIR" "$STAGING/$APP_NAME.app"
@@ -68,17 +70,17 @@ if /usr/sbin/diskutil image create from --help >/dev/null 2>&1; then
     --format UDZO \
     --volumeName "$APP_NAME" \
     "$STAGING" \
-    "$DMG_PATH"
+    "$DMG_TMP"
 else
   hdiutil create \
     -volname "$APP_NAME" \
     -srcfolder "$STAGING" \
     -ov \
     -format UDZO \
-    "$DMG_PATH"
+    "$DMG_TMP"
 fi
 
-hdiutil verify "$DMG_PATH"
+hdiutil verify "$DMG_TMP"
 rm -rf "$VERIFY_MOUNT"
 mkdir -p "$VERIFY_MOUNT"
 if [[ "$USE_DISKUTIL_IMAGE" -eq 1 ]]; then
@@ -86,9 +88,9 @@ if [[ "$USE_DISKUTIL_IMAGE" -eq 1 ]]; then
     --readOnly \
     --mountOptions nobrowse \
     --mountPoint "$VERIFY_MOUNT" \
-    "$DMG_PATH" >/dev/null
+    "$DMG_TMP" >/dev/null
 else
-  hdiutil attach -readonly -nobrowse -mountpoint "$VERIFY_MOUNT" "$DMG_PATH" >/dev/null
+  hdiutil attach -readonly -nobrowse -mountpoint "$VERIFY_MOUNT" "$DMG_TMP" >/dev/null
 fi
 MOUNTED=1
 VERIFY_APP="$VERIFY_MOUNT/$APP_NAME.app"
@@ -98,4 +100,5 @@ unregister_app_bundle "$VERIFY_APP"
 detach_verify_image >/dev/null
 MOUNTED=0
 rm -rf "$VERIFY_MOUNT"
+mv -f "$DMG_TMP" "$DMG_PATH"
 echo "$DMG_PATH"

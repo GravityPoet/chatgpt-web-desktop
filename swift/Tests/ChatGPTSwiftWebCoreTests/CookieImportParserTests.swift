@@ -53,4 +53,27 @@ final class CookieImportParserTests: XCTestCase {
         XCTAssertTrue(CookieImportParser.isSessionCookieName("__Secure-next-auth.session-token"))
         XCTAssertFalse(CookieImportParser.isEssentialCookieName("_ga"))
     }
+
+    func testRejectsOversizedImportAndExcessiveCookieCount() {
+        let oversized = Data(repeating: 0x61, count: CookieImportParser.maximumImportBytes + 1)
+        XCTAssertThrowsError(try CookieImportParser.parse(data: oversized)) { error in
+            XCTAssertTrue(CookieImportParser.safeMessage(error).contains("文件过大"))
+        }
+
+        let manyCookies = (0...CookieImportParser.maximumCookieCount).map { "name\($0)=value\($0)" }.joined(separator: ";")
+        XCTAssertThrowsError(try CookieImportParser.parse(data: Data(manyCookies.utf8))) { error in
+            XCTAssertTrue(CookieImportParser.safeMessage(error).contains("数量超过"))
+        }
+    }
+
+    func testRejectsOversizedCookieFieldsAndControlCharacters() {
+        let oversizedValue = String(repeating: "x", count: CookieImportParser.maximumCookieValueBytes + 1)
+        XCTAssertThrowsError(try CookieImportParser.parse(data: Data("session=\(oversizedValue)".utf8))) { error in
+            XCTAssertTrue(CookieImportParser.safeMessage(error).contains("字段过大"))
+        }
+
+        XCTAssertThrowsError(try CookieImportParser.parse(data: Data("session=ok\u{0001}".utf8))) { error in
+            XCTAssertTrue(CookieImportParser.safeMessage(error).contains("控制字符"))
+        }
+    }
 }

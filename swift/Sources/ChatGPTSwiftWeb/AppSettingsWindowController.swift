@@ -329,13 +329,13 @@ final class AppSettingsWindowController: NSWindowController {
     }
 
     private func renderNotes() {
-        addHeader("备忘录", "读取 Apple Notes 列表中当前选中的第一条备忘录标题和完整正文，并插入网页输入框；不会自动发送，也不读取 IDE、Terminal 或代码工程。")
+        addHeader("备忘录", "读取 Apple Notes 列表中当前选中的第一条备忘录标题和正文（超长内容会截断），并插入网页输入框；不会自动发送，也不读取 IDE、Terminal 或代码工程。")
         addKeyValue("自动化权限", state.notesAutomationStatus)
         addActionButton("打开系统自动化设置", action: #selector(openNotesAutomationPrivacy(_:)))
     }
 
     private func renderDistribution() {
-        addHeader("分发", "本地统一自签名是当前正式交付方式。配置 Sparkle appcast 和 EdDSA 公钥后可走自动更新；未配置时保留 GitHub Releases 手动检查。")
+        addHeader("分发", "本地统一自签名适合本机安装和 GitHub Releases 手动检查；跨设备 Sparkle 自动更新需要稳定、受系统信任的 Developer ID 签名与 EdDSA appcast。")
         addKeyValue("更新状态", state.updateStatus)
         addKeyValue("签名策略", state.distributionStatus)
         let buttonRow = NSStackView()

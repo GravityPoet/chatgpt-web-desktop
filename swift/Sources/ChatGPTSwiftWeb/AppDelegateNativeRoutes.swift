@@ -2,6 +2,9 @@ import AppKit
 
 extension AppDelegate {
     @objc func focusPromptAction(_ sender: Any?) {
+        guard !profileMutationInProgress,
+              ProfileStore.pendingDataMutation == nil,
+              !ProfileStore.metadataRecoveryRequired else { return }
         guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
             return
         }
@@ -9,6 +12,9 @@ extension AppDelegate {
     }
 
     @objc func insertNotesContextAction(_ sender: Any?) {
+        guard !profileMutationInProgress,
+              ProfileStore.pendingDataMutation == nil,
+              !ProfileStore.metadataRecoveryRequired else { return }
         guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
             return
         }
@@ -19,6 +25,11 @@ extension AppDelegate {
         controller.setStatus("正在读取备忘录…", showsProgress: false)
         NotesContextReader.readSelectedNote { result in
             DispatchQueue.main.async {
+                guard !self.profileMutationInProgress,
+                      ProfileStore.pendingDataMutation == nil,
+                      !controller.isDisposing else {
+                    return
+                }
                 switch result {
                 case .success(let context):
                     controller.insertTextIntoPrompt(context) { errorText in

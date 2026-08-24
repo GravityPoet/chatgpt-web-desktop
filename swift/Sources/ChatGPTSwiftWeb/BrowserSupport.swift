@@ -174,6 +174,41 @@ struct FingerprintProfile: Codable {
     let devicePixelRatio: Double
     let maxTouchPoints: Int
     let timezone: String?
+
+    /// Imported profile metadata is untrusted JSON. Keep the bounds tight enough that a profile
+    /// cannot allocate an unexpectedly large user script or inject control characters into UI and
+    /// WebKit configuration. The built-in catalogue intentionally stays well inside these limits.
+    func isValidForImport() -> Bool {
+        func validText(_ value: String, maximumLength: Int) -> Bool {
+            !value.isEmpty
+                && value.count <= maximumLength
+                && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        }
+
+        guard validText(presetID, maximumLength: 128),
+              validText(displayName, maximumLength: 256),
+              validText(userAgent, maximumLength: 1024),
+              validText(platform, maximumLength: 128),
+              (1 ... 8).contains(acceptLanguages.count),
+              acceptLanguages.allSatisfy({ validText($0, maximumLength: 32) }),
+              (1 ... 128).contains(hardwareConcurrency),
+              (1 ... 256).contains(deviceMemory),
+              (320 ... 16_384).contains(screenWidth),
+              (240 ... 16_384).contains(screenHeight),
+              (1 ... 64).contains(colorDepth),
+              devicePixelRatio.isFinite,
+              (0.25 ... 8).contains(devicePixelRatio),
+              (0 ... 32).contains(maxTouchPoints) else {
+            return false
+        }
+
+        if let timezone {
+            guard validText(timezone, maximumLength: 64), TimeZone(identifier: timezone) != nil else {
+                return false
+            }
+        }
+        return true
+    }
 }
 
 /// Resolves the timezone of the current network egress for an explicitly selected fingerprint
@@ -232,8 +267,31 @@ enum GeoIPResolver {
         let endpoint = endpoints[endpointIndex]
         var request = URLRequest(url: endpoint.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        URLSession.shared.dataTask(with: request) { data, _, _ in
-            if let data,
+        request.httpShouldHandleCookies = false
+        request.setValue(nil, forHTTPHeaderField: "Cookie")
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: configuration)
+        session.dataTask(with: request) { data, response, _ in
+            defer { session.finishTasksAndInvalidate() }
+            let validResponse: Bool
+            if let httpResponse = response as? HTTPURLResponse,
+               let responseURL = httpResponse.url,
+               httpResponse.statusCode >= 200,
+               httpResponse.statusCode < 300,
+               responseURL.scheme?.lowercased() == "https",
+               responseURL.host?.lowercased() == endpoint.url.host?.lowercased() {
+                validResponse = true
+            } else {
+                validResponse = false
+            }
+
+            if validResponse,
+               let data,
+               data.count <= 128 * 1024,
                let json = try? JSONSerialization.jsonObject(with: data),
                let tz = endpoint.timezone(json), isValidTimezone(tz) {
                 completion(tz)
@@ -938,6 +996,65 @@ enum FingerprintCatalog {
 }
 
 enum ProfileStore {
+    private static let corruptProfilesBackupKey = profilesDefaultsKey + ".CorruptBackup"
+    private static let metadataRecoveryRequiredKey = profilesDefaultsKey + ".RecoveryRequired"
+    private static let pendingDataMutationKey = profilesDefaultsKey + ".PendingDataMutation"
+    private static let maximumProfileMetadataBytes = 1 * 1024 * 1024
+    private static let maximumProfileCount = 128
+
+    static var metadataRecoveryRequired: Bool {
+        UserDefaults.standard.bool(forKey: metadataRecoveryRequiredKey)
+    }
+
+    static var corruptProfilesBackupData: Data? {
+        UserDefaults.standard.data(forKey: corruptProfilesBackupKey)
+    }
+
+    static func markPendingDataMutation(kind: String, profileID: String) {
+        UserDefaults.standard.set(
+            ["kind": kind, "profileID": profileID],
+            forKey: pendingDataMutationKey
+        )
+    }
+
+    static var pendingDataMutation: (kind: String, profileID: String)? {
+        guard let value = UserDefaults.standard.dictionary(forKey: pendingDataMutationKey),
+              let kind = value["kind"] as? String,
+              let profileID = value["profileID"] as? String,
+              !kind.isEmpty,
+              !profileID.isEmpty else {
+            return nil
+        }
+        return (kind, profileID)
+    }
+
+    static func clearPendingDataMutation() {
+        UserDefaults.standard.removeObject(forKey: pendingDataMutationKey)
+    }
+
+    static func restoreProfilesFromBackup() -> Bool {
+        guard let data = corruptProfilesBackupData,
+              data.count <= maximumProfileMetadataBytes,
+              let profiles = try? JSONDecoder().decode([WebProfile].self, from: data),
+              isValidProfileMetadata(profiles) else {
+            return false
+        }
+        UserDefaults.standard.set(data, forKey: profilesDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: metadataRecoveryRequiredKey)
+        _ = loadProfiles()
+        return !metadataRecoveryRequired
+    }
+
+    static func resetToDefaultAfterRecovery() {
+        let profiles = [WebProfile(id: defaultProfileID, name: "默认", createdAt: Date())]
+        if let data = try? JSONEncoder().encode(profiles) {
+            UserDefaults.standard.set(data, forKey: profilesDefaultsKey)
+        }
+        UserDefaults.standard.removeObject(forKey: currentProfileDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
+        UserDefaults.standard.removeObject(forKey: metadataRecoveryRequiredKey)
+    }
+
     static func ensurePrivacyBaseline() {
         let profiles = loadProfiles()
         for profile in profiles {
@@ -960,11 +1077,41 @@ enum ProfileStore {
     }
 
     static func loadProfiles() -> [WebProfile] {
-        var profiles: [WebProfile] = []
-        if let data = UserDefaults.standard.data(forKey: profilesDefaultsKey),
-           let decoded = try? JSONDecoder().decode([WebProfile].self, from: data) {
+        var profiles: [WebProfile]
+        if let data = UserDefaults.standard.data(forKey: profilesDefaultsKey) {
+            guard data.count <= maximumProfileMetadataBytes else {
+                if UserDefaults.standard.data(forKey: corruptProfilesBackupKey) == nil {
+                    UserDefaults.standard.set(data, forKey: corruptProfilesBackupKey)
+                }
+                UserDefaults.standard.set(true, forKey: metadataRecoveryRequiredKey)
+                return [WebProfile(id: defaultProfileID, name: "默认", createdAt: Date(timeIntervalSince1970: 0))]
+            }
+            guard let decoded = try? JSONDecoder().decode([WebProfile].self, from: data) else {
+                if UserDefaults.standard.data(forKey: corruptProfilesBackupKey) == nil {
+                    UserDefaults.standard.set(data, forKey: corruptProfilesBackupKey)
+                }
+                UserDefaults.standard.set(true, forKey: metadataRecoveryRequiredKey)
+                return [WebProfile(id: defaultProfileID, name: "默认", createdAt: Date(timeIntervalSince1970: 0))]
+            }
             profiles = decoded
+        } else {
+            profiles = []
         }
+
+        guard isValidProfileMetadata(profiles) else {
+            if let data = UserDefaults.standard.data(forKey: profilesDefaultsKey),
+               UserDefaults.standard.data(forKey: corruptProfilesBackupKey) == nil {
+                UserDefaults.standard.set(data, forKey: corruptProfilesBackupKey)
+            }
+            UserDefaults.standard.set(true, forKey: metadataRecoveryRequiredKey)
+            return [WebProfile(id: defaultProfileID, name: "默认", createdAt: Date(timeIntervalSince1970: 0))]
+        }
+
+        // A user or recovery tool may have restored a valid metadata blob after a previous
+        // corruption event. Keep the preserved backup, but reopen normal profile mutations once
+        // the current blob is valid again.
+        UserDefaults.standard.removeObject(forKey: metadataRecoveryRequiredKey)
+
         if !profiles.contains(where: { $0.id == defaultProfileID }) {
             profiles.insert(WebProfile(id: defaultProfileID, name: "默认", createdAt: Date()), at: 0)
             save(profiles)
@@ -972,19 +1119,60 @@ enum ProfileStore {
         return profiles
     }
 
+    private static func isValidProfileMetadata(_ profiles: [WebProfile]) -> Bool {
+        guard profiles.count <= maximumProfileCount else {
+            return false
+        }
+        var ids = Set<String>()
+        for profile in profiles {
+            guard !profile.id.isEmpty,
+                  isCanonicalProfileID(profile.id),
+                  !profile.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  profile.name.count <= 256,
+                  !profile.name.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+                  ids.insert(profile.id).inserted else {
+                return false
+            }
+        }
+        return profiles.filter { $0.id == defaultProfileID }.count <= 1
+    }
+
+    private static func isCanonicalProfileID(_ id: String) -> Bool {
+        guard id != defaultProfileID else {
+            return true
+        }
+        guard let uuid = UUID(uuidString: id) else {
+            return false
+        }
+        // UUID strings are used as WKWebsiteDataStore identifiers and as UserDefaults key
+        // suffixes. Reject case variants so two metadata records cannot address the same store.
+        return uuid.uuidString == id
+    }
+
     static func startupProfileID() -> String {
         let profiles = loadProfiles()
+        if metadataRecoveryRequired {
+            return defaultProfileID
+        }
         if let stored = UserDefaults.standard.string(forKey: startupProfileDefaultsKey),
-           profiles.contains(where: { $0.id == stored }) {
+           profiles.contains(where: { $0.id == stored }),
+           stored == defaultProfileID || UUID(uuidString: stored) != nil,
+           stored == defaultProfileID || isProfileIsolationAvailable {
             return stored
         }
+        UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
         return defaultProfileID
     }
 
     @discardableResult
     static func setStartupProfileID(_ id: String) -> Bool {
         var profiles = loadProfiles()
-        guard let idx = profiles.firstIndex(where: { $0.id == id }) else {
+        guard !metadataRecoveryRequired else {
+            return false
+        }
+        guard let idx = profiles.firstIndex(where: { $0.id == id }),
+              id == defaultProfileID || UUID(uuidString: id) != nil,
+              id == defaultProfileID || isProfileIsolationAvailable else {
             return false
         }
         let profile = profiles.remove(at: idx)
@@ -1002,23 +1190,16 @@ enum ProfileStore {
     }
 
     static func applyStartupProfileIfAvailable() {
-        guard let stored = UserDefaults.standard.string(forKey: startupProfileDefaultsKey) else {
+        guard UserDefaults.standard.string(forKey: startupProfileDefaultsKey) != nil else {
             return
         }
-        let profiles = loadProfiles()
-        guard profiles.contains(where: { $0.id == stored }) else {
-            UserDefaults.standard.removeObject(forKey: startupProfileDefaultsKey)
-            return
-        }
-        if stored != defaultProfileID {
-            guard #available(macOS 14.0, *) else {
-                return
-            }
-        }
-        setCurrentProfileID(stored)
+        setCurrentProfileID(startupProfileID())
     }
 
     static func save(_ profiles: [WebProfile]) {
+        guard !metadataRecoveryRequired else {
+            return
+        }
         guard let data = try? JSONEncoder().encode(profiles) else {
             return
         }
@@ -1037,10 +1218,31 @@ enum ProfileStore {
     }
 
     static func currentProfileID() -> String {
-        UserDefaults.standard.string(forKey: currentProfileDefaultsKey) ?? defaultProfileID
+        let stored = UserDefaults.standard.string(forKey: currentProfileDefaultsKey) ?? defaultProfileID
+        let profiles = loadProfiles()
+        if metadataRecoveryRequired {
+            return defaultProfileID
+        }
+        guard profiles.contains(where: { $0.id == stored }),
+              stored == defaultProfileID || UUID(uuidString: stored) != nil,
+              stored == defaultProfileID || isProfileIsolationAvailable else {
+            UserDefaults.standard.set(defaultProfileID, forKey: currentProfileDefaultsKey)
+            return defaultProfileID
+        }
+        return stored
     }
 
     static func setCurrentProfileID(_ id: String) {
+        let profiles = loadProfiles()
+        guard !metadataRecoveryRequired else {
+            return
+        }
+        guard profiles.contains(where: { $0.id == id }),
+              id == defaultProfileID || UUID(uuidString: id) != nil,
+              id == defaultProfileID || isProfileIsolationAvailable else {
+            UserDefaults.standard.set(defaultProfileID, forKey: currentProfileDefaultsKey)
+            return
+        }
         UserDefaults.standard.set(id, forKey: currentProfileDefaultsKey)
     }
 
@@ -1053,21 +1255,24 @@ enum ProfileStore {
     static func homepageURL(for profileID: String) -> URL {
         let key = profileHomepageDefaultsPrefix + profileID
         if let raw = UserDefaults.standard.string(forKey: key),
-           let url = URL(string: raw),
-           url.scheme?.lowercased() == "https" {
+           let url = NavigationRules.validatedExternalURL(raw) {
             return url
         }
         return chatGPTURL
     }
 
     static func homepageString(for profileID: String) -> String? {
-        UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + profileID)
+        guard let raw = UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + profileID),
+              let validated = NavigationRules.validatedExternalURL(raw) else {
+            return nil
+        }
+        return validated.absoluteString
     }
 
     static func setHomepage(_ url: URL?, for profileID: String) {
         let key = profileHomepageDefaultsPrefix + profileID
-        if let url, url.scheme?.lowercased() == "https" {
-            UserDefaults.standard.set(url.absoluteString, forKey: key)
+        if let url, let validated = NavigationRules.validatedExternalURL(url.absoluteString) {
+            UserDefaults.standard.set(validated.absoluteString, forKey: key)
         } else {
             UserDefaults.standard.removeObject(forKey: key)
         }
@@ -1089,6 +1294,20 @@ enum ProfileStore {
         UserDefaults.standard.set(enabled, forKey: key)
     }
 
+    static func removeAllMetadata(for profileID: String) {
+        removeHomepage(for: profileID)
+        setFingerprint(nil, for: profileID)
+        UserDefaults.standard.removeObject(forKey: profileEnhancedPrivacyDefaultsPrefix + profileID)
+        PromptDraftStore.clearDraft(for: profileID)
+    }
+
+    private static var isProfileIsolationAvailable: Bool {
+        if #available(macOS 14.0, *) {
+            return true
+        }
+        return false
+    }
+
     static func fingerprint(for profileID: String?) -> FingerprintProfile? {
         guard let profileID else {
             return nil
@@ -1098,7 +1317,8 @@ enum ProfileStore {
         }
         let key = profileFingerprintDefaultsPrefix + profileID
         guard let data = UserDefaults.standard.data(forKey: key),
-              let fingerprint = try? JSONDecoder().decode(FingerprintProfile.self, from: data) else {
+              let fingerprint = try? JSONDecoder().decode(FingerprintProfile.self, from: data),
+              fingerprint.isValidForImport() else {
             return nil
         }
         return fingerprint
@@ -1114,6 +1334,9 @@ enum ProfileStore {
         guard let fingerprint else {
             UserDefaults.standard.removeObject(forKey: key)
             UserDefaults.standard.removeObject(forKey: disabledKey)
+            return
+        }
+        guard fingerprint.isValidForImport() else {
             return
         }
         guard let data = try? JSONEncoder().encode(fingerprint) else {

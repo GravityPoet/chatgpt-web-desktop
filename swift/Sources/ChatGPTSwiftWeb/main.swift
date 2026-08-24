@@ -23,8 +23,9 @@ let minimumWebZoom: CGFloat = 0.85
 let maximumWebZoom: CGFloat = 1.40
 let webZoomStep: CGFloat = 0.05
 let maximumCookieImportBytes = 2 * 1024 * 1024
+let maximumProfileImportBytes = 1 * 1024 * 1024
 let maximumChatGPTCookieHeaderBytes = 6 * 1024
-let maximumBridgeDownloadBytes = 200 * 1024 * 1024
+let maximumBridgeDownloadBytes = 64 * 1024 * 1024
 let maximumBridgeDownloadPayloadCharacters = maximumBridgeDownloadBytes * 2 + 4096
 let profilesDefaultsKey = "ChatGPTSwiftWeb.Profiles"
 let currentProfileDefaultsKey = "ChatGPTSwiftWeb.CurrentProfileID"
@@ -39,7 +40,6 @@ let keepThirdPartyLinksInAppDefaultsKey = "ChatGPTSwiftWeb.KeepThirdPartyLinksIn
 let smokeReportPathEnvironmentKey = "CHATGPT_SWIFT_SMOKE_REPORT_PATH"
 let smokeTimeoutEnvironmentKey = "CHATGPT_SWIFT_SMOKE_TIMEOUT_SECONDS"
 let processStartedAt = Date()
-var singleInstanceLockFileDescriptor: CInt = -1
 
 enum SmokeTestEnvironment {
     static var reportPath: String? {
@@ -261,6 +261,11 @@ app.delegate = applicationDelegate
 app.run()
 
 enum SingleInstance {
+    // The descriptor is deliberately process-global and is only assigned after flock succeeds.
+    // `nonisolated(unsafe)` documents that the OS file lock, not Swift actor isolation, is the
+    // synchronization primitive for this single-instance guard.
+    nonisolated(unsafe) private static var lockFileDescriptor: CInt = -1
+
     static func activateExistingInstanceOrAcquireLock() {
         let lockPath = lockFileURL().path
         let fileDescriptor = open(lockPath, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR)
@@ -270,7 +275,7 @@ enum SingleInstance {
         }
 
         if flock(fileDescriptor, LOCK_EX | LOCK_NB) == 0 {
-            singleInstanceLockFileDescriptor = fileDescriptor
+            lockFileDescriptor = fileDescriptor
             return
         }
 

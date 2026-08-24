@@ -85,7 +85,7 @@ public enum DiagnosticRedactor {
 
     private static func replacingURLs(in text: String) -> String {
         guard let expression = try? NSRegularExpression(
-            pattern: #"https?://[^\s\"'<>\[\](){}]+"#,
+            pattern: #"https?://[^\s\"'<>\[\]{}]+"#,
             options: [.caseInsensitive]
         ) else {
             return text
@@ -97,7 +97,13 @@ public enum DiagnosticRedactor {
             guard let originalRange = Range(match.range, in: result) else {
                 continue
             }
-            let rawURL = String(result[originalRange])
+            var rawURL = String(result[originalRange])
+            while let last = rawURL.last, ".,;!?".contains(last) {
+                rawURL.removeLast()
+            }
+            while rawURL.last == ")" && rawURL.filter({ $0 == ")" }).count > rawURL.filter({ $0 == "(" }).count {
+                rawURL.removeLast()
+            }
             guard let url = URL(string: rawURL) else {
                 continue
             }
