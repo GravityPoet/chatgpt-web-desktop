@@ -291,7 +291,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             isDefault: profileID == nil || profileID == defaultProfileID,
             persistent: persistent
         )
-        let rows = [
+        let rows: [(String, String)] = [
             ("窗口标题", isPopup ? "弹窗（标题已脱敏）" : "ChatGPT Swift"),
             ("窗口 frame", "x=\(Int(frame.origin.x)), y=\(Int(frame.origin.y)), w=\(Int(frame.size.width)), h=\(Int(frame.size.height))"),
             ("窗口类型", isPopup ? "弹窗" : "主窗口"),
