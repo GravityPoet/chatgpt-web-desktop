@@ -26,8 +26,11 @@ EXPECTED_SPARKLE_VERSION="2.9.6"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 VERIFY_ROOT=""
 CI_LOCAL_KEYCHAIN=""
+CI_KEYCHAIN_LIST_BACKUP=""
 if [[ "${GITHUB_ACTIONS:-}" == "true" && -z "${CHATGPT_RUST_CODESIGN_KEYCHAIN:-}" ]]; then
   CI_LOCAL_KEYCHAIN="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/chatgpt-rust-local-signing.keychain-db"
+  CI_KEYCHAIN_LIST_BACKUP="$(mktemp "${TMPDIR:-/tmp}/chatgpt-swift-keychains.XXXXXX")"
+  /usr/bin/security list-keychains -d user >"$CI_KEYCHAIN_LIST_BACKUP" 2>/dev/null || true
 fi
 
 unregister_app_bundle() {
@@ -41,6 +44,17 @@ unregister_app_bundle() {
 }
 
 cleanup_ci_keychain() {
+  if [[ -n "$CI_KEYCHAIN_LIST_BACKUP" && -f "$CI_KEYCHAIN_LIST_BACKUP" ]]; then
+    restored_keychains=()
+    while IFS= read -r keychain; do
+      [[ -n "$keychain" ]] && restored_keychains+=("$keychain")
+    done < <(/usr/bin/sed -nE 's/^[[:space:]]*"(.*)"[[:space:]]*$/\1/p' "$CI_KEYCHAIN_LIST_BACKUP")
+    if [[ "${#restored_keychains[@]}" -gt 0 ]]; then
+      /usr/bin/security list-keychains -d user -s "${restored_keychains[@]}" >/dev/null 2>&1 || true
+    fi
+    rm -f "$CI_KEYCHAIN_LIST_BACKUP"
+    CI_KEYCHAIN_LIST_BACKUP=""
+  fi
   if [[ -n "$CI_LOCAL_KEYCHAIN" ]]; then
     /usr/bin/security delete-keychain "$CI_LOCAL_KEYCHAIN" >/dev/null 2>&1 || true
   fi
