@@ -113,4 +113,20 @@ final class CookieConsentSettingsIntegrationTests: XCTestCase {
             $0.name == "session-preserved-for-test" && $0.value == "keep-me"
         })
     }
+
+    func testManagedRejectionCookiesAreMarkedForPrunePreservation() throws {
+        let rejectionCookie = try XCTUnwrap(
+            CookieConsentSettings.rejectionCookies(now: Date(timeIntervalSince1970: 1_700_000_000)).first
+        )
+        let lookalike = try XCTUnwrap(HTTPCookie(properties: [
+            .domain: ".openai.com",
+            .name: rejectionCookie.name,
+            .path: "/",
+            .secure: "TRUE",
+            .value: "false",
+        ]))
+
+        XCTAssertTrue(CookieConsentSettings.isManagedRejectionCookie(rejectionCookie))
+        XCTAssertFalse(CookieConsentSettings.isManagedRejectionCookie(lookalike))
+    }
 }
