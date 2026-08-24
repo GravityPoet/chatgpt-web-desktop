@@ -3,8 +3,8 @@
 # ChatGPT Web Desktop
 
 <p align="center">
-  <strong>ChatGPT Web superpowers in a fast, private 2.7 MB native macOS desktop app.</strong><br>
-  <em>Full web model controls, isolated cookies, background completion alerts, and 1-click Apple Notes context — running on macOS 12+ (Intel & Apple Silicon).</em>
+  <strong>Take back full control of ChatGPT's reasoning effort in a fast, private 2.7 MB native desktop app.</strong><br>
+  <em>Never let official apps silently downgrade your thinking depth. Force maximum reasoning effort on complex code, math, and research — wrapped in a lightweight, isolated macOS shell (macOS 12+ Universal).</em>
 </p>
 
 <p align="center">
@@ -21,49 +21,56 @@
 
 ---
 
-## Why ChatGPT Web Desktop?
+## The Core Problem: Silent Model Downgrades & Shallow Thinking
 
-Stop losing ChatGPT in a sea of browser tabs or getting blocked by official desktop app limitations:
+When working on difficult programming, architecture design, mathematical proofs, or deep research, **reasoning depth is everything**.
 
-- **Web-First Controls Without Tab Chaos**: ChatGPT Web gets the newest model pickers, advanced reasoning effort sliders, Canvas, and Work features first. This app brings the complete web experience into a dedicated, distraction-free desktop window.
-- **Runs on macOS 12+ (Monterey & Ventura)**: OpenAI's official macOS desktop app requires macOS 14+ Sonoma. This native Swift implementation supports macOS 12.0 and later on both Apple Silicon and Intel Macs.
-- **100% Isolated & Private**: Separate WebView storage keeps your ChatGPT session completely isolated from Safari, Chrome, and system tracking. It automatically rejects non-essential cookies by default while keeping you logged in.
-- **Featherweight Native Performance**: A tiny ~2.7 MB DMG download built with native AppKit and WKWebView — no Electron bloat or heavy memory footprint.
+Yet official desktop apps and automatic routers are often tuned to conserve server compute:
+- Queries get silently routed to lighter, shallower modes with abbreviated thinking times.
+- Granular reasoning sliders and web-first model selectors are delayed, restricted, or hidden.
+- You end up with superficial answers when you needed deep, multi-step problem solving.
+
+**ChatGPT Web Desktop brings the full, uncompromised web reasoning engine into a dedicated 2.7 MB native desktop app.** You choose the exact model, slider, and thinking effort level — with zero silent downgrading.
 
 ## Before vs. After
 
-| Feature | Browser Tab / Official App | ChatGPT Web Desktop |
+| Experience | Official App / Auto Browser Tab | ChatGPT Web Desktop |
 |---|---|---|
-| **macOS Compatibility** | Official app locked to macOS 14+ | **macOS 12.0+ (Monterey, Ventura, Sonoma, Sequoia)** |
-| **Download & App Size** | Electron wrappers often > 150 MB | **~2.7 MB DMG** (Native Swift universal binary) |
-| **Workspace Focus** | Easily lost among dozens of open tabs | **Dedicated Dock tile**, saved window position & single-instance lock |
-| **Context Insertion** | Manual copy-pasting from notes | **1-click Apple Notes integration** (`Cmd+Option+N`) |
-| **Generation Alerts** | Must keep switching tabs to check progress | **Native background notifications** when answers finish |
-| **Cookie Isolation** | Shares cookies with main browser | **Isolated profile store**; auto-opts out of tracking cookies |
-| **File Downloads** | Web `blob:`/`data:` links frequently fail | **Native download bridge** auto-saves straight to `~/Downloads` |
-| **Crash Protection** | Accidental refresh loses unsent prompt | **Automatic input draft recovery** restores unsent text |
+| **Thinking Effort Control** | Auto-routed to shallow compute; silent model downgrade to save tokens | **100% sovereign thinking control**: force high/advanced reasoning effort on demand |
+| **Model Parity** | Web-first controls delayed or missing | **Immediate access** to latest web model pickers, Canvas, Voice & Work tools |
+| **macOS Compatibility** | Locked to macOS 14+ Sonoma | **Native support for macOS 12.0+** (Monterey, Ventura, Sonoma, Sequoia) |
+| **App Footprint** | Heavy Electron wrappers (>150 MB) | **~2.7 MB DMG** (Native Swift universal binary for Intel & Apple Silicon) |
+| **Workspace Focus** | Buried in dozens of browser tabs | **Dedicated Dock tile**, window position restore & single-instance lock |
+| **Context Workflow** | Manual copy-pasting from notes | **1-click Apple Notes prompt insertion** (`Cmd+Option+N`) |
+| **Task Awareness** | Constantly checking if long reasoning finished | **Native macOS background notifications** when answers finish |
+| **Storage & Privacy** | Shared browser cookies & tracking | **100% isolated profile store**; auto-opts out of tracking cookies |
+| **Downloads** | `blob:`/`data:` links frequently fail in WebViews | **Native download bridge** auto-saves directly to `~/Downloads` |
+| **Draft Protection** | Reload or crash loses unsent prompt | **Automatic input draft recovery** restores unsent text |
 
 ## Killer Features
 
-### 1. Web-First Power in a Focused Desktop Shell
-Experience the complete ChatGPT Web interface — model selection, deep reasoning effort, Voice, Canvas, and Work tools — directly inside a native macOS window. Single-instance management prevents cluttered duplicate windows, and your exact window size and position are remembered across launches.
+### 1. Sovereign Thinking Effort Control — Zero Silent Downgrades
+Take back full control over how hard the model thinks. Select maximum reasoning effort, high-thinking modes, and specific reasoning models directly from the web interface without being silently throttled or auto-routed to shallower defaults. Get rigorous, multi-step deductions on complex codebases, refactors, and research.
 
-### 2. Native macOS Integrations for Daily Flow
-- **Apple Notes Bridge (`Cmd+Option+N`)**: Instantly pulls the title and body of your currently selected Apple Note directly into the prompt box without manual copy-pasting.
-- **Background Completion Alerts**: Sends a macOS notification when ChatGPT finishes generating long responses or deep-thinking tasks while you work in another app.
-- **Smart Download Bridge**: Automatically handles `blob:` and `data:` download links generated by ChatGPT and saves them cleanly to `~/Downloads`.
-- **Draft Recovery**: Preserves unsent prompt text through page reloads or WebKit process restarts so you never lose complex prompts.
+### 2. Full Web Superpowers in a Focused 2.7 MB Desktop Shell
+Access the complete ChatGPT Web surface — model picker, deep thinking controls, Voice, Canvas, and Work — without browser tab clutter. Built on native AppKit + WKWebView with a tiny 2.7 MB footprint, zero Electron bloat, and instant startup on macOS 12+ (Apple Silicon & Intel).
 
-### 3. Isolated Storage & Privacy-First Defaults
-- **Independent Cookie Jar**: Keeps your ChatGPT login credentials completely separated from Safari, Chrome, or other browsers.
-- **Automatic Consent Rejection**: Pre-sets official consent preferences to reject non-essential tracking cookies while preserving authentication.
-- **Zero Intermediaries**: Connects directly to official OpenAI endpoints with zero proxying, zero credential collection, and zero telemetry.
+### 3. Native macOS Integrations for Power Users
+- **Apple Notes Context Bridge (`Cmd+Option+N`)**: Instantly inject the title and body of your selected Apple Note into the prompt input box.
+- **Background Completion Alerts**: Get a native macOS notification the second a long reasoning chain finishes while you work in other apps.
+- **Auto-Download Bridge**: Intercepts `blob:` and `data:` download links generated by ChatGPT and saves them cleanly to `~/Downloads`.
+- **Crash & Reload Draft Recovery**: Preserves unsent prompts across page reloads or WebKit process restarts so you never lose detailed prompts.
+
+### 4. Isolated Profiles & Default Cookie Privacy
+- **Independent Cookie Jar**: Keeps your ChatGPT credentials completely separate from Safari, Chrome, and system browsers.
+- **Consent Opt-Out**: Pre-sets official consent preferences to reject non-essential tracking cookies while preserving login.
+- **Zero Intermediaries**: Direct connection between your Mac and `chatgpt.com` — no proxies, no relays, no telemetry.
 
 ## Quick Start
 
 > **Prerequisites**: macOS 12.0+ (Apple Silicon M-Series or Intel Mac) and an active ChatGPT account.
 
-### Option 1: Direct Download (Fastest)
+### Option 1: Direct Download (Recommended)
 
 1. **Download** the latest [ChatGPT.Swift.dmg](https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg) (~2.7 MB).
 2. Open the DMG and drag **ChatGPT Swift** into your `Applications` folder.
@@ -83,9 +90,9 @@ The universal app will be created at `dist/ChatGPT Swift.zip`.
 
 ## Who Needs This?
 
-- **Developers & Engineers**: Maximize reasoning effort on hard coding tasks, refactors, and architecture design in a clean, isolated workspace.
-- **Writers & Researchers**: Seamlessly insert research from Apple Notes and receive background alerts when deep reasoning finishes.
-- **Users on macOS 12 / 13**: Continue using a native-feeling ChatGPT desktop client on Monterey and Ventura without upgrading hardware or OS.
+- **Developers & Engineers**: Force maximum reasoning effort on complex debugging, architectural reviews, and code generation without silent downgrading.
+- **Writers & Researchers**: Seamlessly insert research notes from Apple Notes and receive background alerts when deep reasoning finishes.
+- **Users on macOS 12 / 13**: Keep using a high-performance ChatGPT desktop client on Monterey and Ventura without being locked out by official app requirements.
 - **Multi-Account Power Users**: Maintain clean session boundaries between personal and work accounts without browser profile clutter.
 
 ## Implementations
@@ -107,7 +114,7 @@ This is an independent open-source project and is not affiliated with, endorsed 
 ---
 
 <p align="center">
-  <strong>Ready to upgrade your ChatGPT desktop experience?</strong><br><br>
+  <strong>Ready to take full control of your ChatGPT reasoning?</strong><br><br>
   <a href="https://github.com/GravityPoet/chatgpt-web-desktop/releases/latest/download/ChatGPT.Swift.dmg">
     <img src="https://img.shields.io/badge/Download-ChatGPT.Swift.dmg%20(2.7MB)-007AFF?style=for-the-badge&logo=apple&logoColor=white" alt="Download ChatGPT Swift DMG">
   </a>
