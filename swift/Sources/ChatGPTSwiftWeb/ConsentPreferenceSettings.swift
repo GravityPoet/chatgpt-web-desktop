@@ -92,6 +92,9 @@ enum CookieConsentSettings {
 
         let group = DispatchGroup()
         for cookie in cookies {
+            guard isEnabled(defaults: defaults) else {
+                break
+            }
             group.enter()
             dataStore.httpCookieStore.setCookie(cookie) {
                 group.leave()
@@ -103,5 +106,7 @@ enum CookieConsentSettings {
     private static func isManagedRejectionCookie(_ cookie: HTTPCookie) -> Bool {
         rejectionCookieNames.contains(cookie.name)
             && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == "chatgpt.com"
+            && cookie.path == "/"
+            && cookie.isSecure
     }
 }

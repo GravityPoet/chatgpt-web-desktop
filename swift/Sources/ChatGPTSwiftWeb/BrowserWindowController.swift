@@ -12,6 +12,22 @@ import WebKit
 final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelegate, WKNavigationDelegate, WKUIDelegate, WKDownloadDelegate, WKScriptMessageHandler {
     private static var controllers: [BrowserWindowController] = []
 
+    static func disposeControllers(for profileID: String, completion: @escaping () -> Void = {}) {
+        let matchingControllers = controllers.filter { $0.profileID == profileID }
+        guard !matchingControllers.isEmpty else {
+            completion()
+            return
+        }
+        let group = DispatchGroup()
+        matchingControllers.forEach { controller in
+            group.enter()
+            controller.dispose {
+                group.leave()
+            }
+        }
+        group.notify(queue: .main, execute: completion)
+    }
+
     private(set) var window: NSWindow!
     private(set) var webView: WKWebView!
     private var contentContainer: NSView!
@@ -26,6 +42,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var isDisposing = false
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
     private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
+    private var didTearDownWebView = false
+    private var didFinishWindowClose = false
+    // All asynchronous writes to this controller's WebKit store are drained before a destructive
+    // profile mutation removes the store.  Cookie consent is one such write, but imports, pruning,
+    // and profile cloning also need the same lifetime boundary.
+    private let websiteDataMutationGroup = DispatchGroup()
+    private let ownsNativeMessageHandlers: Bool
     private var renderProbeGeneration = 0
     var lastRenderProbeWasBlank = false
     private var blankRecoveryAttempts = 0
@@ -70,6 +93,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         self.persistent = persistent
         self.profileID = profileID
         self.closeHandler = closeHandler
+        self.ownsNativeMessageHandlers = configuration == nil
         super.init()
         Self.controllers.append(self)
 
@@ -132,7 +156,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
         if let initialURL {
             let initialRequest = Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID)
+            let consentGroup = websiteDataMutationGroup
+            consentGroup.enter()
             applyDefaultCookieConsent { [weak self] in
+                consentGroup.leave()
                 guard let self, !self.isDisposing else {
                     return
                 }
@@ -150,6 +177,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func reload(_ sender: Any?) {
+        guard !isDisposing else { return }
         if isShowingBlankContent {
             setStatus("正在恢复空白页面…", showsProgress: true)
             recoverFromBlankContent(reason: "reload action")
@@ -171,6 +199,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     /// Re-issue a full load (restarting a dead content process) instead of refreshing the back-forward
     /// list. Falls back to the profile homepage when there is no current URL to recover.
     func hardReload(ignoringCache: Bool = false) {
+        guard !isDisposing else { return }
         let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
         let cachePolicy: URLRequest.CachePolicy = ignoringCache ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
         webView.stopLoading()
@@ -186,6 +215,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func goBack(_ sender: Any?) {
+        guard !isDisposing else { return }
         guard webView.canGoBack else {
             return
         }
@@ -193,6 +223,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func goForward(_ sender: Any?) {
+        guard !isDisposing else { return }
         guard webView.canGoForward else {
             return
         }
@@ -200,6 +231,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func goHome(_ sender: Any?) {
+        guard !isDisposing else { return }
         let target = ProfileStore.homepageURL(for: profileID ?? ProfileStore.currentProfileID())
         webView.stopLoading()
         webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID))
@@ -207,10 +239,18 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     @objc func openCurrentURLInSystemBrowser(_ sender: Any?) {
         let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? ProfileStore.currentProfileID())
-        NSWorkspace.shared.open(target)
+        guard let safeTarget = NavigationRules.sanitizedUserFacingURL(target, sourceURL: webView.url) else {
+            presentError("当前页面不是可安全交给系统浏览器的 HTTPS 地址。登录临时参数不会被外带。")
+            return
+        }
+        if safeTarget != target {
+            setStatus("已移除登录临时参数后打开", showsProgress: false)
+        }
+        NSWorkspace.shared.open(safeTarget)
     }
 
     func navigate(to url: URL) {
+        guard !isDisposing else { return }
         webView.load(Self.privacyRequest(for: url, sourceURL: webView.url, profileID: profileID))
     }
 
@@ -219,18 +259,29 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func applyDefaultCookieConsent(completion: @escaping () -> Void) {
+        let dataStore = webView.configuration.websiteDataStore
         CookieConsentSettings.applyIfEnabled(
-            to: webView.configuration.websiteDataStore,
-            completion: completion
+            to: dataStore,
+            completion: {
+                // The preference can change while WebKit is asynchronously writing the four
+                // managed cookies. Re-read it at the end and remove a stale batch before the
+                // first page load, so disabling the default cannot leave a rejection cookie behind.
+                if CookieConsentSettings.isEnabled() {
+                    completion()
+                } else {
+                    CookieConsentSettings.clearManagedRejectionCookies(
+                        from: dataStore,
+                        completion: completion
+                    )
+                }
+            }
         )
     }
 
     func notificationContextText() -> String {
-        if let title = webView.title?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !title.isEmpty {
-            return title
-        }
-        return webView.url?.host ?? "ChatGPT"
+        // Notification bodies are visible outside the app (including on a lock screen). Never
+        // copy a conversation title, URL, or account name into that channel.
+        return "ChatGPT"
     }
 
     func diagnosticsReport() -> String {
@@ -255,13 +306,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("zoom", "\(Int(round(currentZoom * 100)))%"),
             ("isShowingBlankContent", isShowingBlankContent ? "true" : "false"),
             ("lastRenderProbeWasBlank", lastRenderProbeWasBlank ? "true" : "false"),
-            ("lastRenderProbe", lastRenderProbeSummary),
+            ("lastRenderProbe", DiagnosticRedactor.text(lastRenderProbeSummary)),
             ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
-            ("lastBlankRecovery", lastBlankRecoverySummary),
-            ("nativeStatusOverlay", currentOverlayMode.diagnosticDescription),
+            ("lastBlankRecovery", DiagnosticRedactor.text(lastBlankRecoverySummary)),
+            ("nativeStatusOverlay", DiagnosticRedactor.text(currentOverlayMode.diagnosticDescription)),
             ("webContentProcessTerminationCount", "\(webContentProcessTerminationCount)"),
             ("navigationFailureCount", "\(navigationFailureCount)"),
-            ("lastNavigationFailure", lastNavigationFailureDescription),
+            ("lastNavigationFailure", DiagnosticRedactor.text(lastNavigationFailureDescription)),
             ("controllerCreatedAt", Self.diagnosticDateString(controllerCreatedAt)),
             ("firstNavigationFinishedAt", Self.diagnosticDateString(firstNavigationFinishedAt)),
             ("lastNavigationStartedAt", Self.diagnosticDateString(lastNavigationStartedAt)),
@@ -328,18 +379,18 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "windowVisible=\(windowVisible)",
             "currentURL=\(webView.url.map(Self.loggableURL) ?? "nil")",
             "historyCurrentURL=\(currentItemURL.map(Self.loggableURL) ?? "nil")",
-            "title=\(webView.title ?? "nil")",
+            "title=\(DiagnosticRedactor.pageTitle(webView.title))",
             "isLoading=\(webView.isLoading)",
             "estimatedProgress=\(String(format: "%.3f", webView.estimatedProgress))",
             "renderProbeSucceeded=\(renderProbeSucceeded)",
             "renderProbeNonBlank=\(renderProbeNonBlank)",
             "lastRenderProbeWasBlank=\(lastRenderProbeWasBlank)",
-            "lastRenderProbe=\(lastRenderProbeSummary)",
+            "lastRenderProbe=\(DiagnosticRedactor.text(lastRenderProbeSummary))",
             "diagnosticsHealthy=\(diagnosticsHealthy)",
-            "nativeStatusOverlay=\(currentOverlayMode.diagnosticDescription)",
+            "nativeStatusOverlay=\(DiagnosticRedactor.text(currentOverlayMode.diagnosticDescription))",
             "cloudflareChallengeActive=\(isCloudflareChallengeActive)",
             "navigationFailureCount=\(navigationFailureCount)",
-            "lastNavigationFailure=\(lastNavigationFailureDescription)",
+            "lastNavigationFailure=\(DiagnosticRedactor.text(lastNavigationFailureDescription))",
             "webContentProcessTerminationCount=\(webContentProcessTerminationCount)",
         ]
         return (passed, rows.joined(separator: "\n"))
@@ -353,20 +404,63 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
     }
 
-    func copyCookies(toProfileID targetProfileID: String, completion: @escaping (Int) -> Void) {
+    func copyCookies(toProfileID targetProfileID: String, completion: @escaping (Int, Int, Bool) -> Void) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            completion(0, 0, false)
+            return
+        }
+
+        let operationGroup = websiteDataMutationGroup
+        operationGroup.enter()
+        let completionLock = NSLock()
+        var didFinishOperation = false
+        let finishOperation = {
+            completionLock.lock()
+            let shouldLeave = !didFinishOperation
+            didFinishOperation = true
+            completionLock.unlock()
+            if shouldLeave {
+                operationGroup.leave()
+            }
+        }
+
         let sourceStore = webView.configuration.websiteDataStore.httpCookieStore
         let targetStore = Self.resolveDataStore(persistent: true, profileID: targetProfileID).httpCookieStore
 
-        sourceStore.getAllCookies { cookies in
-            guard !cookies.isEmpty else {
+        sourceStore.getAllCookies { [weak self] cookies in
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                finishOperation()
                 DispatchQueue.main.async {
-                    completion(0)
+                    completion(0, 0, false)
+                }
+                return
+            }
+            let transferableCookies = BrowserDataBoundary.transferableCookies(cookies)
+            guard !transferableCookies.isEmpty else {
+                finishOperation()
+                DispatchQueue.main.async {
+                    completion(0, 0, false)
+                }
+                return
+            }
+
+            let boundedCookies = Self.boundedCookiesForProfileTransfer(transferableCookies)
+            let skippedCount = transferableCookies.count - boundedCookies.count
+            let boundedIdentities = Set(boundedCookies.map(CookieIdentity.init))
+            let essentialSkipped = transferableCookies.contains { cookie in
+                CookieImportParser.isEssentialCookieName(cookie.name)
+                    && !boundedIdentities.contains(CookieIdentity(cookie))
+            }
+            guard !boundedCookies.isEmpty else {
+                finishOperation()
+                DispatchQueue.main.async {
+                    completion(0, skippedCount, essentialSkipped)
                 }
                 return
             }
 
             let group = DispatchGroup()
-            for cookie in cookies {
+            for cookie in boundedCookies {
                 group.enter()
                 targetStore.setCookie(cookie) {
                     group.leave()
@@ -374,7 +468,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             }
 
             group.notify(queue: .main) {
-                completion(cookies.count)
+                finishOperation()
+                completion(boundedCookies.count, skippedCount, essentialSkipped)
             }
         }
     }
@@ -442,7 +537,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func exportCookiesViaPanel() {
         let panel = NSSavePanel()
         panel.title = "Export Cookies"
-        panel.message = "导出当前账号空间内所有 cookie 到 JSON 文件。"
+        panel.message = "仅导出 ChatGPT/OpenAI cookie。导出的文件等同登录凭证，请保存到本机私密位置。"
         panel.prompt = "Export"
         panel.allowedContentTypes = [.json]
         panel.nameFieldStringValue = Self.suggestedExportFilename()
@@ -463,18 +558,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 return
             }
 
-            guard !cookies.isEmpty else {
+            let exportableCookies = BrowserDataBoundary.transferableCookies(cookies)
+            guard !exportableCookies.isEmpty else {
                 self.presentError("当前账号空间内没有可导出的 cookie。")
                 return
             }
 
-            let exported = cookies.map { ExportedBrowserCookie(cookie: $0) }
+            let exported = exportableCookies.map { ExportedBrowserCookie(cookie: $0) }
             do {
                 let encoder = JSONEncoder()
                 encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
                 let data = try encoder.encode(exported)
-                try data.write(to: url, options: [.atomic, .completeFileProtection])
-                self.presentInfo("已导出 \(cookies.count) 个 cookie 到 \(url.lastPathComponent)。")
+                try BrowserDataBoundary.writeSensitiveData(data, to: url)
+                self.presentInfo("已导出 \(exportableCookies.count) 个 ChatGPT/OpenAI cookie。文件等同登录凭证，请勿上传或同步到不可信位置。")
             } catch {
                 self.presentError("Cookie 导出失败：\(error.localizedDescription)")
             }
@@ -488,7 +584,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return "cookies-\(formatter.string(from: Date())).json"
     }
 
-    func confirmBurnCurrentProfileData(completion: @escaping () -> Void) {
+    func confirmBurnCurrentProfileData(
+        onCancel: @escaping () -> Void = {},
+        completion: @escaping () -> Void
+    ) {
         let alert = NSAlert()
         alert.messageText = "焚烧当前空间？"
         alert.informativeText = "这会删除当前空间在本 App WebView 内所有站点的 cookies、缓存、localStorage、IndexedDB、Service Worker 等网站数据和本机未发送草稿，关闭当前空间弹窗，清空页面历史，重建浏览器视图，并恢复默认 Safari 指纹。\n\n会保留：空间名称、首页、增强隐私设置。其他空间不受影响。"
@@ -497,6 +596,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
             guard response == .alertFirstButtonReturn else {
+                onCancel()
                 return
             }
 
@@ -528,7 +628,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return false
     }
 
-    func dispose() {
+    func dispose(completion: @escaping () -> Void = {}) {
         cancelScheduledMainWindowFramePersistence()
         cancelRemoteImageLoads()
         webViewObservations.removeAll()
@@ -536,7 +636,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         childControllers.removeAll()
         closeHandler = nil
         isDisposing = true
+        tearDownWebView()
+        // Remove the live document after its native bridges are detached. This prevents page timers
+        // and queued bridge messages from continuing to target the persistent store while a caller
+        // waits for websiteDataMutationGroup before deleting it.
+        webView.loadHTMLString("", baseURL: nil)
         window.close()
+        websiteDataMutationGroup.notify(queue: .main) { [weak self] in
+            self?.finishWindowClose()
+            completion()
+        }
     }
 
     func windowDidMove(_ notification: Notification) {
@@ -560,8 +669,42 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         cancelScheduledMainWindowFramePersistence()
         cancelRemoteImageLoads()
         persistMainWindowFrame()
+        isDisposing = true
+        tearDownWebView()
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+        websiteDataMutationGroup.notify(queue: .main) { [weak self] in
+            self?.finishWindowClose()
+        }
+    }
+
+    private func finishWindowClose() {
+        guard !didFinishWindowClose else {
+            return
+        }
+        didFinishWindowClose = true
         Self.controllers.removeAll { $0 === self }
-        closeHandler?()
+        let handler = closeHandler
+        closeHandler = nil
+        handler?()
+    }
+
+    private func tearDownWebView() {
+        guard !didTearDownWebView else {
+            return
+        }
+        didTearDownWebView = true
+        webView.stopLoading()
+        webView.navigationDelegate = nil
+        webView.uiDelegate = nil
+        guard ownsNativeMessageHandlers else {
+            return
+        }
+        let userContentController = webView.configuration.userContentController
+        for name in ["downloadBlob", "promptDraft", "completionState"] {
+            userContentController.removeScriptMessageHandler(forName: name)
+        }
+        userContentController.removeAllUserScripts()
     }
 
     private func showStatusOverlay(_ mode: BrowserStatusOverlayMode) {
@@ -605,6 +748,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func scheduleRenderedContentProbe(reason: String, delay: TimeInterval) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         invalidateRenderedContentProbes()
         let generation = renderProbeGeneration
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak webView] in
@@ -742,6 +888,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         lastNavigationStartedAt = Date()
         lastRenderProbeWasBlank = false
         isCloudflareChallengeActive = false
@@ -761,28 +910,57 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping @MainActor @Sendable (WKNavigationActionPolicy) -> Void
     ) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            decisionHandler(.cancel)
+            return
+        }
         guard let url = navigationAction.request.url else {
             decisionHandler(.allow)
             return
         }
 
-        if #available(macOS 11.3, *), navigationAction.shouldPerformDownload {
+        let sourceURL = webView.url
+        let cleanedURL = Self.cleanTrackingParameters(from: url)
+
+        guard NavigationRules.isAllowedWebViewNavigationURL(cleanedURL, sourceURL: sourceURL) else {
+            setStatus("已阻止不安全的导航协议或凭据链接", showsProgress: false)
+            decisionHandler(.cancel)
+            return
+        }
+
+        if NavigationRules.shouldBlockInsecureThirdPartyNavigation(cleanedURL, sourceURL: sourceURL) {
+            setStatus("已阻止明文第三方链接", showsProgress: false)
+            decisionHandler(.cancel)
+            return
+        }
+
+        if #available(macOS 11.3, *),
+           navigationAction.shouldPerformDownload,
+           navigationAction.navigationType == .linkActivated,
+           Self.isTrustedChatGPTURL(sourceURL),
+           navigationAction.targetFrame?.isMainFrame == true {
             // Links flagged for download (e.g. <a download> for large blob/data exports) stream to disk
             // through WKDownload instead of the base64 bridge, so there is no size ceiling.
             decisionHandler(.download)
             return
         }
-
-        let cleanedURL = Self.cleanTrackingParameters(from: url)
-
-        let sourceURL = webView.url
+        if #available(macOS 11.3, *), navigationAction.shouldPerformDownload {
+            setStatus("已阻止非 ChatGPT 页面自动下载", showsProgress: false)
+            decisionHandler(.cancel)
+            return
+        }
 
         if navigationAction.targetFrame == nil {
             // New window / window.open / target=_blank. The privacy menu decides whether third-party
             // destinations stay in an app popup or leave through the user's default browser.
             if Self.shouldOpenNewWindowInSystemBrowser(cleanedURL, sourceURL: sourceURL) {
-                browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
-                NSWorkspace.shared.open(cleanedURL)
+                guard let safeURL = NavigationRules.sanitizedUserFacingURL(cleanedURL, sourceURL: sourceURL) else {
+                    setStatus("已阻止不安全的外部链接", showsProgress: false)
+                    decisionHandler(.cancel)
+                    return
+                }
+                browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(safeURL), privacy: .public)")
+                NSWorkspace.shared.open(safeURL)
             } else {
                 openPopup(url: cleanedURL)
             }
@@ -793,8 +971,24 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let staysInsideTrustedSurface = Self.shouldOpenInsideApp(cleanedURL, sourceURL: sourceURL)
         if !staysInsideTrustedSurface,
            Self.shouldOpenInSystemBrowser(cleanedURL, sourceURL: sourceURL, navigationType: navigationAction.navigationType) {
-            browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
-            NSWorkspace.shared.open(cleanedURL)
+            guard let safeURL = NavigationRules.sanitizedUserFacingURL(cleanedURL, sourceURL: sourceURL) else {
+                setStatus("已阻止不安全的外部链接", showsProgress: false)
+                decisionHandler(.cancel)
+                return
+            }
+            browserLogger.info("Opening user-clicked third-party URL in system browser: \(Self.loggableURL(safeURL), privacy: .public)")
+            NSWorkspace.shared.open(safeURL)
+            decisionHandler(.cancel)
+            return
+        }
+
+        if navigationAction.targetFrame?.isMainFrame == true,
+           let sourceURL,
+           let method = navigationAction.request.httpMethod?.uppercased(),
+           method != "GET", method != "HEAD",
+           sourceURL.host?.lowercased() != cleanedURL.host?.lowercased(),
+           !staysInsideTrustedSurface {
+            setStatus("已阻止跨站表单提交", showsProgress: false)
             decisionHandler(.cancel)
             return
         }
@@ -819,6 +1013,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         lastNavigationFinishedAt = Date()
         if firstNavigationFinishedAt == nil {
             firstNavigationFinishedAt = lastNavigationFinishedAt
@@ -833,6 +1030,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
         // window self-heals instead of stranding the user on a blank page.
         webContentProcessTerminationCount += 1
@@ -844,6 +1044,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         guard !Self.isBenignNavigationError(error) else {
             updateNativeChromeStatus()
             return
@@ -851,35 +1054,51 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
         // Surface the failure so a blank window after a failed load is diagnosable in the unified log.
         navigationFailureCount += 1
-        lastNavigationFailureDescription = error.localizedDescription
+        let safeErrorDescription = DiagnosticRedactor.text(error.localizedDescription)
+        lastNavigationFailureDescription = safeErrorDescription
         lastRenderProbeWasBlank = true
         stopLoadingWatchdog()
         setStatus("页面加载失败", showsProgress: false)
-        showStatusOverlay(.failed(error.localizedDescription))
-        browserLogger.error("Provisional navigation failed: \(error.localizedDescription, privacy: .public)")
+        showStatusOverlay(.failed(safeErrorDescription))
+        browserLogger.error("Provisional navigation failed: \(safeErrorDescription, privacy: .public)")
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         guard !Self.isBenignNavigationError(error) else {
             updateNativeChromeStatus()
             return
         }
 
         navigationFailureCount += 1
-        lastNavigationFailureDescription = error.localizedDescription
+        let safeErrorDescription = DiagnosticRedactor.text(error.localizedDescription)
+        lastNavigationFailureDescription = safeErrorDescription
         lastRenderProbeWasBlank = true
         stopLoadingWatchdog()
         setStatus("页面加载失败", showsProgress: false)
-        showStatusOverlay(.failed(error.localizedDescription))
-        browserLogger.error("Navigation failed: \(error.localizedDescription, privacy: .public)")
+        showStatusOverlay(.failed(safeErrorDescription))
+        browserLogger.error("Navigation failed: \(safeErrorDescription, privacy: .public)")
     }
 
     func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration, for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return nil
+        }
         if let url = navigationAction.request.url {
             let cleanedURL = Self.cleanTrackingParameters(from: url)
+            guard NavigationRules.isAllowedWebViewNavigationURL(cleanedURL, sourceURL: webView.url) else {
+                setStatus("已阻止不安全的外部弹窗协议或凭据链接", showsProgress: false)
+                return nil
+            }
             if Self.shouldOpenNewWindowInSystemBrowser(cleanedURL, sourceURL: webView.url) {
-                browserLogger.info("Opening user-clicked third-party popup URL in system browser: \(Self.loggableURL(cleanedURL), privacy: .public)")
-                NSWorkspace.shared.open(cleanedURL)
+                guard let safeURL = NavigationRules.sanitizedUserFacingURL(cleanedURL, sourceURL: webView.url) else {
+                    setStatus("已阻止不安全的外部弹窗链接", showsProgress: false)
+                    return nil
+                }
+                browserLogger.info("Opening user-clicked third-party popup URL in system browser: \(Self.loggableURL(safeURL), privacy: .public)")
+                NSWorkspace.shared.open(safeURL)
                 return nil
             }
         }
@@ -900,7 +1119,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func webViewDidClose(_ webView: WKWebView) {
-        if isPopup {
+        if isPopup, !isDisposing {
             window.close()
         }
     }
@@ -912,6 +1131,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         initiatedByFrame frame: WKFrameInfo,
         completionHandler: @escaping @MainActor @Sendable ([URL]?) -> Void
     ) {
+        guard Self.isTrustedChatGPTOrigin(frame.securityOrigin) else {
+            completionHandler(nil)
+            return
+        }
         let panel = NSOpenPanel()
         panel.title = "选择要上传的文件"
         panel.prompt = "上传"
@@ -947,13 +1170,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         case .cameraAndMicrophone:
             kind = .cameraAndMicrophone
         @unknown default:
-            decisionHandler(.prompt)
+            decisionHandler(.deny)
             return
         }
 
         let decision = MediaCapturePermissionPolicy.decision(
             originScheme: origin.protocol,
             originHost: origin.host,
+            originPort: origin.port == 0 ? nil : origin.port,
             kind: kind,
             microphoneStatus: Self.mediaAuthorizationStatus(for: .audio),
             cameraStatus: Self.mediaAuthorizationStatus(for: .video)
@@ -1049,11 +1273,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private func handlePromptDraftMessage(_ message: WKScriptMessage) {
         guard persistent,
+              !isDisposing,
+              ProfileStore.pendingDataMutation == nil,
               PromptDraftStore.isRestoreEnabled(),
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any],
-              let rawText = payload["text"] as? String
+              let rawText = payload["text"] as? String,
+              rawText.count <= 24_000
         else {
             return
         }
@@ -1071,7 +1298,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         let isBusy = Self.boolValue(payload["busy"])
-        let reason = payload["reason"] as? String ?? "unknown"
+        let reason = Self.redactedCompletionReason(payload["reason"] as? String)
         let previous = isAssistantResponseInProgress
         isAssistantResponseInProgress = isBusy
         lastCompletionObservationSummary = "\(Self.diagnosticDateString(Date())) busy=\(isBusy), reason=\(reason)"
@@ -1089,9 +1316,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func saveImageDownloadPayload(_ payload: [String: Any]) {
-        let suggestedName = (payload["filename"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suggestedName = (payload["filename"] as? String)
+            .map { String($0.prefix(512)).trimmingCharacters(in: .whitespacesAndNewlines) }
         if let dataURL = payload["dataURL"] as? String {
             do {
+                guard Self.isImageDataURL(dataURL) else {
+                    throw NSError(domain: "ChatGPTSwiftWeb", code: 9, userInfo: [NSLocalizedDescriptionKey: "仅支持图像数据"])
+                }
                 let filename = Self.imageFilename(
                     suggestedFilename: suggestedName,
                     fallback: "chatgpt-image",
@@ -1107,8 +1338,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         if let rawURL = payload["url"] as? String,
-           let url = URL(string: rawURL),
-           url.scheme?.lowercased() == "https" {
+           let url = NavigationRules.validatedExternalURL(rawURL) {
             downloadRemoteImage(from: url, suggestedFilename: suggestedName)
             return
         }
@@ -1128,8 +1358,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         copyItem.representedObject = payload as NSDictionary
         menu.addItem(copyItem)
 
-        let x = CGFloat((payload["x"] as? Double) ?? Double(webView.bounds.midX))
-        let y = CGFloat((payload["y"] as? Double) ?? Double(webView.bounds.midY))
+        let x = CGFloat(Self.finiteDouble(payload["x"]) ?? Double(webView.bounds.midX))
+        let y = CGFloat(Self.finiteDouble(payload["y"]) ?? Double(webView.bounds.midY))
         let point = NSPoint(
             x: min(max(x, 0), webView.bounds.width),
             y: min(max(webView.bounds.height - y, 0), webView.bounds.height)
@@ -1166,6 +1396,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private func copyImagePayload(_ payload: [String: Any]) {
         if let dataURL = payload["dataURL"] as? String {
             do {
+                guard Self.isImageDataURL(dataURL) else {
+                    throw NSError(domain: "ChatGPTSwiftWeb", code: 9, userInfo: [NSLocalizedDescriptionKey: "仅支持图像数据"])
+                }
                 let data = try decodeDataURL(dataURL)
                 try copyImageDataToPasteboard(data)
             } catch {
@@ -1175,8 +1408,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         if let rawURL = payload["url"] as? String,
-           let url = URL(string: rawURL),
-           url.scheme?.lowercased() == "https" {
+           let url = NavigationRules.validatedExternalURL(rawURL) {
             copyRemoteImage(from: url)
             return
         }
@@ -1198,6 +1430,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func clearInjectedZoomState() {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         let script = """
         try {
           localStorage.removeItem('chatgptWebZoom');
@@ -1212,6 +1447,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     func restorePromptDraftIfAvailable(reason: String) {
         guard persistent,
+              !isDisposing,
+              ProfileStore.pendingDataMutation == nil,
               PromptDraftStore.isRestoreEnabled(),
               Self.canInjectPromptContent(into: webView.url) else {
             return
@@ -1238,6 +1475,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private func schedulePromptDraftRestore(reason: String) {
         guard persistent,
+              !isDisposing,
+              ProfileStore.pendingDataMutation == nil,
               PromptDraftStore.isRestoreEnabled(),
               !PromptDraftStore.draft(for: profileID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return
@@ -1248,7 +1487,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 guard let self,
                       let webView,
                       self.webView === webView,
-                      !self.isDisposing else {
+                      !self.isDisposing,
+                      ProfileStore.pendingDataMutation == nil else {
                     return
                 }
                 self.restorePromptDraftIfAvailable(reason: reason)
@@ -1257,11 +1497,17 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func renderFingerprintReport() {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         webView.evaluateJavaScript(Self.fingerprintTestRenderScript) { [weak self] _, error in
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                return
+            }
             if let error {
                 let message = Self.javascriptStringLiteral(error.localizedDescription)
                 let script = "document.body.innerHTML = '<main><h1>指纹检测页</h1><p>报告脚本执行失败：' + \(message) + '</p></main>';"
-                self?.webView.evaluateJavaScript(script, completionHandler: nil)
+                self.webView.evaluateJavaScript(script, completionHandler: nil)
             }
         }
     }
@@ -1344,6 +1590,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func importCookies(_ cookies: [HTTPCookie]) {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         let parsedCount = cookies.count
         let importableCookies = cookies.filter { Self.isChatGPTEssentialCookieName($0.name) }
         let skippedCount = parsedCount - importableCookies.count
@@ -1351,8 +1600,26 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             presentError("Cookie 导入失败：未发现关键 ChatGPT 登录 cookie。为避免请求头过大导致白屏，已拒绝导入低价值 cookie。")
             return
         }
+        let importedHeaderBytes = Self.cookieHeaderBytes(importableCookies)
+        guard importedHeaderBytes <= maximumChatGPTCookieHeaderBytes else {
+            presentError("Cookie 导入失败：关键登录 cookie 总大小超过 \(maximumChatGPTCookieHeaderBytes / 1024) KB，已拒绝写入以避免页面白屏。")
+            return
+        }
 
         let cookieStore = webView.configuration.websiteDataStore.httpCookieStore
+        let operationGroup = websiteDataMutationGroup
+        operationGroup.enter()
+        let completionLock = NSLock()
+        var didFinishOperation = false
+        let finishOperation = {
+            completionLock.lock()
+            let shouldLeave = !didFinishOperation
+            didFinishOperation = true
+            completionLock.unlock()
+            if shouldLeave {
+                operationGroup.leave()
+            }
+        }
         let group = DispatchGroup()
         let importedIdentities = Set(importableCookies.map(CookieIdentity.init))
 
@@ -1364,18 +1631,21 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         group.notify(queue: .main) { [weak self] in
-            guard let self else {
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                finishOperation()
                 return
             }
 
             self.pruneOversizedChatGPTCookies(in: cookieStore) { [weak self] prunedCount in
-                guard let self else {
+                guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                    finishOperation()
                     return
                 }
 
                 cookieStore.getAllCookies { [weak self] storedCookies in
                     DispatchQueue.main.async { [weak self] in
-                        guard let self else {
+                        guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                            finishOperation()
                             return
                         }
 
@@ -1412,6 +1682,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                         }
 
                         lines.append("正在刷新页面。")
+                        finishOperation()
                         self.presentAlert(lines.joined(separator: "\n"), style: missingCookies.isEmpty && missingLoginNames.isEmpty ? .informational : .warning)
                         self.webView.reload()
                     }
@@ -1421,15 +1692,22 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func pruneOversizedChatGPTCookies(in cookieStore: WKHTTPCookieStore, completion: @escaping (Int) -> Void) {
-        cookieStore.getAllCookies { storedCookies in
-            let finish: (Int) -> Void = { count in
-                DispatchQueue.main.async {
-                    completion(count)
-                }
+        let finish: (Int) -> Void = { count in
+            DispatchQueue.main.async {
+                completion(count)
             }
-            let headerBytes = storedCookies
-                .filter(Self.isChatGPTRelatedCookie)
-                .reduce(0) { $0 + $1.name.utf8.count + $1.value.utf8.count + 2 }
+        }
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+            finish(0)
+            return
+        }
+
+        cookieStore.getAllCookies { [weak self] storedCookies in
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                finish(0)
+                return
+            }
+            let headerBytes = Self.cookieHeaderBytes(storedCookies.filter(Self.isChatGPTRelatedCookie))
             guard headerBytes > maximumChatGPTCookieHeaderBytes else {
                 finish(0)
                 return
@@ -1458,6 +1736,33 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private static func isChatGPTRelatedCookie(_ cookie: HTTPCookie) -> Bool {
         isAllowedCookieDomain(cookie.domain)
+    }
+
+    private static func boundedCookiesForProfileTransfer(_ cookies: [HTTPCookie]) -> [HTTPCookie] {
+        let prioritized = cookies.sorted { lhs, rhs in
+            let leftEssential = CookieImportParser.isEssentialCookieName(lhs.name)
+            let rightEssential = CookieImportParser.isEssentialCookieName(rhs.name)
+            if leftEssential != rightEssential {
+                return leftEssential && !rightEssential
+            }
+            return lhs.name < rhs.name
+        }
+        var selected: [HTTPCookie] = []
+        for cookie in prioritized {
+            guard cookie.value.utf8.count <= CookieImportParser.maximumCookieValueBytes,
+                  Self.cookieHeaderBytes(selected + [cookie]) <= maximumChatGPTCookieHeaderBytes else {
+                continue
+            }
+            selected.append(cookie)
+        }
+        return selected
+    }
+
+    private static func cookieHeaderBytes(_ cookies: [HTTPCookie]) -> Int {
+        cookies.enumerated().reduce(0) { total, item in
+            let (index, cookie) = item
+            return total + cookie.name.utf8.count + cookie.value.utf8.count + 1 + (index == 0 ? 0 : 2)
+        }
     }
 
     fileprivate static func isAllowedCookieDomain(_ domain: String) -> Bool {
@@ -1588,24 +1893,47 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func burnWebsiteData(completion: @escaping () -> Void) {
-        WebsiteDataCleaner.removeAllData(from: webView.configuration.websiteDataStore) { [weak self] in
-            guard let self else {
-                return
+        // Stop the current document and close child windows before deleting the persistent store.
+        // Otherwise timers/navigation in an active page can write cookies or local storage back
+        // while WebKit is reporting a successful cleanup.
+        ProfileStore.markPendingDataMutation(
+            kind: "burn",
+            profileID: profileID ?? defaultProfileID
+        )
+        isDisposing = true
+        tearDownWebView()
+        webView.stopLoading()
+        webView.loadHTMLString("", baseURL: nil)
+        let children = childControllers
+        childControllers.removeAll()
+        let group = DispatchGroup()
+        for child in children {
+            group.enter()
+            child.dispose {
+                group.leave()
             }
+        }
+        group.enter()
+        websiteDataMutationGroup.notify(queue: .main) {
+            group.leave()
+        }
+        group.notify(queue: .main) { [weak self] in
+            guard let self else { return }
+            WebsiteDataCleaner.removeAllData(from: self.webView.configuration.websiteDataStore) { [weak self] in
+                guard let self else {
+                    return
+                }
 
-            URLCache.shared.removeAllCachedResponses()
-            let children = self.childControllers
-            self.childControllers.removeAll()
-            children.forEach { $0.window.close() }
-            self.currentZoom = 1.0
-            UserDefaults.standard.removeObject(forKey: webZoomDefaultsKey)
-            completion()
+                self.currentZoom = 1.0
+                UserDefaults.standard.removeObject(forKey: webZoomDefaultsKey)
+                completion()
+            }
         }
     }
 
     private static func loadCookieExport(from url: URL) throws -> [HTTPCookie] {
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
-        if let fileSize = values.fileSize, fileSize > maximumCookieImportBytes {
+        if let fileSize = values.fileSize, fileSize > CookieImportParser.maximumImportBytes {
             throw cookieImportError("Cookie 文件过大")
         }
 
@@ -1627,7 +1955,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private func decodeDataURL(_ dataURL: String) throws -> Data {
         guard dataURL.utf8.count <= maximumBridgeDownloadPayloadCharacters else {
-            throw NSError(domain: "ChatGPTSwiftWeb", code: 4, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+            throw NSError(domain: "ChatGPTSwiftWeb", code: 4, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 \(maximumBridgeDownloadBytes / 1024 / 1024)MB 限制"])
         }
         guard let commaIndex = dataURL.firstIndex(of: ",") else {
             throw NSError(domain: "ChatGPTSwiftWeb", code: 1, userInfo: [NSLocalizedDescriptionKey: "不是有效的 data URL"])
@@ -1638,13 +1966,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         if header.contains(";base64") {
             let estimatedDecodedBytes = (body.utf8.count * 3) / 4
             guard estimatedDecodedBytes <= maximumBridgeDownloadBytes else {
-                throw NSError(domain: "ChatGPTSwiftWeb", code: 5, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+                throw NSError(domain: "ChatGPTSwiftWeb", code: 5, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 \(maximumBridgeDownloadBytes / 1024 / 1024)MB 限制"])
             }
             guard let data = Data(base64Encoded: body, options: [.ignoreUnknownCharacters]) else {
                 throw NSError(domain: "ChatGPTSwiftWeb", code: 2, userInfo: [NSLocalizedDescriptionKey: "Base64 数据无法解码"])
             }
             guard data.count <= maximumBridgeDownloadBytes else {
-                throw NSError(domain: "ChatGPTSwiftWeb", code: 6, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+                throw NSError(domain: "ChatGPTSwiftWeb", code: 6, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 \(maximumBridgeDownloadBytes / 1024 / 1024)MB 限制"])
             }
             return data
         }
@@ -1655,7 +1983,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             throw NSError(domain: "ChatGPTSwiftWeb", code: 3, userInfo: [NSLocalizedDescriptionKey: "文本数据无法解码"])
         }
         guard data.count <= maximumBridgeDownloadBytes else {
-            throw NSError(domain: "ChatGPTSwiftWeb", code: 7, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 200MB 限制"])
+            throw NSError(domain: "ChatGPTSwiftWeb", code: 7, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 \(maximumBridgeDownloadBytes / 1024 / 1024)MB 限制"])
         }
         return data
     }
@@ -1694,6 +2022,39 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return string == "true" || string == "1"
         }
         return false
+    }
+
+    private static func finiteDouble(_ value: Any?) -> Double? {
+        let number: Double?
+        if let value = value as? Double {
+            number = value
+        } else if let value = value as? NSNumber {
+            number = value.doubleValue
+        } else if let value = value as? String {
+            number = Double(value)
+        } else {
+            number = nil
+        }
+        guard let number, number.isFinite else {
+            return nil
+        }
+        return number
+    }
+
+    private static func redactedCompletionReason(_ rawReason: String?) -> String {
+        let bounded = String((rawReason ?? "unknown").prefix(128))
+        let normalized = bounded.unicodeScalars.map { scalar in
+            CharacterSet.controlCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined()
+        return DiagnosticRedactor.text(normalized)
+    }
+
+    private static func isImageDataURL(_ dataURL: String) -> Bool {
+        guard let commaIndex = dataURL.firstIndex(of: ",") else {
+            return false
+        }
+        let header = dataURL[..<commaIndex].lowercased()
+        return header.hasPrefix("data:image/") && !header.hasPrefix("data:image/svg+xml")
     }
 
     private static func intValue(_ value: Any?) -> Int {
@@ -2098,14 +2459,21 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return .nonPersistent()
         }
 
-        guard let profileID, profileID != defaultProfileID, let uuid = UUID(uuidString: profileID) else {
+        guard let profileID else {
             return .default()
+        }
+        if profileID == defaultProfileID {
+            return .default()
+        }
+        guard let uuid = UUID(uuidString: profileID) else {
+            // Never silently put malformed custom metadata into the shared default store.
+            return .nonPersistent()
         }
 
         if #available(macOS 14.0, *) {
             return WKWebsiteDataStore(forIdentifier: uuid)
         }
-        return .default()
+        return .nonPersistent()
     }
 
     private static func isChatGPTHost(_ host: String) -> Bool {
@@ -2162,10 +2530,28 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private static func isTrustedChatGPTBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
-        guard origin.protocol == "https" else {
+        guard isTrustedChatGPTOrigin(origin) else {
+            return false
+        }
+        return true
+    }
+
+    private static func isTrustedChatGPTOrigin(_ origin: WKSecurityOrigin) -> Bool {
+        guard origin.protocol == "https",
+              (origin.port == 0 || origin.port == 443) else {
             return false
         }
         return NavigationRules.isChatGPTHost(origin.host.lowercased())
+    }
+
+    private static func isTrustedChatGPTURL(_ url: URL?) -> Bool {
+        guard let url,
+              url.scheme?.lowercased() == "https",
+              (url.port == nil || url.port == 443),
+              let host = url.host else {
+            return false
+        }
+        return NavigationRules.isChatGPTHost(host.lowercased())
     }
 
     private static func shouldOpenInsideApp(_ url: URL, sourceURL: URL? = nil) -> Bool {
@@ -2897,7 +3283,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       const isTrustedPage = () => {
         try {
           const host = location.hostname.toLowerCase();
-          return location.protocol === 'https:' && (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com' || host.endsWith('.chat.openai.com'));
+          return location.protocol === 'https:' && (location.port === '' || location.port === '443') && (host === 'chatgpt.com' || host.endsWith('.chatgpt.com') || host === 'chat.openai.com' || host.endsWith('.chat.openai.com'));
         } catch (_) {
           return false;
         }

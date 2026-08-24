@@ -2,9 +2,18 @@ import Foundation
 
 public enum CookieImportParser {
     public static let errorDomain = "ChatGPTSwiftWeb.CookieImport"
+    public static let maximumImportBytes = 2 * 1024 * 1024
+    public static let maximumCookieCount = 1024
+    public static let maximumCookieNameBytes = 256
+    public static let maximumCookieValueBytes = 64 * 1024
+    public static let maximumCookieDomainBytes = 255
+    public static let maximumCookiePathBytes = 4096
     private static let defaultHeaderCookieImportDomain = ".chatgpt.com"
 
     public static func parse(data: Data) throws -> [HTTPCookie] {
+        guard data.count <= maximumImportBytes else {
+            throw cookieImportError("Cookie 文件过大")
+        }
         guard let text = String(data: data, encoding: .utf8) else {
             throw cookieImportError("Cookie 文件必须是 UTF-8 文本")
         }
@@ -22,6 +31,10 @@ public enum CookieImportParser {
             exportedCookies = try parseNetscapeCookieText(trimmedText)
         } else {
             exportedCookies = try parseHeaderCookieText(trimmedText)
+        }
+
+        guard exportedCookies.count <= maximumCookieCount else {
+            throw cookieImportError("Cookie 数量超过 \(maximumCookieCount) 个上限")
         }
 
         let cookies = try exportedCookies.map { try $0.makeCookie() }
@@ -406,6 +419,19 @@ private struct CookieImportRecord: Codable {
 
         guard !trimmedName.isEmpty else {
             throw CookieImportParser.cookieImportError("cookie 名称为空")
+        }
+        guard trimmedName.utf8.count <= CookieImportParser.maximumCookieNameBytes,
+              value.utf8.count <= CookieImportParser.maximumCookieValueBytes,
+              trimmedDomain.utf8.count <= CookieImportParser.maximumCookieDomainBytes,
+              cookiePath.utf8.count <= CookieImportParser.maximumCookiePathBytes else {
+            throw CookieImportParser.cookieImportError("cookie 字段过大")
+        }
+        let controlCharacters = CharacterSet.controlCharacters
+        guard !trimmedName.unicodeScalars.contains(where: controlCharacters.contains),
+              !value.unicodeScalars.contains(where: controlCharacters.contains),
+              !trimmedDomain.unicodeScalars.contains(where: controlCharacters.contains),
+              !cookiePath.unicodeScalars.contains(where: controlCharacters.contains) else {
+            throw CookieImportParser.cookieImportError("cookie 字段包含控制字符")
         }
         guard !trimmedDomain.isEmpty else {
             throw CookieImportParser.cookieImportError("cookie 域名为空")

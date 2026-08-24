@@ -7,6 +7,7 @@ APP_NAME="ChatGPT Swift"
 BINARY_NAME="ChatGPTSwiftWeb"
 APP_DIR="$ROOT/dist/$APP_NAME.app"
 ARCHIVE="$ROOT/dist/$APP_NAME.zip"
+ARCHIVE_TMP="$ARCHIVE.tmp.$$"
 CONTENTS="$APP_DIR/Contents"
 MACOS="$CONTENTS/MacOS"
 RESOURCES="$CONTENTS/Resources"
@@ -21,6 +22,7 @@ SPARKLE_PUBLIC_ED_KEY="${CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY:-}"
 SHORT_VERSION_OVERRIDE="${CHATGPT_SWIFT_SHORT_VERSION:-}"
 BUILD_NUMBER_OVERRIDE="${CHATGPT_SWIFT_BUILD_NUMBER:-}"
 KEEP_TRANSIENT_APP="${CHATGPT_SWIFT_KEEP_TRANSIENT_APP:-0}"
+EXPECTED_SPARKLE_VERSION="2.9.6"
 LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 VERIFY_ROOT=""
 
@@ -43,6 +45,7 @@ cleanup_failed_build() {
   if [[ "$status" -ne 0 ]]; then
     unregister_app_bundle "$APP_DIR"
     rm -rf "$APP_DIR"
+    rm -f "$ARCHIVE_TMP"
     rm -f "$ROOT/dist/.metadata_never_index"
   fi
   exit "$status"
@@ -63,6 +66,7 @@ fi
 cd "$ROOT"
 
 mkdir -p .build dist
+rm -f "$ARCHIVE_TMP"
 : > .build/.metadata_never_index
 : > dist/.metadata_never_index
 if [[ -d .build ]]; then
@@ -79,8 +83,11 @@ UNIVERSAL_RELEASE_DIR="$(swift build -c release --arch arm64 --arch x86_64 --sho
 if [[ -z "$SIGN_IDENTITY" ]]; then
   SIGN_IDENTITY="$("$REPO_ROOT/tauri/packaging/ensure-local-codesign-cert.sh")"
 fi
+SIGNING_DISTRIBUTION="github"
 case "$SIGN_IDENTITY" in
-  "Developer ID Application:"*) ;;
+  "Developer ID Application:"*)
+    SIGNING_DISTRIBUTION="developer-id"
+    ;;
   *)
     if [[ -z "$SIGN_ENTITLEMENTS" ]]; then
       SIGN_ENTITLEMENTS="$LOCAL_ENTITLEMENTS"
@@ -106,14 +113,25 @@ if [[ -n "$SPARKLE_FEED_URL" || -n "$SPARKLE_PUBLIC_ED_KEY" ]]; then
     echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL and CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY must be set together." >&2
     exit 2
   fi
-  case "$SPARKLE_FEED_URL" in
+ case "$SPARKLE_FEED_URL" in
     https://*) ;;
     *)
       echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL must be an https:// URL." >&2
       exit 2
       ;;
   esac
-  /usr/libexec/PlistBuddy -c "Add :SUFeedURL string $SPARKLE_FEED_URL" "$CONTENTS/Info.plist" 2>/dev/null \
+  if [[ ! "$SPARKLE_FEED_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]+)?([/?#][^[:cntrl:][:space:]]*)?$ ]]; then
+    echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL must contain a non-empty host and no credentials or control characters." >&2
+    exit 2
+  fi
+  if [[ "$SPARKLE_FEED_URL" =~ ^https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*:([0-9]+)([/\?#].*)?$ ]]; then
+    sparkle_port="${BASH_REMATCH[4]}"
+    if (( sparkle_port < 1 || sparkle_port > 65535 )); then
+      echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL port must be between 1 and 65535." >&2
+      exit 2
+    fi
+  fi
+ /usr/libexec/PlistBuddy -c "Add :SUFeedURL string $SPARKLE_FEED_URL" "$CONTENTS/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :SUFeedURL $SPARKLE_FEED_URL" "$CONTENTS/Info.plist"
   /usr/libexec/PlistBuddy -c "Add :SUPublicEDKey string $SPARKLE_PUBLIC_ED_KEY" "$CONTENTS/Info.plist" 2>/dev/null \
     || /usr/libexec/PlistBuddy -c "Set :SUPublicEDKey $SPARKLE_PUBLIC_ED_KEY" "$CONTENTS/Info.plist"
@@ -124,14 +142,17 @@ for candidate in \
   "$UNIVERSAL_RELEASE_DIR/Sparkle.framework" \
   "$ROOT/.build/artifacts/sparkle/Sparkle/Sparkle.xcframework/macos-arm64_x86_64/Sparkle.framework"
 do
-  if [[ -d "$candidate" ]]; then
+  candidate_info="$candidate/Versions/Current/Resources/Info.plist"
+  [[ -f "$candidate_info" ]] || candidate_info="$candidate/Versions/B/Resources/Info.plist"
+  if [[ -d "$candidate" && -f "$candidate_info" ]] \
+      && [[ "$(/usr/bin/plutil -extract CFBundleShortVersionString raw "$candidate_info" 2>/dev/null || true)" == "$EXPECTED_SPARKLE_VERSION" ]]; then
     SPARKLE_FRAMEWORK_SOURCE="$candidate"
     break
   fi
 done
 
 if [[ -z "$SPARKLE_FRAMEWORK_SOURCE" ]]; then
-  echo "error: Sparkle.framework not found after swift build." >&2
+  echo "error: Sparkle.framework $EXPECTED_SPARKLE_VERSION not found after swift build." >&2
   exit 2
 fi
 /usr/bin/ditto "$SPARKLE_FRAMEWORK_SOURCE" "$FRAMEWORKS/Sparkle.framework"
@@ -166,7 +187,7 @@ if [[ "$SIGN_TIMESTAMP" == "1" ]]; then
 fi
 /usr/bin/codesign "${framework_codesign_args[@]}" "$FRAMEWORKS/Sparkle.framework"
 /usr/bin/codesign "${codesign_args[@]}" "$APP_DIR"
-"$ROOT/packaging/verify-app-bundle.sh" "$APP_DIR" >/dev/null
+"$ROOT/packaging/verify-app-bundle.sh" "$APP_DIR" "$SIGNING_DISTRIBUTION" >/dev/null
 
 if [[ "$KEEP_TRANSIENT_APP" == "1" ]]; then
   trap - EXIT INT TERM
@@ -174,17 +195,18 @@ if [[ "$KEEP_TRANSIENT_APP" == "1" ]]; then
   exit 0
 fi
 
-rm -f "$ARCHIVE"
-/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE"
-/usr/bin/unzip -tq "$ARCHIVE" >/dev/null
+rm -f "$ARCHIVE_TMP"
+/usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_DIR" "$ARCHIVE_TMP"
+/usr/bin/unzip -tq "$ARCHIVE_TMP" >/dev/null
 VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt-swift-archive-verify.XXXXXX")"
 : > "$VERIFY_ROOT/.metadata_never_index"
-/usr/bin/ditto -x -k "$ARCHIVE" "$VERIFY_ROOT"
+/usr/bin/ditto -x -k "$ARCHIVE_TMP" "$VERIFY_ROOT"
 VERIFY_APP="$VERIFY_ROOT/$APP_NAME.app"
 [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$VERIFY_APP/Contents/Info.plist" 2>/dev/null || true)" == "local.chatgpt-web.swift" ]]
-"$ROOT/packaging/verify-app-bundle.sh" "$VERIFY_APP" >/dev/null
+"$ROOT/packaging/verify-app-bundle.sh" "$VERIFY_APP" "$SIGNING_DISTRIBUTION" >/dev/null
 rm -rf "$VERIFY_ROOT"
 VERIFY_ROOT=""
+mv -f "$ARCHIVE_TMP" "$ARCHIVE"
 unregister_app_bundle "$APP_DIR"
 rm -rf "$APP_DIR"
 rm -f "$ROOT/dist/.metadata_never_index"

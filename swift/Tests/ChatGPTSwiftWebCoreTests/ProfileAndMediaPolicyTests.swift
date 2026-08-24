@@ -75,7 +75,7 @@ final class ProfileAndMediaPolicyTests: XCTestCase {
         )
     }
 
-    func testThirdPartyOriginKeepsBrowserStylePromptEvenWhenSystemAccessIsAuthorized() {
+    func testThirdPartyOriginIsDeniedEvenWhenSystemAccessIsAuthorized() {
         XCTAssertEqual(
             MediaCapturePermissionPolicy.decision(
                 originScheme: "https",
@@ -84,7 +84,21 @@ final class ProfileAndMediaPolicyTests: XCTestCase {
                 microphoneStatus: .authorized,
                 cameraStatus: .authorized
             ),
-            .prompt
+            .deny
+        )
+    }
+
+    func testChatGPTNonStandardPortDoesNotReceiveMediaGrant() {
+        XCTAssertEqual(
+            MediaCapturePermissionPolicy.decision(
+                originScheme: "https",
+                originHost: "chatgpt.com",
+                originPort: 8443,
+                kind: .microphone,
+                microphoneStatus: .authorized,
+                cameraStatus: .authorized
+            ),
+            .deny
         )
     }
 }

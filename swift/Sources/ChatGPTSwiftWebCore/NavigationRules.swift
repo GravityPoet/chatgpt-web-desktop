@@ -13,6 +13,9 @@ public enum NavigationRules {
         guard !trimmed.isEmpty else {
             return nil
         }
+        guard !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return nil
+        }
         let lower = trimmed.lowercased()
         if lower.hasPrefix("http://") {
             return nil
@@ -28,10 +31,79 @@ public enum NavigationRules {
         guard let url = URL(string: candidate),
               url.scheme?.lowercased() == "https",
               let host = url.host, !host.isEmpty,
-              host.contains(".") else {
+              host.contains("."),
+              url.user == nil,
+              url.password == nil,
+              url.port.map({ (1...65535).contains($0) }) ?? true else {
             return nil
         }
         return url
+    }
+
+    /// The only origins that may receive native privileges or native data bridges.
+    /// Third-party pages can still be displayed when the user explicitly keeps them in-app,
+    /// but they remain outside this trusted capability surface.
+    public static func isTrustedAppOrigin(scheme: String, host: String) -> Bool {
+        guard scheme.lowercased() == "https" else {
+            return false
+        }
+        let normalizedHost = host.lowercased()
+        return isChatGPTHost(normalizedHost) || isOpenAIEcosystemHost(normalizedHost)
+    }
+
+   public static func shouldBlockInsecureThirdPartyNavigation(_ url: URL, sourceURL: URL? = nil) -> Bool {
+       guard url.scheme?.lowercased() == "http" else {
+           return false
+       }
+       return !shouldOpenInsideApp(url, sourceURL: sourceURL)
+   }
+
+    /// Restricts WebKit navigation actions to web content schemes. Credentials and executable
+    /// custom schemes never enter an app WebView or popup.
+    public static func isAllowedWebViewNavigationURL(_ url: URL, sourceURL: URL? = nil) -> Bool {
+        guard url.user == nil,
+              url.password == nil,
+              !url.absoluteString.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return false
+        }
+        switch url.scheme?.lowercased() {
+        case "https":
+            return url.host?.isEmpty == false
+                && (url.port.map { (1 ... 65535).contains($0) } ?? true)
+        case "about":
+            return url.absoluteString.lowercased() == "about:blank"
+        case "blob", "data":
+            let sourceScheme = sourceURL?.scheme?.lowercased()
+            return ["https", "blob", "data", "about"].contains(sourceScheme)
+        default:
+            return false
+        }
+    }
+
+    /// Produces a URL safe to expose to another app or the clipboard. Authentication callbacks
+    /// lose query/fragment values; all other URLs retain functional query parameters after tracking
+    /// cleanup. HTTPS and credential-free URLs are the only accepted scheme.
+    public static func sanitizedUserFacingURL(_ url: URL, sourceURL: URL? = nil) -> URL? {
+        guard url.scheme?.lowercased() == "https",
+              let host = url.host?.lowercased(),
+              !host.isEmpty,
+              !host.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              url.user == nil,
+              url.password == nil,
+              url.port.map({ (1 ... 65535).contains($0) }) ?? true,
+              var components = URLComponents(url: cleanTrackingParameters(from: url), resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
+
+        let sensitive = isAuthLikeURL(url, expanded: true)
+            || isOAuthContinuationHost(url)
+            || isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
+        components.fragment = nil
+        if sensitive {
+            components.query = nil
+        }
+        return components.url
     }
 
     public static func shouldOpenInsideApp(_ url: URL, sourceURL: URL? = nil) -> Bool {
@@ -179,11 +251,12 @@ public enum NavigationRules {
     }
 
     public static func isAuthLikeURL(_ url: URL, expanded: Bool = false) -> Bool {
-        let path = url.path.lowercased()
-        let query = url.query?.lowercased() ?? ""
-        let combined = path + "?" + query
+        let pathSegments = url.path
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map { String($0).lowercased() }
         var markers = [
             "oauth",
+            "oauth2",
             "auth",
             "authorize",
             "signin",
@@ -203,7 +276,24 @@ public enum NavigationRules {
                 "sso",
             ])
         }
-        return markers.contains { combined.contains($0) }
+        if pathSegments.contains(where: { segment in
+            markers.contains { marker in
+                segment == marker || (marker == "oauth" && segment.hasPrefix("oauth2"))
+            }
+        }) {
+            return true
+        }
+
+        let sensitiveQueryNames: Set<String> = [
+            "access_token", "assertion", "authorization", "client_id", "code", "credential",
+            "id_token", "login_hint", "nonce", "passkey", "redirect_uri", "response_type",
+            "samlresponse", "scope", "state", "token", "verification_token",
+        ]
+        return URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.contains { item in
+            let name = item.name.lowercased()
+            return sensitiveQueryNames.contains(name)
+                || (expanded && (name.hasSuffix("_token") || name.hasSuffix("_code")))
+        } ?? false
     }
 
     public static func isOAuthContinuationHost(_ url: URL) -> Bool {

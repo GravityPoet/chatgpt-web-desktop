@@ -23,16 +23,20 @@ public enum MediaCapturePermissionPolicy {
     public static func decision(
         originScheme: String,
         originHost: String,
+        originPort: Int? = nil,
         kind: MediaCaptureKind,
         microphoneStatus: MediaDeviceAuthorizationStatus,
         cameraStatus: MediaDeviceAuthorizationStatus
     ) -> MediaCapturePermissionDecision {
         let normalizedHost = originHost.lowercased()
         let isTrustedOrigin = originScheme.lowercased() == "https"
-            && (NavigationRules.isChatGPTHost(normalizedHost) || NavigationRules.isOpenAIFamilyHost(normalizedHost))
+            && (originPort == nil || originPort == 443)
+            && NavigationRules.isChatGPTHost(normalizedHost)
 
         guard isTrustedOrigin else {
-            return .prompt
+            // Third-party pages may remain visible in an in-app popup, but they must not use the
+            // wrapper's media permission surface to induce a microphone/camera grant.
+            return .deny
         }
 
         let relevantStatuses: [MediaDeviceAuthorizationStatus]

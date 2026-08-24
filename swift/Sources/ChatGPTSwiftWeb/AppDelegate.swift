@@ -28,6 +28,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     )
     private var sparkleUpdaterController: SPUStandardUpdaterController?
     private var sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
+    private(set) var profileMutationInProgress = false
+    private var cookieConsentMutationGeneration = 0
+    /// Tracks asynchronous consent-cookie mutations started from settings. Destructive profile
+    /// operations drain this group before removing a WebKit data store so late callbacks cannot
+    /// recreate data in a store that was just deleted.
+    private let cookieConsentOperationGroup = DispatchGroup()
+    private enum PendingDataMutationKind {
+        static let deleteProfile = "delete-profile"
+        static let resetDefault = "reset-default"
+        static let burn = "burn"
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         RemoteImageLoader.cleanupStaleTemporaryFiles()
@@ -47,23 +58,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         configureSparkleUpdaterIfAvailable()
         installKeyboardZoomShortcuts()
         let needsIsolationFallbackNotice = smokeTestRun ? false : reconcileProfileIsolationOnLaunch()
-        if !smokeTestRun {
+        let pendingMutation = !smokeTestRun && ProfileStore.pendingDataMutation != nil
+        if !smokeTestRun && !pendingMutation {
             ProfileStore.applyStartupProfileIfAvailable()
             ProfileStore.ensurePrivacyBaseline()
         }
 
-        let profile = smokeTestRun ? nil : ProfileStore.currentProfile()
+        let profile = smokeTestRun || pendingMutation ? nil : ProfileStore.currentProfile()
         let controller = BrowserWindowController(
-            initialURL: smokeTestRun ? chatGPTURL : ProfileStore.homepageURL(for: profile?.id ?? defaultProfileID),
-            title: profile.map(mainWindowTitle(for:)) ?? "ChatGPT Swift Smoke Test",
+            initialURL: smokeTestRun
+                ? chatGPTURL
+                : (pendingMutation ? nil : ProfileStore.homepageURL(for: profile?.id ?? defaultProfileID)),
+            title: profile.map(mainWindowTitle(for:)) ?? (pendingMutation ? "正在恢复空间数据…" : "ChatGPT Swift Smoke Test"),
             isPopup: false,
-            persistent: !smokeTestRun,
+            persistent: !smokeTestRun && !pendingMutation,
             profileID: profile?.id
         )
         mainController = controller
-        controller.show()
+        if !pendingMutation {
+            controller.show()
+        }
         NSApp.activate(ignoringOtherApps: true)
-        scheduleSmokeTestIfRequested()
+        if pendingMutation {
+            reconcilePendingDataMutation()
+        }
+        if !pendingMutation {
+            scheduleSmokeTestIfRequested()
+        }
 
         if !smokeTestRun,
            BrowserPerformancePolicy.shouldRefreshExitTimezoneCache(
@@ -91,6 +112,136 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return true
     }
 
+    /// Completes a destructive data operation that was journaled before WebKit was asked to
+    /// mutate a persistent store. The journal is intentionally tiny and contains only an operation
+    /// kind plus profile ID; it lets a crash between WebKit and UserDefaults converge safely on the
+    /// next launch instead of leaving a ghost profile or stale metadata.
+    private func reconcilePendingDataMutation() {
+        guard let pending = ProfileStore.pendingDataMutation else {
+            return
+        }
+
+        switch pending.kind {
+        case PendingDataMutationKind.deleteProfile:
+            reconcilePendingProfileDeletion(profileID: pending.profileID)
+        case PendingDataMutationKind.resetDefault:
+            reconcilePendingDefaultReset()
+        case PendingDataMutationKind.burn:
+            reconcilePendingBurn(profileID: pending.profileID)
+        default:
+            ProfileStore.clearPendingDataMutation()
+            rebuildMainController()
+        }
+    }
+
+    private func reconcilePendingProfileDeletion(profileID: String) {
+        guard #available(macOS 14.0, *) else {
+            ProfileStore.clearPendingDataMutation()
+            rebuildMainController()
+            return
+        }
+        guard profileID != defaultProfileID,
+              let identifier = UUID(uuidString: profileID) else {
+            ProfileStore.clearPendingDataMutation()
+            rebuildMainController()
+            return
+        }
+        guard ProfileStore.loadProfiles().contains(where: { $0.id == profileID }) else {
+            ProfileStore.clearPendingDataMutation()
+            rebuildMainController()
+            return
+        }
+
+        profileMutationInProgress = true
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            BrowserWindowController.disposeControllers(for: profileID) { [weak self] in
+                guard let self else { return }
+                let wasCurrent = ProfileStore.currentProfileID() == profileID
+                if wasCurrent {
+                    ProfileStore.setCurrentProfileID(defaultProfileID)
+                    self.rebuildMainController()
+                }
+                WKWebsiteDataStore.remove(forIdentifier: identifier) { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if let error {
+                            if wasCurrent {
+                                ProfileStore.setCurrentProfileID(profileID)
+                            }
+                            ProfileStore.clearPendingDataMutation()
+                            self.profileMutationInProgress = false
+                            self.rebuildMainController()
+                            self.presentError("上次空间删除未完成，已保留空间配置：\(error.localizedDescription)")
+                            return
+                        }
+                        self.finalizeProfileDeletion(profileID: profileID)
+                        ProfileStore.clearPendingDataMutation()
+                        self.profileMutationInProgress = false
+                        self.applyCurrentCookiePreferenceAfterMutation()
+                        self.presentInfo("已完成上次中断的空间删除。")
+                    }
+                }
+            }
+        }
+    }
+
+    private func reconcilePendingDefaultReset() {
+        profileMutationInProgress = true
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            BrowserWindowController.disposeControllers(for: defaultProfileID) { [weak self] in
+                guard let self else { return }
+                WebsiteDataCleaner.removeAllData(from: WKWebsiteDataStore.default()) { [weak self] in
+                    guard let self else { return }
+                    ProfileStore.resetDefaultProfile()
+                    ProfileStore.clearPendingDataMutation()
+                    self.profileMutationInProgress = false
+                    self.applyCurrentCookiePreferenceAfterMutation()
+                    self.profilesMenu.map(self.rebuildProfilesMenu(_:))
+                    self.rebuildMainController()
+                    self.presentInfo("已完成上次中断的内置空间重建。")
+                }
+            }
+        }
+    }
+
+    private func reconcilePendingBurn(profileID: String) {
+        guard ProfileStore.loadProfiles().contains(where: { $0.id == profileID }) else {
+            ProfileStore.clearPendingDataMutation()
+            rebuildMainController()
+            return
+        }
+        profileMutationInProgress = true
+        let dataStore: WKWebsiteDataStore
+        if profileID == defaultProfileID {
+            dataStore = .default()
+        } else if #available(macOS 14.0, *), let identifier = UUID(uuidString: profileID) {
+            dataStore = WKWebsiteDataStore(forIdentifier: identifier)
+        } else {
+            ProfileStore.clearPendingDataMutation()
+            profileMutationInProgress = false
+            rebuildMainController()
+            return
+        }
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            BrowserWindowController.disposeControllers(for: profileID) { [weak self] in
+                guard let self else { return }
+                WebsiteDataCleaner.removeAllData(from: dataStore) { [weak self] in
+                    guard let self else { return }
+                    PromptDraftStore.clearDraft(for: profileID)
+                    ProfileStore.disableFingerprint(for: profileID)
+                    ProfileStore.clearPendingDataMutation()
+                    self.profileMutationInProgress = false
+                    self.applyCurrentCookiePreferenceAfterMutation()
+                    self.rebuildMainController()
+                    self.presentInfo("已完成上次中断的空间清理。")
+                }
+            }
+        }
+    }
+
     private func presentIsolationFallbackNotice() {
         let alert = NSAlert()
         alert.messageText = "已回退到默认账号空间"
@@ -101,7 +252,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        if !flag {
+        if !flag, !profileMutationInProgress, ProfileStore.pendingDataMutation == nil {
             mainController?.show()
         }
         return true
@@ -384,6 +535,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func installKeyboardZoomShortcuts() {
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, !self.profileMutationInProgress,
+                  ProfileStore.pendingDataMutation == nil else {
+                return event
+            }
             guard let controller = BrowserWindowController.keyWindowController() else {
                 return event
             }
@@ -400,7 +555,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
             switch event.charactersIgnoringModifiers {
             case ",":
-                self?.openAppSettingsAction(nil)
+                self.openAppSettingsAction(nil)
                 return nil
             case "[":
                 controller.goBack(nil)
@@ -533,6 +688,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setWebRTCProtectionFromSettings(_ enabled: Bool) {
+        guard ensureProfileMetadataWritable() else { return }
         guard PrivacySettings.isWebRTCProtectionEnabled() != enabled else {
             refreshNativeUtilityWindows()
             return
@@ -544,6 +700,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setPromptDraftRestoreFromSettings(_ enabled: Bool) {
+        guard ensureProfileMetadataWritable() else { return }
         PromptDraftStore.setRestoreEnabled(enabled)
         if !enabled {
             PromptDraftStore.clearDraft(for: ProfileStore.currentProfileID())
@@ -583,26 +740,92 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setRejectNonEssentialCookiesFromSettings(_ enabled: Bool) {
+        guard ensureProfileMetadataWritable() else { return }
         CookieConsentSettings.setEnabled(enabled)
-        guard let controller = mainController else {
-            refreshNativeUtilityWindows()
+        cookieConsentMutationGeneration &+= 1
+        let generation = cookieConsentMutationGeneration
+        applyCookiePreference(enabled: enabled, generation: generation)
+    }
+
+    private func applyCookiePreference(enabled: Bool, generation: Int) {
+        guard !profileMutationInProgress else {
             return
         }
-
-        if enabled {
-            controller.applyDefaultCookieConsent { [weak self, weak controller] in
-                controller?.setStatus("已默认拒绝非必要 Cookie；下次页面加载生效", showsProgress: false)
-                self?.refreshNativeUtilityWindows()
+        let stores = activePersistentDataStores()
+        let group = DispatchGroup()
+        let operationGroup = cookieConsentOperationGroup
+        for store in stores {
+            group.enter()
+            operationGroup.enter()
+            var didFinish = false
+            let finish = {
+                guard !didFinish else { return }
+                didFinish = true
+                operationGroup.leave()
+                group.leave()
             }
+            if enabled {
+                CookieConsentSettings.applyIfEnabled(to: store, completion: finish)
+            } else {
+                CookieConsentSettings.clearManagedRejectionCookies(from: store, completion: finish)
+            }
+        }
+        group.notify(queue: .main) { [weak self, weak controller = mainController] in
+            guard let self else { return }
+            guard !self.profileMutationInProgress else {
+                return
+            }
+            guard self.cookieConsentMutationGeneration == generation else {
+                self.applyCookiePreference(
+                    enabled: CookieConsentSettings.isEnabled(),
+                    generation: self.cookieConsentMutationGeneration
+                )
+                return
+            }
+            if enabled {
+                controller?.setStatus("已默认拒绝非必要 Cookie；所有账号空间将在下次加载时继续执行", showsProgress: false)
+            } else {
+                controller?.setStatus("已取消默认拒绝；所有账号空间下次加载可在 Cookie Preferences 中选择", showsProgress: false)
+            }
+            self.refreshNativeUtilityWindows()
+        }
+    }
+
+    /// New preference mutations are blocked while `profileMutationInProgress` is true, so this
+    /// drain gives destructive cleanup a stable boundary around all already-issued WebKit calls.
+    private func waitForCookieConsentOperations(completion: @escaping () -> Void) {
+        cookieConsentOperationGroup.notify(queue: .main, execute: completion)
+    }
+
+    private func invalidateCookiePreferenceMutations() {
+        cookieConsentMutationGeneration &+= 1
+    }
+
+    private func applyCurrentCookiePreferenceAfterMutation() {
+        guard !profileMutationInProgress else {
             return
         }
+        cookieConsentMutationGeneration &+= 1
+        applyCookiePreference(
+            enabled: CookieConsentSettings.isEnabled(),
+            generation: cookieConsentMutationGeneration
+        )
+    }
 
-        CookieConsentSettings.clearManagedRejectionCookies(
-            from: controller.webView.configuration.websiteDataStore
-        ) { [weak self, weak controller] in
-            controller?.setStatus("已取消默认拒绝；下次页面加载可在 Cookie Preferences 中选择", showsProgress: false)
-            self?.refreshNativeUtilityWindows()
+    private func activePersistentDataStores() -> [WKWebsiteDataStore] {
+        var stores = [WKWebsiteDataStore.default()]
+        guard #available(macOS 14.0, *) else {
+            return stores
         }
+
+        var seen = Set<UUID>()
+        for profile in ProfileStore.loadProfiles() where profile.id != defaultProfileID {
+            guard let identifier = UUID(uuidString: profile.id), seen.insert(identifier).inserted else {
+                continue
+            }
+            stores.append(WKWebsiteDataStore(forIdentifier: identifier))
+        }
+        return stores
     }
 
     private func setWindowTitleDisplayModeFromSettings(_ mode: WindowTitleDisplayMode) {
@@ -612,6 +835,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setEnhancedPrivacyFromSettings(_ enabled: Bool) {
+        guard ensureProfileMetadataWritable() else { return }
         let profileID = ProfileStore.currentProfileID()
         guard ProfileStore.isEnhancedPrivacyEnabled(for: profileID) != enabled else {
             refreshNativeUtilityWindows()
@@ -711,7 +935,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("ChatGPTSwiftWeb", forHTTPHeaderField: "User-Agent")
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+        let session = URLSession(configuration: configuration)
+        session.dataTask(with: request) { [weak self] data, response, error in
+            defer { session.finishTasksAndInvalidate() }
             DispatchQueue.main.async {
                 guard let self else {
                     return
@@ -726,8 +956,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     return
                 }
 
-                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                guard statusCode == 200, let data else {
+                let httpResponse = response as? HTTPURLResponse
+                let statusCode = httpResponse?.statusCode ?? 0
+                let responseHost = httpResponse?.url?.host?.lowercased()
+                guard statusCode == 200,
+                      httpResponse?.url?.scheme?.lowercased() == "https",
+                      responseHost == "api.github.com",
+                      let data,
+                      data.count <= 512 * 1024 else {
                     self.updateCheckStatus = "没有可读取的 GitHub Release feed（HTTP \(statusCode)）。"
                     self.refreshNativeUtilityWindows()
                     if showAlert {
@@ -968,6 +1204,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         sections.append(Self.diagnosticSection("账号空间 / 隐私", [
             ("当前空间", profileLabel),
+            ("空间配置恢复", ProfileStore.metadataRecoveryRequired ? "需要恢复；原始配置已保留，写操作已暂停" : "正常"),
             ("首页", DiagnosticRedactor.url(ProfileStore.homepageURL(for: profile.id))),
             ("启动默认空间", startupProfileLabel),
             ("本机草稿恢复", PromptDraftStore.isRestoreEnabled() ? "开启" : "关闭"),
@@ -1121,31 +1358,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func importCookiesMenu(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         mainController?.importCookiesFromPanel()
     }
 
     @objc private func pasteCookiesMenu(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         mainController?.pasteCookiesFromDialog()
     }
 
     @objc private func exportCookiesMenu(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         mainController?.exportCookiesViaPanel()
     }
 
     @objc private func burnCurrentProfileData(_ sender: Any?) {
-        mainController?.confirmBurnCurrentProfileData { [weak self] in
-            guard let self else {
-                return
+        guard ensureProfileMetadataWritable() else { return }
+        guard let controller = mainController else { return }
+        profileMutationInProgress = true
+        invalidateCookiePreferenceMutations()
+        // Drain any settings-triggered cookie writes before presenting the destructive action.
+        // `profileMutationInProgress` blocks new batches while the confirmation sheet is open.
+        waitForCookieConsentOperations { [weak self, weak controller] in
+            guard let self, let controller, self.profileMutationInProgress else { return }
+            controller.confirmBurnCurrentProfileData(onCancel: { [weak self] in
+                self?.profileMutationInProgress = false
+                self?.applyCurrentCookiePreferenceAfterMutation()
+            }) { [weak self] in
+                guard let self else {
+                    return
+                }
+                let profileID = ProfileStore.currentProfileID()
+                PromptDraftStore.clearDraft(for: profileID)
+                ProfileStore.disableFingerprint(for: profileID)
+                ProfileStore.clearPendingDataMutation()
+                self.profileMutationInProgress = false
+                self.applyCurrentCookiePreferenceAfterMutation()
+                self.rebuildMainController()
+                self.presentInfo("已焚烧当前空间浏览现场，并恢复为默认 Safari 指纹。空间名称、首页和增强隐私设置已保留。")
             }
-            let profileID = ProfileStore.currentProfileID()
-            PromptDraftStore.clearDraft(for: profileID)
-            ProfileStore.disableFingerprint(for: profileID)
-            self.rebuildMainController()
-            self.presentInfo("已焚烧当前空间浏览现场，并恢复为默认 Safari 指纹。空间名称、首页和增强隐私设置已保留。")
         }
     }
 
     @objc private func toggleWebRTCProtection(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let enabled = !PrivacySettings.isWebRTCProtectionRequested()
         PrivacySettings.setWebRTCProtectionEnabled(enabled)
         updateWebRTCProtectionMenuItem()
@@ -1201,10 +1457,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func openFingerprintTestPage(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         mainController?.loadFingerprintTestPage()
     }
 
     @objc private func goToURLAction(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         guard let controller = mainController else {
             return
         }
@@ -1222,18 +1480,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func goBackAction(_ sender: Any?) {
+        guard !profileMutationInProgress else { return }
         BrowserWindowController.keyWindowController()?.goBack(sender)
     }
 
     @objc private func goForwardAction(_ sender: Any?) {
+        guard !profileMutationInProgress else { return }
         BrowserWindowController.keyWindowController()?.goForward(sender)
     }
 
     @objc private func goHomeAction(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         (BrowserWindowController.keyWindowController() ?? mainController)?.goHome(sender)
     }
 
     @objc private func reloadAction(_ sender: Any?) {
+        guard !profileMutationInProgress, !ProfileStore.metadataRecoveryRequired else { return }
         guard let controller = BrowserWindowController.keyWindowController() ?? mainController else {
             return
         }
@@ -1257,16 +1519,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func copyCurrentURLAction(_ sender: Any?) {
-        guard let url = (BrowserWindowController.keyWindowController() ?? mainController)?.currentURL() else {
+        guard let controller = BrowserWindowController.keyWindowController() ?? mainController,
+              let url = controller.currentURL(),
+              let safeURL = NavigationRules.sanitizedUserFacingURL(url, sourceURL: url) else {
+            presentError("当前页面没有可安全复制的 HTTPS 链接；登录临时参数不会写入剪贴板。")
             return
         }
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(url.absoluteString, forType: .string)
+        NSPasteboard.general.setString(safeURL.absoluteString, forType: .string)
+        if safeURL != url {
+            controller.setStatus("已移除登录临时参数后复制", showsProgress: false)
+        }
     }
 
     @objc private func setProfileHomepageAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let profile = ProfileStore.currentProfile()
-        let initial = UserDefaults.standard.string(forKey: profileHomepageDefaultsPrefix + profile.id) ?? ""
+        let initial = ProfileStore.homepageString(for: profile.id) ?? ""
         promptForURL(
             title: "设置空间 \"\(profile.name)\" 的首页",
             message: "下次启动或切换到本空间时将自动加载该网址。仅支持 https://。留空可以保持当前设置。",
@@ -1281,6 +1550,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func resetProfileHomepageAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let profile = ProfileStore.currentProfile()
         ProfileStore.removeHomepage(for: profile.id)
         rebuildMainController(initialURL: ProfileStore.homepageURL(for: profile.id))
@@ -1306,6 +1576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func switchToProfile(_ sender: NSMenuItem) {
+        guard ensureProfileMetadataWritable() else { return }
         guard let id = sender.representedObject as? String else {
             return
         }
@@ -1330,6 +1601,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func setProfileAsDefault(id: String) {
+        guard ensureProfileMetadataWritable() else { return }
         guard ProfileStore.setStartupProfileID(id) else {
             presentError("设置启动默认空间失败：找不到目标空间。")
             return
@@ -1340,6 +1612,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func selectFingerprintPreset(_ sender: NSMenuItem) {
+        guard ensureProfileMetadataWritable() else { return }
         guard let presetID = sender.representedObject as? String else {
             return
         }
@@ -1354,6 +1627,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func randomizeCurrentFingerprint(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let profileID = ProfileStore.currentProfileID()
         ProfileStore.setFingerprint(FingerprintCatalog.randomProfile(), for: profileID)
         updateWebRTCProtectionMenuItem()
@@ -1361,6 +1635,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func toggleEnhancedPrivacy(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let profileID = ProfileStore.currentProfileID()
         let enabled = !ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         ProfileStore.setEnhancedPrivacyEnabled(enabled, for: profileID)
@@ -1369,6 +1644,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func cloneCurrentProfileAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         guard ensureIsolationAvailable() else {
             return
         }
@@ -1433,6 +1709,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func importProfileAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         guard ensureIsolationAvailable() else {
             return
         }
@@ -1450,6 +1727,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 return
             }
             self?.importProfile(from: url)
+        }
+    }
+
+    @objc private func restoreProfileMetadataAction(_ sender: Any?) {
+        guard !profileMutationInProgress,
+              ProfileStore.pendingDataMutation == nil,
+              ProfileStore.metadataRecoveryRequired else {
+            return
+        }
+        guard ProfileStore.restoreProfilesFromBackup() else {
+            presentError("没有可自动恢复的有效空间配置备份。可以先导出原始备份，再选择重建默认空间。")
+            return
+        }
+        profilesMenu.map(rebuildProfilesMenu(_:))
+        updateWebRTCProtectionMenuItem()
+        updateEnhancedPrivacyMenuItem()
+        rebuildMainController()
+        presentInfo("已从保留的原始备份恢复账号空间配置；网站数据未被删除。")
+    }
+
+    @objc private func resetProfileMetadataAfterRecoveryAction(_ sender: Any?) {
+        guard !profileMutationInProgress,
+              ProfileStore.pendingDataMutation == nil,
+              ProfileStore.metadataRecoveryRequired else {
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "重建默认空间配置？"
+        alert.informativeText = "将保留原始损坏配置备份，只重建一个默认空间；不会删除任何 WebKit 网站数据。之后可以从“检查遗留账号空间数据”中单独处理旧空间。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "重建默认空间")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            return
+        }
+        ProfileStore.resetToDefaultAfterRecovery()
+        profilesMenu.map(rebuildProfilesMenu(_:))
+        updateWebRTCProtectionMenuItem()
+        updateEnhancedPrivacyMenuItem()
+        rebuildMainController()
+        presentInfo("已重建默认空间配置；网站数据仍保留。")
+    }
+
+    @objc private func exportCorruptProfileMetadataAction(_ sender: Any?) {
+        guard let data = ProfileStore.corruptProfilesBackupData else {
+            presentError("没有可导出的原始空间配置备份。")
+            return
+        }
+        let panel = NSSavePanel()
+        panel.title = "导出原始空间配置备份"
+        panel.message = "该文件可能包含账号空间名称、首页和隐私配置；不会包含 cookies 或网站数据。"
+        panel.prompt = "导出"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "ChatGPT-Swift-corrupt-profile-backup.json"
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url else { return }
+            do {
+                try BrowserDataBoundary.writeSensitiveData(data, to: url)
+                self?.presentInfo("已导出原始空间配置备份。")
+            } catch {
+                self?.presentError("导出原始备份失败：\(error.localizedDescription)")
+            }
         }
     }
 
@@ -1475,6 +1814,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func addProfileAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         guard ensureIsolationAvailable() else {
             return
         }
@@ -1498,6 +1838,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     @objc private func renameCurrentProfileAction(_ sender: Any?) {
+        guard ensureProfileMetadataWritable() else { return }
         let currentID = ProfileStore.currentProfileID()
         var profiles = ProfileStore.loadProfiles()
         guard let idx = profiles.firstIndex(where: { $0.id == currentID }) else {
@@ -1545,8 +1886,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func deleteProfile(id: String) {
+        guard !ProfileStore.metadataRecoveryRequired else {
+            presentError("账号空间配置无法读取；原始配置已保留，恢复前不会删除任何空间数据。")
+            return
+        }
         let currentID = ProfileStore.currentProfileID()
-        var profiles = ProfileStore.loadProfiles()
+        let profiles = ProfileStore.loadProfiles()
         guard let idx = profiles.firstIndex(where: { $0.id == id }) else {
             presentError("删除失败：找不到目标空间。")
             return
@@ -1569,23 +1914,75 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         guard alert.runModal() == .alertFirstButtonReturn else {
             return
         }
-        profiles.remove(at: idx)
-        ProfileStore.save(profiles)
-        ProfileStore.removeHomepage(for: profile.id)
-        ProfileStore.setFingerprint(nil, for: profile.id)
-        ProfileStore.setEnhancedPrivacyEnabled(false, for: profile.id)
-        PromptDraftStore.clearDraft(for: profile.id)
-        ProfileStore.clearStartupProfileIfNeeded(profile.id)
-        profilesMenu.map(rebuildProfilesMenu(_:))
-        if currentID == profile.id {
-            ProfileStore.setCurrentProfileID(defaultProfileID)
-            rebuildMainController()
+        guard !profileMutationInProgress else {
+            return
         }
-        if #available(macOS 14.0, *), let uuid = UUID(uuidString: profile.id) {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                WKWebsiteDataStore.remove(forIdentifier: uuid) { _ in }
+        profileMutationInProgress = true
+        invalidateCookiePreferenceMutations()
+        let wasCurrent = currentID == profile.id
+        // Close every WebView using this persistent store before asking WebKit to remove it. The
+        // metadata is finalized only after WebKit confirms removal; a failed deletion therefore
+        // cannot leave a profile pointing at an unknown half-deleted store.
+        ProfileStore.markPendingDataMutation(
+            kind: PendingDataMutationKind.deleteProfile,
+            profileID: profile.id
+        )
+        guard #available(macOS 14.0, *), let uuid = UUID(uuidString: profile.id) else {
+            profileMutationInProgress = false
+            ProfileStore.clearPendingDataMutation()
+            applyCurrentCookiePreferenceAfterMutation()
+            if wasCurrent, ProfileStore.currentProfileID() == defaultProfileID {
+                ProfileStore.setCurrentProfileID(profile.id)
+                rebuildMainController()
+            }
+            presentError("当前系统无法安全删除该空间的数据仓库；空间配置已保留。")
+            return
+        }
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            BrowserWindowController.disposeControllers(for: profile.id) { [weak self] in
+                guard let self else { return }
+                if wasCurrent {
+                    ProfileStore.setCurrentProfileID(defaultProfileID)
+                    self.rebuildMainController()
+                }
+                WKWebsiteDataStore.remove(forIdentifier: uuid) { [weak self] error in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if let error {
+                            ProfileStore.clearPendingDataMutation()
+                            self.profileMutationInProgress = false
+                            self.applyCurrentCookiePreferenceAfterMutation()
+                            if wasCurrent, ProfileStore.currentProfileID() == defaultProfileID {
+                                ProfileStore.setCurrentProfileID(profile.id)
+                                self.rebuildMainController()
+                            }
+                            self.presentError("删除空间数据失败，已保留空间配置：\(error.localizedDescription)")
+                            return
+                        }
+                        self.profileMutationInProgress = false
+                        self.finalizeProfileDeletion(profileID: profile.id)
+                        ProfileStore.clearPendingDataMutation()
+                        self.applyCurrentCookiePreferenceAfterMutation()
+                        self.presentInfo("已删除空间「\(profile.name)」及其网站数据。")
+                    }
+                }
             }
         }
+    }
+
+    private func finalizeProfileDeletion(profileID: String) {
+        var profiles = ProfileStore.loadProfiles()
+        profiles.removeAll { $0.id == profileID }
+        guard profiles.contains(where: { $0.id == defaultProfileID }) else {
+            return
+        }
+        ProfileStore.removeAllMetadata(for: profileID)
+        ProfileStore.save(profiles)
+        ProfileStore.clearStartupProfileIfNeeded(profileID)
+        profilesMenu.map(rebuildProfilesMenu(_:))
+        updateEnhancedPrivacyMenuItem()
+        refreshNativeUtilityWindows()
     }
 
     private func deleteDefaultProfile(_ profile: WebProfile, isCurrent: Bool) {
@@ -1598,53 +1995,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         guard alert.runModal() == .alertFirstButtonReturn else {
             return
         }
+        guard !profileMutationInProgress else {
+            return
+        }
+        profileMutationInProgress = true
+        invalidateCookiePreferenceMutations()
 
-        WebsiteDataCleaner.removeAllData(from: WKWebsiteDataStore.default()) { [weak self] in
-            guard let self else {
-                return
+        ProfileStore.markPendingDataMutation(
+            kind: PendingDataMutationKind.resetDefault,
+            profileID: defaultProfileID
+        )
+
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            BrowserWindowController.disposeControllers(for: defaultProfileID) { [weak self] in
+                guard let self else { return }
+                WebsiteDataCleaner.removeAllData(from: WKWebsiteDataStore.default()) { [weak self] in
+                    guard let self else {
+                        return
+                    }
+                    self.profileMutationInProgress = false
+                    PromptDraftStore.clearDraft(for: defaultProfileID)
+                    ProfileStore.resetDefaultProfile()
+                    ProfileStore.clearPendingDataMutation()
+                    ProfileStore.setCurrentProfileID(isCurrent ? defaultProfileID : ProfileStore.currentProfileID())
+                    self.applyCurrentCookiePreferenceAfterMutation()
+                    self.profilesMenu.map(self.rebuildProfilesMenu(_:))
+                    if isCurrent {
+                        self.rebuildMainController()
+                    }
+                    self.presentInfo("已删除并重新创建内置空间。")
+                }
             }
-            PromptDraftStore.clearDraft(for: defaultProfileID)
-            ProfileStore.resetDefaultProfile()
-            ProfileStore.setCurrentProfileID(isCurrent ? defaultProfileID : ProfileStore.currentProfileID())
-            self.profilesMenu.map(self.rebuildProfilesMenu(_:))
-            if isCurrent {
-                self.rebuildMainController()
-            }
-            self.presentInfo("已删除并重新创建内置空间。")
         }
     }
 
     @objc private func inspectOrphanedProfileDataStores(_ sender: Any?) {
+        guard !profileMutationInProgress else { return }
+        guard !ProfileStore.metadataRecoveryRequired else {
+            presentError("账号空间配置无法读取；原始配置已保留，恢复前不会检查或清理遗留数据。")
+            return
+        }
         guard #available(macOS 14.0, *) else {
             presentInfo("遗留账号空间数据检测需要 macOS 14 或更新版本。")
             return
         }
 
-        let activeProfileIDs = ProfileStore.loadProfiles().map(\.id)
-        WKWebsiteDataStore.fetchAllDataStoreIdentifiers { [weak self] allIdentifiers in
-            guard let self else {
-                return
-            }
-            let orphanedIdentifiers = ProfileDataStoreInventory.orphanedIdentifiers(
-                allIdentifiers: allIdentifiers,
-                activeProfileIDs: activeProfileIDs
-            )
-            guard !orphanedIdentifiers.isEmpty else {
-                self.presentInfo("没有发现已删除账号空间遗留的网站数据。")
-                return
-            }
+        profileMutationInProgress = true
+        invalidateCookiePreferenceMutations()
+        waitForCookieConsentOperations { [weak self] in
+            guard let self, self.profileMutationInProgress else { return }
+            let activeProfileIDs = ProfileStore.loadProfiles().map(\.id)
+            WKWebsiteDataStore.fetchAllDataStoreIdentifiers { [weak self] allIdentifiers in
+                guard let self else {
+                    return
+                }
+                let orphanedIdentifiers = ProfileDataStoreInventory.orphanedIdentifiers(
+                    allIdentifiers: allIdentifiers,
+                    activeProfileIDs: activeProfileIDs
+                )
+                guard !orphanedIdentifiers.isEmpty else {
+                    self.profileMutationInProgress = false
+                    self.applyCurrentCookiePreferenceAfterMutation()
+                    self.presentInfo("没有发现已删除账号空间遗留的网站数据。")
+                    return
+                }
 
-            let alert = NSAlert()
-            alert.messageText = "发现 \(orphanedIdentifiers.count) 份遗留账号空间数据"
-            alert.informativeText = "这些独立 WebKit 数据仓库已不属于当前账号空间，可能仍含 cookie、登录态、缓存与本地存储。清理后无法恢复；当前 \(activeProfileIDs.count) 个账号空间不会被删除。"
-            alert.alertStyle = .warning
-            alert.addButton(withTitle: "清理遗留数据")
-            alert.addButton(withTitle: "保留")
-            guard alert.runModal() == .alertFirstButtonReturn else {
-                return
-            }
+                let alert = NSAlert()
+                alert.messageText = "发现 \(orphanedIdentifiers.count) 份遗留账号空间数据"
+                alert.informativeText = "这些独立 WebKit 数据仓库已不属于当前账号空间，可能仍含 cookie、登录态、缓存与本地存储。清理后无法恢复；当前 \(activeProfileIDs.count) 个账号空间不会被删除。"
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "清理遗留数据")
+                alert.addButton(withTitle: "保留")
+                guard alert.runModal() == .alertFirstButtonReturn else {
+                    self.profileMutationInProgress = false
+                    self.applyCurrentCookiePreferenceAfterMutation()
+                    return
+                }
 
-            self.removeOrphanedProfileDataStores(orphanedIdentifiers[...], removedCount: 0, failedCount: 0)
+                self.removeOrphanedProfileDataStores(orphanedIdentifiers[...], removedCount: 0, failedCount: 0)
+            }
         }
     }
 
@@ -1654,7 +2084,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         removedCount: Int,
         failedCount: Int
     ) {
+        guard !ProfileStore.metadataRecoveryRequired else {
+            profileMutationInProgress = false
+            applyCurrentCookiePreferenceAfterMutation()
+            presentError("账号空间配置进入恢复模式，已停止遗留数据清理。")
+            return
+        }
         guard let identifier = remaining.first else {
+            profileMutationInProgress = false
+            applyCurrentCookiePreferenceAfterMutation()
             if failedCount == 0 {
                 presentInfo("已清理 \(removedCount) 份遗留账号空间数据。当前账号空间不受影响。")
             } else {
@@ -1663,12 +2101,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             return
         }
 
-        WKWebsiteDataStore.remove(forIdentifier: identifier) { [weak self] error in
-            self?.removeOrphanedProfileDataStores(
+        let stillActive = ProfileStore.loadProfiles().contains { profile in
+            UUID(uuidString: profile.id) == identifier
+        }
+        if stillActive {
+            removeOrphanedProfileDataStores(
                 remaining.dropFirst(),
-                removedCount: removedCount + (error == nil ? 1 : 0),
-                failedCount: failedCount + (error == nil ? 0 : 1)
+                removedCount: removedCount,
+                failedCount: failedCount
             )
+            return
+        }
+
+        WKWebsiteDataStore.remove(forIdentifier: identifier) { [weak self] error in
+            DispatchQueue.main.async {
+                self?.removeOrphanedProfileDataStores(
+                    remaining.dropFirst(),
+                    removedCount: removedCount + (error == nil ? 1 : 0),
+                    failedCount: failedCount + (error == nil ? 0 : 1)
+                )
+            }
         }
     }
 
@@ -1683,35 +2135,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         switch menuItem.action {
         case #selector(goBackAction(_:)):
-            return BrowserWindowController.keyWindowController()?.canGoBack ?? false
+            return !profileMutationInProgress && (BrowserWindowController.keyWindowController()?.canGoBack ?? false)
         case #selector(goForwardAction(_:)):
-            return BrowserWindowController.keyWindowController()?.canGoForward ?? false
+            return !profileMutationInProgress && (BrowserWindowController.keyWindowController()?.canGoForward ?? false)
+        case #selector(goToURLAction(_:)), #selector(goHomeAction(_:)), #selector(reloadAction(_:)),
+             #selector(importCookiesMenu(_:)), #selector(pasteCookiesMenu(_:)), #selector(exportCookiesMenu(_:)),
+             #selector(openFingerprintTestPage(_:)), #selector(toggleWebRTCProtection(_:)):
+            return !profileMutationInProgress && !ProfileStore.metadataRecoveryRequired && mainController != nil
         case #selector(zoomInAction(_:)), #selector(zoomOutAction(_:)), #selector(resetZoomAction(_:)):
             return (BrowserWindowController.keyWindowController() ?? mainController) != nil
+        case #selector(burnCurrentProfileData(_:)):
+            return !profileMutationInProgress && !ProfileStore.metadataRecoveryRequired && mainController != nil
         case #selector(switchToProfile(_:)):
             guard let id = menuItem.representedObject as? String else {
                 return false
             }
-            return canUseProfile(id) && id != ProfileStore.currentProfileID()
+            return !profileMutationInProgress
+                && !ProfileStore.metadataRecoveryRequired
+                && canUseProfile(id)
+                && id != ProfileStore.currentProfileID()
         case #selector(setProfileAsDefaultAction(_:)):
             guard let id = menuItem.representedObject as? String else {
                 return false
             }
-            return canUseProfile(id) && id != ProfileStore.startupProfileID()
+            return !profileMutationInProgress
+                && !ProfileStore.metadataRecoveryRequired
+                && canUseProfile(id)
+                && id != ProfileStore.startupProfileID()
         case #selector(setCurrentProfileAsDefaultAction(_:)):
             let currentID = ProfileStore.currentProfileID()
-            return canUseProfile(currentID) && currentID != ProfileStore.startupProfileID()
+            return !profileMutationInProgress
+                && !ProfileStore.metadataRecoveryRequired
+                && canUseProfile(currentID)
+                && currentID != ProfileStore.startupProfileID()
         case #selector(addProfileAction(_:)), #selector(importProfileAction(_:)):
-            return isProfileIsolationAvailable
+            return !profileMutationInProgress && !ProfileStore.metadataRecoveryRequired && isProfileIsolationAvailable
         case #selector(renameCurrentProfileAction(_:)):
-            return isProfileIsolationAvailable || ProfileStore.currentProfileID() == defaultProfileID
+            return !profileMutationInProgress
+                && !ProfileStore.metadataRecoveryRequired
+                && (isProfileIsolationAvailable || ProfileStore.currentProfileID() == defaultProfileID)
         case #selector(deleteProfileAction(_:)):
             guard let id = menuItem.representedObject as? String else {
                 return false
             }
-            return canDeleteProfile(id)
+            return !profileMutationInProgress && !ProfileStore.metadataRecoveryRequired && canDeleteProfile(id)
         case #selector(deleteCurrentProfileAction(_:)):
-            return canDeleteProfile(ProfileStore.currentProfileID())
+            return !profileMutationInProgress
+                && !ProfileStore.metadataRecoveryRequired
+                && canDeleteProfile(ProfileStore.currentProfileID())
         default:
             return menuItem.isEnabled
         }
@@ -1720,6 +2191,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func rebuildProfilesMenu(_ menu: NSMenu) {
         menu.removeAllItems()
         let isolationAvailable = isProfileIsolationAvailable
+
+        if ProfileStore.metadataRecoveryRequired {
+            let warning = menu.addItem(withTitle: "空间配置需要恢复（写操作已暂停）", action: nil, keyEquivalent: "")
+            warning.isEnabled = false
+            let restoreItem = menu.addItem(withTitle: "从保留备份恢复…", action: #selector(restoreProfileMetadataAction(_:)), keyEquivalent: "")
+            restoreItem.target = self
+            restoreItem.isEnabled = !profileMutationInProgress && ProfileStore.pendingDataMutation == nil
+            let resetItem = menu.addItem(withTitle: "重建默认空间配置…", action: #selector(resetProfileMetadataAfterRecoveryAction(_:)), keyEquivalent: "")
+            resetItem.target = self
+            resetItem.isEnabled = !profileMutationInProgress && ProfileStore.pendingDataMutation == nil
+            let exportItem = menu.addItem(withTitle: "导出原始配置备份…", action: #selector(exportCorruptProfileMetadataAction(_:)), keyEquivalent: "")
+            exportItem.target = self
+            menu.addItem(NSMenuItem.separator())
+        }
 
         let currentID = ProfileStore.currentProfileID()
         let defaultID = ProfileStore.startupProfileID()
@@ -1894,7 +2379,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func rebuildMainController(initialURL: URL? = nil) {
         let oldController = mainController
         mainController = nil
-        oldController?.dispose()
+        if let oldController, !oldController.isDisposing {
+            oldController.dispose()
+        }
 
         let profile = ProfileStore.currentProfile()
         let controller = BrowserWindowController(
@@ -1912,6 +2399,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func recoverBlankContent(in controller: BrowserWindowController) {
+        guard !profileMutationInProgress, ProfileStore.pendingDataMutation == nil else {
+            return
+        }
         if controller === mainController {
             rebuildMainController(initialURL: controller.currentURL())
         } else {
@@ -1940,6 +2430,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         return false
     }
 
+    private func ensureProfileMetadataWritable() -> Bool {
+        guard !profileMutationInProgress else {
+            return false
+        }
+        guard !ProfileStore.metadataRecoveryRequired else {
+            presentError("账号空间配置无法读取；原始配置已保留。请先恢复有效的空间配置后再修改账号空间。")
+            return false
+        }
+        guard ProfileStore.pendingDataMutation == nil else {
+            presentError("上一次空间数据操作仍在恢复；当前写操作已暂停，请等待恢复完成。")
+            return false
+        }
+        return true
+    }
+
     private func updateWebRTCProtectionMenuItem() {
         webRTCProtectionItem?.title = PrivacySettings.isWebRTCProtectionEnabled()
             ? "关闭 WebRTC 防护"
@@ -1954,11 +2459,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func createProfileFromCurrent(named name: String, copyCookies: Bool) {
+        guard ensureProfileMetadataWritable() else { return }
+        profileMutationInProgress = true
         let sourceID = ProfileStore.currentProfileID()
         let newProfile = WebProfile(id: UUID().uuidString, name: name, createdAt: Date())
         var profiles = ProfileStore.loadProfiles()
         profiles.append(newProfile)
         ProfileStore.save(profiles)
+
+        guard ProfileStore.loadProfiles().contains(where: { $0.id == newProfile.id }) else {
+            profileMutationInProgress = false
+            presentError("克隆空间失败：空间配置无法保存。")
+            return
+        }
 
         if let homepage = ProfileStore.homepageString(for: sourceID),
            let url = URL(string: homepage) {
@@ -1967,20 +2480,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         ProfileStore.disableFingerprint(for: newProfile.id)
         ProfileStore.setEnhancedPrivacyEnabled(ProfileStore.isEnhancedPrivacyEnabled(for: sourceID), for: newProfile.id)
 
-        let switchToNewProfile = { [weak self] in
+        let switchToNewProfile = { [weak self] () -> Bool in
+            guard let self else { return false }
+            guard !ProfileStore.metadataRecoveryRequired,
+                  ProfileStore.loadProfiles().contains(where: { $0.id == newProfile.id }) else {
+                self.profileMutationInProgress = false
+                self.applyCurrentCookiePreferenceAfterMutation()
+                self.presentError("克隆空间未完成；目标空间已不存在或配置需要恢复。")
+                return false
+            }
             ProfileStore.setCurrentProfileID(newProfile.id)
-            self?.updateWebRTCProtectionMenuItem()
-            self?.rebuildMainController()
+            self.profileMutationInProgress = false
+            self.applyCurrentCookiePreferenceAfterMutation()
+            self.updateWebRTCProtectionMenuItem()
+            self.rebuildMainController()
+            return true
         }
 
         guard copyCookies, let controller = mainController else {
-            switchToNewProfile()
+            _ = switchToNewProfile()
             return
         }
 
-        controller.copyCookies(toProfileID: newProfile.id) { [weak self] count in
-            switchToNewProfile()
-            self?.presentInfo("已克隆空间「\(name)」，并复制 \(count) 个 cookie。")
+        controller.copyCookies(toProfileID: newProfile.id) { [weak self] count, skippedCount, essentialSkipped in
+            if switchToNewProfile() {
+                let skippedText = skippedCount > 0 ? "，为避免请求头过大跳过 \(skippedCount) 个 cookie" : ""
+                if essentialSkipped {
+                    self?.presentAlert(
+                        "已创建空间「\(name)」，复制了 \(count) 个 cookie\(skippedText)，但关键登录 cookie 过大或超出请求头上限，登录态未完整复制。",
+                        style: .warning
+                    )
+                } else {
+                    self?.presentInfo("已克隆空间「\(name)」，并复制 \(count) 个 cookie\(skippedText)。")
+                }
+            }
         }
     }
 
@@ -2002,7 +2535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             encoder.dateEncodingStrategy = .iso8601
             encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
             let data = try encoder.encode(document)
-            try data.write(to: url, options: .atomic)
+            try BrowserDataBoundary.writeSensitiveData(data, to: url)
             presentInfo("已导出当前空间配置到 \(url.lastPathComponent)。")
         } catch {
             presentError("Profile 导出失败：\(error.localizedDescription)")
@@ -2010,13 +2543,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func importProfile(from url: URL) {
+        guard ensureProfileMetadataWritable() else { return }
         do {
-            let data = try Data(contentsOf: url)
+            let values = try url.resourceValues(forKeys: [.fileSizeKey])
+            if let fileSize = values.fileSize, fileSize > maximumProfileImportBytes {
+                throw NSError(
+                    domain: "ChatGPTSwiftWeb.ProfileImport",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Profile 文件过大"]
+                )
+            }
+            let data = try Data(contentsOf: url, options: .mappedIfSafe)
             let decoder = JSONDecoder()
             decoder.dateDecodingStrategy = .iso8601
             let document = try decoder.decode(ProfileExportDocument.self, from: data)
             guard document.schemaVersion == 1 else {
                 presentError("Profile JSON 版本不支持。")
+                return
+            }
+            guard Self.isValidImportedProfileDocument(document) else {
+                presentError("Profile JSON 包含无效或超出范围的配置。")
                 return
             }
 
@@ -2027,11 +2573,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             ProfileStore.save(profiles)
 
             if let homepage = document.homepage,
-               let url = URL(string: homepage),
-               url.scheme?.lowercased() == "https" {
+               let url = NavigationRules.validatedExternalURL(homepage) {
                 ProfileStore.setHomepage(url, for: profile.id)
             }
-            if let fingerprint = document.fingerprint {
+            if let fingerprint = document.fingerprint, document.fingerprintDisabled != true {
                 ProfileStore.setFingerprint(fingerprint, for: profile.id)
             } else {
                 ProfileStore.disableFingerprint(for: profile.id)
@@ -2046,9 +2591,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         }
     }
 
+    private static func isValidImportedProfileDocument(_ document: ProfileExportDocument) -> Bool {
+        func validText(_ value: String, maximumLength: Int) -> Bool {
+            !value.isEmpty
+                && value.count <= maximumLength
+                && !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        }
+
+        guard validText(document.name, maximumLength: 256),
+              document.sourceProfileID == defaultProfileID || UUID(uuidString: document.sourceProfileID) != nil else {
+            return false
+        }
+        if let homepage = document.homepage {
+            guard NavigationRules.validatedExternalURL(homepage) != nil else {
+                return false
+            }
+        }
+        if let fingerprint = document.fingerprint, !fingerprint.isValidForImport() {
+            return false
+        }
+        return true
+    }
+
     private func uniqueProfileName(_ baseName: String) -> String {
         let trimmed = baseName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let base = trimmed.isEmpty ? "新空间" : trimmed
+        let safeTrimmed = String(trimmed.prefix(256))
+        let base = safeTrimmed.isEmpty
+            || safeTrimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+            ? "新空间"
+            : safeTrimmed
         let profiles = ProfileStore.loadProfiles()
         if !Self.profileNameExists(base, in: profiles, excluding: nil) {
             return base
@@ -2131,7 +2702,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         let response = alert.runModal()
         let trimmed = textField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        if response == .alertFirstButtonReturn, !trimmed.isEmpty {
+        if response == .alertFirstButtonReturn,
+           !trimmed.isEmpty,
+           trimmed.count <= 256,
+           !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) {
             completion(trimmed)
         } else {
             completion(nil)

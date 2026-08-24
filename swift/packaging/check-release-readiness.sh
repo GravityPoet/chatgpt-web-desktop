@@ -42,6 +42,18 @@ validate_feed_url() {
       return 1
       ;;
   esac
+  if [[ ! "$feed_url" =~ ^https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*(:[0-9]+)?([/?#][^[:cntrl:][:space:]]*)?$ ]]; then
+    echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL must contain a non-empty host and no credentials or control characters." >&2
+    return 1
+  fi
+  local port
+  if [[ "$feed_url" =~ ^https://[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*:([0-9]+)([/\?#].*)?$ ]]; then
+    port="${BASH_REMATCH[4]}"
+    if (( port < 1 || port > 65535 )); then
+      echo "error: CHATGPT_SWIFT_SPARKLE_FEED_URL port must be between 1 and 65535." >&2
+      return 1
+    fi
+  fi
 }
 
 validate_env() {
@@ -165,6 +177,11 @@ case "$SPARKLE" in
     exit 2
     ;;
 esac
+
+if [[ "$SPARKLE" == "on" && "$DISTRIBUTION" != "developer-id" ]]; then
+  echo "error: Sparkle auto-updates require a stable Developer ID signature; use --distribution developer-id." >&2
+  exit 2
+fi
 
 case "$MODE" in
   env)

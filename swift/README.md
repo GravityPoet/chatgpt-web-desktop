@@ -48,7 +48,7 @@ OpenAI 已在 2026 年 7 月 9 日推出把 Chat、Work 和 Codex 合并到一�
 dist/ChatGPT Swift.zip
 ```
 
-打包脚本会显式为 `arm64` 和 `x86_64` 构建并合并 universal 主程序，验证两个 slice 的最低系统版本均为 macOS 12.0，并检查 Sparkle 内嵌可执行文件也包含两种架构。默认继续使用本机统一的 `ChatGPT Rust Local Code Signing` 自签名证书；签名身份可通过 `CHATGPT_SWIFT_CODESIGN_IDENTITY` 覆盖。
+打包脚本会显式为 `arm64` 和 `x86_64` 构建并合并 universal 主程序，验证两个 slice 的最低系统版本均为 macOS 12.0，并检查精确的 Sparkle 2.9.6 内嵌可执行文件也包含两种架构。默认继续使用本机统一的 `ChatGPT Rust Local Code Signing` 自签名证书；签名身份可通过 `CHATGPT_SWIFT_CODESIGN_IDENTITY` 覆盖。
 
 低层 App 仅在 DMG、安装或调试流程存活，并在退出时物理删除；`.build` 中的 Sparkle Helper 属于依赖组件，不单独删除，只通过构建根索引隔离。不要提交 `.build/`、`dist/`、`.app`、`.dmg` 或 cookie/session 导出文件。
 
@@ -72,7 +72,7 @@ dist/ChatGPT Swift.dmg
 
 ## Developer ID / Notarization
 
-本地构建会 codesign 并启用 hardened runtime。由于本地自签名证书没有 Apple Team ID，脚本会自动使用 `packaging/local-debug.entitlements` 允许加载嵌入的 Sparkle framework。Developer ID 分发需要使用 Apple Developer 证书、timestamp 和 notarization：
+本地构建会 codesign 并启用 hardened runtime。由于本地统一自签名证书没有 Apple Team ID，脚本会让 App 与嵌入的 Sparkle framework 使用同一证书签名，并仅附加 `com.apple.security.cs.disable-library-validation` 这一 Sparkle Library Validation 例外；`packaging/verify-app-bundle.sh` 只在本地/GitHub 自签路径允许它，Developer ID 路径会拒绝它。Developer ID 分发需要使用 Apple Developer 证书、timestamp 和 notarization：
 
 ```bash
 CHATGPT_SWIFT_CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" \
@@ -109,7 +109,7 @@ App 菜单里的 `检查更新…` 优先使用 Sparkle；未配置 Sparkle 时�
 CHATGPT_SWIFT_SPARKLE_KEY_ACCOUNT="your-account" ./packaging/generate-sparkle-keys.sh
 ```
 
-用 HTTPS appcast feed 和公钥打包：
+用 HTTPS appcast feed 和公钥打包（仅 Developer ID/同机验证路径；本地自签名不作为跨设备自动更新信任根）：
 
 ```bash
 CHATGPT_SWIFT_SPARKLE_FEED_URL="https://example.com/appcast.xml" \
@@ -117,26 +117,28 @@ CHATGPT_SWIFT_SPARKLE_PUBLIC_ED_KEY="YOUR_PUBLIC_EDDSA_KEY" \
 ./packaging/make-dmg.sh
 ```
 
-从签名后的 DMG 生成 appcast：
+从已验收的 DMG 生成带 EdDSA 签名的 appcast（必须提供私钥文件或环境变量；生成失败时保留旧 appcast/DMG）：
 
 ```bash
+CHATGPT_SWIFT_SPARKLE_ED_KEY_FILE="/secure/path/sparkle-ed25519-private-key" \
 CHATGPT_SWIFT_SPARKLE_DOWNLOAD_URL_PREFIX="https://example.com/releases/" \
 ./packaging/make-sparkle-appcast.sh
 ```
 
-Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA 私钥在 Keychain 或 CI secret 中可用。Developer ID 签名和 notarization 不是 GitHub-only 分发的硬要求，但能减少 Gatekeeper 提示。私钥不要提交到仓库。
+Sparkle 自动更新需要 HTTPS 托管 `appcast.xml` 和 DMG、Sparkle EdDSA 私钥在 Keychain 或 CI secret 中可用。公开 CI 自动更新还必须使用稳定、受系统信任的 Developer ID 签名；workflow 会拒绝 `distribution=github` 与 `enable_sparkle=true` 的组合。统一本地自签名继续适合本机安装和手动 GitHub Release，不作为跨设备自动更新信任根。私钥不要提交到仓库。
 
 ## GitHub Release CI
 
 仓库提供手动触发的 GitHub Actions workflow：`.github/workflows/swift-macos-release.yml`。它会：
 
+- 在固定的 macOS 15 arm64 runner 上使用 Xcode 16.4 构建发布；发布 job 之前会先在真正的 `macos-15-intel` x86_64 runner 上执行 build、测试和 native Intel smoke gate，Intel job 只做临时本地签名验证，不生成或发布第二份 release 资产
 - 校验 `v<major>.<minor>.<patch>` tag，并把 tag 版本和 GitHub run id 写入实际 App 的 `CFBundleShortVersionString` / `CFBundleVersion`
 - 在打包前运行 `swift test` 和真实 App 启动/render smoke；任一失败都会停止发布
 - 新 release tag 固定指向本次 `GITHUB_SHA`；只允许同一提交重跑 draft，已发布 release 不会被静默覆盖
 - 默认用本地自签名构建 GitHub Release DMG，不需要 Apple Developer 账号
-- App、ZIP、DMG 和最终安装都会验收 `arm64+x86_64`、两个 slice 的 macOS 12.0 deployment target 及完整 codesign
+- CI 会验收 DMG 内 App 的 `arm64+x86_64`、两个 slice 的 macOS 12.0 deployment target 及完整 codesign；本机 `make-app.sh` 另行生成并验收 ZIP，安装脚本验收替换、回滚、启动和 Spotlight/LaunchServices 唯一性
 - 如果选择 `distribution=developer-id`，才导入 Developer ID Application `.p12`、notarize 并 staple DMG
-- 如果开启 `enable_sparkle=true`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`
+- 如果开启 `enable_sparkle=true`，必须同时选择 `distribution=developer-id`，才构建带 Sparkle feed/key 的 DMG，并生成带 EdDSA 签名的 `appcast.xml`
 - 上传 `ChatGPT Swift.dmg` 到指定 GitHub Release；开启 Sparkle 时额外上传 `appcast.xml`
 
 默认 GitHub-only 分发不需要配置额外 secrets；它会上传自签名 DMG，用户首次打开时可能遇到 macOS Gatekeeper 提示，需要右键打开或手动允许。
