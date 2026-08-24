@@ -1719,6 +1719,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             let removableCookies = storedCookies
                 .filter(Self.isChatGPTRelatedCookie)
                 .filter { !Self.isChatGPTEssentialCookieName($0.name) }
+                .filter { !CookieConsentSettings.isManagedRejectionCookie($0) }
             guard !removableCookies.isEmpty else {
                 finish(0)
                 return

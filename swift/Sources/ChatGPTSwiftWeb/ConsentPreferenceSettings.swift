@@ -103,7 +103,7 @@ enum CookieConsentSettings {
         group.notify(queue: .main, execute: completion)
     }
 
-    private static func isManagedRejectionCookie(_ cookie: HTTPCookie) -> Bool {
+    static func isManagedRejectionCookie(_ cookie: HTTPCookie) -> Bool {
         rejectionCookieNames.contains(cookie.name)
             && cookie.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")) == "chatgpt.com"
             && cookie.path == "/"
