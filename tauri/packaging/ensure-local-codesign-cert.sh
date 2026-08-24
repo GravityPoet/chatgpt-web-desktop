@@ -81,13 +81,15 @@ fi
   -T /usr/bin/security \
   >/dev/null
 
-/usr/bin/security add-trusted-cert \
-  -d \
-  -r trustRoot \
-  -p codeSign \
-  -k "$KEYCHAIN" \
-  "$CERT_PATH" \
-  >/dev/null 2>&1 || true
+if [[ "$CI_KEYCHAIN" != "1" ]]; then
+  /usr/bin/security add-trusted-cert \
+    -d \
+    -r trustRoot \
+    -p codeSign \
+    -k "$KEYCHAIN" \
+    "$CERT_PATH" \
+    >/dev/null 2>&1 || true
+fi
 
 if [[ "$CI_KEYCHAIN" == "1" ]]; then
   /usr/bin/security set-key-partition-list \
@@ -105,7 +107,12 @@ else
     >/dev/null 2>&1 || true
 fi
 
-if ! /usr/bin/security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | /usr/bin/grep -Fq "\"$IDENTITY\""; then
+if [[ "$CI_KEYCHAIN" == "1" ]]; then
+  if ! /usr/bin/security find-certificate -a -c "$IDENTITY" "$KEYCHAIN" >/dev/null 2>&1; then
+    echo "failed to import local CI signing certificate: $IDENTITY" >&2
+    exit 1
+  fi
+elif ! /usr/bin/security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | /usr/bin/grep -Fq "\"$IDENTITY\""; then
   echo "failed to create local code signing identity: $IDENTITY" >&2
   exit 1
 fi

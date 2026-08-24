@@ -66,6 +66,18 @@ if [[ "$plist_minimum" != "$MINIMUM_SYSTEM_VERSION" ]]; then
   exit 1
 fi
 
+requires_native_execution="$(/usr/bin/plutil -extract LSRequiresNativeExecution raw "$INFO_PLIST" 2>/dev/null || true)"
+if [[ "$requires_native_execution" != "true" ]]; then
+  echo "error: LSRequiresNativeExecution must be true for Rosetta-free future macOS compatibility" >&2
+  exit 1
+fi
+architecture_priority_arm64="$(/usr/bin/plutil -extract 'LSArchitecturePriority.0' raw "$INFO_PLIST" 2>/dev/null || true)"
+architecture_priority_x86_64="$(/usr/bin/plutil -extract 'LSArchitecturePriority.1' raw "$INFO_PLIST" 2>/dev/null || true)"
+if [[ "$architecture_priority_arm64" != "arm64" || "$architecture_priority_x86_64" != "x86_64" ]]; then
+  echo "error: LSArchitecturePriority must prefer arm64 and retain x86_64 fallback" >&2
+  exit 1
+fi
+
 /usr/bin/codesign --verify --deep --strict "$APP_PATH"
 signing_details="$(/usr/bin/codesign -dv --verbose=4 "$APP_PATH" 2>&1 || true)"
 if [[ "$DISTRIBUTION" == "auto" ]]; then
