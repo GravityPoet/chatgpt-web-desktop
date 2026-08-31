@@ -18,6 +18,7 @@ extension/cloak-companion/browser-identity-worker.js
 extension/cloak-companion/rules/
 
 # Test artifacts
+.playwright-mcp/
 selftest/live-results/
 
 .env
