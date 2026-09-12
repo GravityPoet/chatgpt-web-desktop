@@ -79,6 +79,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var statusProgressLabelSpacingConstraint: NSLayoutConstraint?
     var progressIndicator: NSProgressIndicator?
     var webViewObservations: [NSKeyValueObservation] = []
+    private(set) var blockedNavigationStatus: String?
+    private var blockedNavigationStatusDismissWorkItem: DispatchWorkItem?
+    private var blockedNavigationCount = 0
+    private var lastBlockedNavigationSummary = "无"
 
     init(
         initialURL: URL?,
@@ -313,6 +317,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("webContentProcessTerminationCount", "\(webContentProcessTerminationCount)"),
             ("navigationFailureCount", "\(navigationFailureCount)"),
             ("lastNavigationFailure", DiagnosticRedactor.text(lastNavigationFailureDescription)),
+            ("blockedNavigationCount", "\(blockedNavigationCount)"),
+            ("lastBlockedNavigation", DiagnosticRedactor.text(lastBlockedNavigationSummary)),
             ("controllerCreatedAt", Self.diagnosticDateString(controllerCreatedAt)),
             ("firstNavigationFinishedAt", Self.diagnosticDateString(firstNavigationFinishedAt)),
             ("lastNavigationStartedAt", Self.diagnosticDateString(lastNavigationStartedAt)),
@@ -631,6 +637,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func dispose(completion: @escaping () -> Void = {}) {
         cancelScheduledMainWindowFramePersistence()
         cancelRemoteImageLoads()
+        clearBlockedNavigationStatus()
         webViewObservations.removeAll()
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
@@ -668,6 +675,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func windowWillClose(_ notification: Notification) {
         cancelScheduledMainWindowFramePersistence()
         cancelRemoteImageLoads()
+        clearBlockedNavigationStatus()
         persistMainWindowFrame()
         isDisposing = true
         tearDownWebView()
@@ -892,6 +900,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         lastNavigationStartedAt = Date()
+        clearBlockedNavigationStatus()
         lastRenderProbeWasBlank = false
         isCloudflareChallengeActive = false
         invalidateRenderedContentProbes()
@@ -922,8 +931,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let sourceURL = webView.url
         let cleanedURL = Self.cleanTrackingParameters(from: url)
 
-        guard NavigationRules.isAllowedWebViewNavigationURL(cleanedURL, sourceURL: sourceURL) else {
-            setStatus("已阻止不安全的导航协议或凭据链接", showsProgress: false)
+        if let reason = NavigationRules.webViewNavigationBlockReason(cleanedURL, sourceURL: sourceURL) {
+            reportBlockedNavigation(
+                reason: reason,
+                url: cleanedURL,
+                sourceURL: sourceURL,
+                navigationAction: navigationAction
+            )
             decisionHandler(.cancel)
             return
         }
@@ -1088,8 +1102,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         if let url = navigationAction.request.url {
             let cleanedURL = Self.cleanTrackingParameters(from: url)
-            guard NavigationRules.isAllowedWebViewNavigationURL(cleanedURL, sourceURL: webView.url) else {
-                setStatus("已阻止不安全的外部弹窗协议或凭据链接", showsProgress: false)
+            if let reason = NavigationRules.webViewNavigationBlockReason(cleanedURL, sourceURL: webView.url) {
+                reportBlockedNavigation(
+                    reason: reason,
+                    url: cleanedURL,
+                    sourceURL: webView.url,
+                    navigationAction: navigationAction
+                )
                 return nil
             }
             if Self.shouldOpenNewWindowInSystemBrowser(cleanedURL, sourceURL: webView.url) {
@@ -2529,6 +2548,101 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return false
         }
         return NavigationRules.isChatGPTHost(host.lowercased())
+    }
+
+    private func reportBlockedNavigation(
+        reason: NavigationRules.WebViewNavigationBlockReason,
+        url: URL,
+        sourceURL: URL?,
+        navigationAction: WKNavigationAction
+    ) {
+        blockedNavigationCount += 1
+        let frameContext: String
+        if navigationAction.targetFrame?.isMainFrame == true {
+            frameContext = "main-frame"
+        } else if navigationAction.targetFrame == nil {
+            frameContext = navigationAction.sourceFrame.isMainFrame ? "new-window" : "subframe-new-window"
+        } else {
+            frameContext = "subframe"
+        }
+        let frameSourceURL = navigationAction.sourceFrame.request.url ?? sourceURL
+        let summary = "reason=\(reason.rawValue), frame=\(frameContext), type=\(navigationAction.navigationType.rawValue), target=\(Self.blockedNavigationURLSummary(url)), source=\(Self.blockedNavigationURLSummary(frameSourceURL))"
+        lastBlockedNavigationSummary = summary
+        browserLogger.notice("Navigation blocked: \(summary, privacy: .public)")
+
+        guard Self.shouldShowBlockedNavigationNotice(for: navigationAction) else {
+            return
+        }
+
+        let message = Self.blockedNavigationMessage(for: reason, url: url)
+        blockedNavigationStatusDismissWorkItem?.cancel()
+        blockedNavigationStatus = message
+        setStatus(message, showsProgress: false)
+
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self, !self.isDisposing, self.blockedNavigationStatus == message else {
+                return
+            }
+            self.blockedNavigationStatus = nil
+            self.blockedNavigationStatusDismissWorkItem = nil
+            self.updateNativeChromeStatus()
+        }
+        blockedNavigationStatusDismissWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: workItem)
+    }
+
+    func clearBlockedNavigationStatus() {
+        blockedNavigationStatusDismissWorkItem?.cancel()
+        blockedNavigationStatusDismissWorkItem = nil
+        blockedNavigationStatus = nil
+    }
+
+    private static func shouldShowBlockedNavigationNotice(for navigationAction: WKNavigationAction) -> Bool {
+        if navigationAction.targetFrame?.isMainFrame == true {
+            return true
+        }
+        switch navigationAction.navigationType {
+        case .linkActivated, .formSubmitted, .formResubmitted:
+            return true
+        default:
+            return navigationAction.targetFrame == nil && navigationAction.sourceFrame.isMainFrame
+        }
+    }
+
+    private static func blockedNavigationMessage(
+        for reason: NavigationRules.WebViewNavigationBlockReason,
+        url: URL
+    ) -> String {
+        switch reason {
+        case .embeddedCredentials:
+            return "已阻止含用户名或密码的链接"
+        case .invalidAddress:
+            return "已阻止格式无效的链接"
+        case .insecureHTTP:
+            return "已阻止未加密的 HTTP 链接"
+        case .localFile:
+            return "已阻止网页打开本地文件"
+        case .scriptURL:
+            return "已阻止脚本协议跳转"
+        case .unsupportedScheme:
+            let scheme = (url.scheme?.lowercased() ?? "未知协议").prefix(32)
+            return "已阻止不支持的 \(scheme): 链接"
+        case .unsupportedInternalPage:
+            return "已阻止不支持的内部页面"
+        case .missingContentSource:
+            return "已阻止来源不明的临时链接"
+        }
+    }
+
+    private static func blockedNavigationURLSummary(_ url: URL?) -> String {
+        guard let url else {
+            return "nil"
+        }
+        let scheme = url.scheme?.lowercased() ?? "unknown"
+        guard scheme == "http" || scheme == "https" else {
+            return "\(scheme.prefix(32)):<redacted>"
+        }
+        return DiagnosticRedactor.url(url)
     }
 
     private static func shouldOpenInsideApp(_ url: URL, sourceURL: URL? = nil) -> Bool {

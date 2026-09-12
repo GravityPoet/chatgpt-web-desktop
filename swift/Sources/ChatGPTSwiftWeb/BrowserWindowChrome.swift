@@ -152,7 +152,9 @@ extension BrowserWindowController {
             reloadItem?.toolTip = "重新加载"
         }
 
-        if webView.isLoading {
+        if let blockedNavigationStatus {
+            setStatus(blockedNavigationStatus, showsProgress: false)
+        } else if webView.isLoading {
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             setStatus("加载中 \(percent)%", showsProgress: true)
         } else if isCloudflareChallengeActive {
@@ -179,6 +181,9 @@ extension BrowserWindowController {
     }
 
     func setStatus(_ text: String, showsProgress: Bool) {
+        if blockedNavigationStatus != nil, text != blockedNavigationStatus {
+            clearBlockedNavigationStatus()
+        }
         let progressPercent = showsProgress
             ? max(3, min(100, Int(round(webView.estimatedProgress * 100))))
             : 0
