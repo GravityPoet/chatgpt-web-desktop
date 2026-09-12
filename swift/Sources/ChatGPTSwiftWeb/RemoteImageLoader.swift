@@ -69,6 +69,8 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
     private let sourceURL: URL
     private let maximumBytes: Int
     private let completion: Completion
+    private let progress: (@Sendable (Int64, Int64?) -> Void)?
+    private var progressPublishedAt = Date.distantPast
     private let temporaryDirectory: URL
     private let sessionConfiguration: URLSessionConfiguration
     private let hostResolver: RemoteImageHostResolver
@@ -93,6 +95,7 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         configuration: URLSessionConfiguration = .ephemeral,
         temporaryDirectory: URL = FileManager.default.temporaryDirectory,
         hostResolver: @escaping RemoteImageHostResolver = RemoteImageLoader.defaultHostResolver,
+        progress: (@Sendable (Int64, Int64?) -> Void)? = nil,
         completion: @escaping Completion
     ) {
         precondition(maximumBytes > 0)
@@ -101,6 +104,7 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         self.temporaryDirectory = temporaryDirectory
         self.hostResolver = hostResolver
         self.completion = completion
+        self.progress = progress
 
         configuration.httpCookieStorage = nil
         configuration.httpShouldSetCookies = false
@@ -292,6 +296,11 @@ final class RemoteImageLoader: NSObject, URLSessionDataDelegate, URLSessionTaskD
         do {
             try fileHandle.write(contentsOf: data)
             receivedByteCount += data.count
+            if Date().timeIntervalSince(progressPublishedAt) >= 0.2 {
+                progressPublishedAt = Date()
+                let expected = dataTask.response?.expectedContentLength ?? -1
+                progress?(Int64(receivedByteCount), expected > 0 ? expected : nil)
+            }
         } catch {
             dataTask.cancel()
             finish(.failure(RemoteImageLoadError.fileWriteFailed))

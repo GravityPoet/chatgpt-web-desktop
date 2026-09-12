@@ -17,4 +17,17 @@ final class PromptDraftStoreIntegrationTests: XCTestCase {
         XCTAssertEqual(PromptDraftStore.draft(for: profileID, defaults: defaults), "")
         XCTAssertEqual(PromptDraftStore.draft(for: otherProfileID, defaults: defaults), "other draft")
     }
+
+    func testConversationDraftsStaySeparateAndProfileClearRemovesAll() throws {
+        let suiteName = "ChatGPTSwiftWeb.PromptDraftStoreConversationTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        PromptDraftStore.saveDraft("one", profileID: "p", conversationID: "c1", defaults: defaults)
+        PromptDraftStore.saveDraft("two", profileID: "p", conversationID: "c2", defaults: defaults)
+        XCTAssertEqual(PromptDraftStore.draft(for: "p", conversationID: "c1", defaults: defaults), "one")
+        XCTAssertEqual(PromptDraftStore.draft(for: "p", conversationID: "c2", defaults: defaults), "two")
+        PromptDraftStore.clearAllDrafts(for: "p", defaults: defaults)
+        XCTAssertEqual(PromptDraftStore.draft(for: "p", conversationID: "c1", defaults: defaults), "")
+        XCTAssertEqual(PromptDraftStore.draft(for: "p", conversationID: "c2", defaults: defaults), "")
+    }
 }

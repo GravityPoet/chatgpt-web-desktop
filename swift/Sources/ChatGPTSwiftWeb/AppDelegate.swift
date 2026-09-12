@@ -10,6 +10,7 @@ import WebKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenuItemValidation {
     var mainController: BrowserWindowController?
+    var quickController: BrowserWindowController?
     private var incognitoControllers: [BrowserWindowController] = []
     private var keyMonitor: Any?
     private var profilesMenu: NSMenu?
@@ -29,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private var sparkleUpdaterController: SPUStandardUpdaterController?
     private var sparkleStatus = "未启用：Info.plist 未提供 SUFeedURL / SUPublicEDKey"
     private(set) var profileMutationInProgress = false
+    private var profileSwitchInProgress = false
     private var cookieConsentMutationGeneration = 0
     /// Tracks asynchronous consent-cookie mutations started from settings. Destructive profile
     /// operations drain this group before removing a WebKit data store so late callbacks cannot
@@ -51,12 +53,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             markRunStarted()
         }
         performanceMonitor.start()
+        NetworkStatusMonitor.shared.start()
         UNUserNotificationCenter.current().delegate = self
         refreshNotificationPermissionStatus()
         NSApp.setActivationPolicy(.regular)
         buildMenu()
         configureSparkleUpdaterIfAvailable()
         installKeyboardZoomShortcuts()
+        if !smokeTestRun { configureQuickWindowHotKey() }
         let needsIsolationFallbackNotice = smokeTestRun ? false : reconcileProfileIsolationOnLaunch()
         let pendingMutation = !smokeTestRun && ProfileStore.pendingDataMutation != nil
         if !smokeTestRun && !pendingMutation {
@@ -230,6 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 guard let self else { return }
                 WebsiteDataCleaner.removeAllData(from: dataStore) { [weak self] in
                     guard let self else { return }
+                    ProfileSessionStore.clear(profileID: profileID)
                     PromptDraftStore.clearDraft(for: profileID)
                     ProfileStore.disableFingerprint(for: profileID)
                     ProfileStore.clearPendingDataMutation()
@@ -267,6 +272,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        QuickWindowHotKey.shared.stop()
+        NetworkStatusMonitor.shared.stop()
         markRunEndedCleanly()
         performanceMonitor.stop()
         mainController?.persistMainWindowFrame()
@@ -462,6 +469,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editMenu.addItem(NSMenuItem.separator())
+        let restoreDraftItem = editMenu.addItem(withTitle: "恢复本页保存的草稿", action: #selector(restoreSavedDraftAction(_:)), keyEquivalent: "")
+        restoreDraftItem.target = self
+        let clearDraftItem = editMenu.addItem(withTitle: "清除当前空间本机草稿", action: #selector(clearSavedDraftAction(_:)), keyEquivalent: "")
+        clearDraftItem.target = self
+        editMenu.addItem(.separator())
         let notesContextItem = editMenu.addItem(withTitle: "插入选中备忘录正文", action: #selector(insertNotesContextAction(_:)), keyEquivalent: "")
         notesContextItem.target = self
         editItem.submenu = editMenu
@@ -469,7 +481,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         let navigationItem = NSMenuItem()
         let navigationMenu = NSMenu(title: "导航")
-        let focusPromptItem = navigationMenu.addItem(withTitle: "聚焦输入框", action: #selector(focusPromptAction(_:)), keyEquivalent: "")
+        let focusPromptItem = navigationMenu.addItem(withTitle: "聚焦输入框", action: #selector(focusPromptAction(_:)), keyEquivalent: "i")
+        focusPromptItem.keyEquivalentModifierMask = [.command, .option]
         focusPromptItem.target = self
         navigationMenu.addItem(NSMenuItem.separator())
         let backItem = navigationMenu.addItem(withTitle: "后退", action: #selector(goBackAction(_:)), keyEquivalent: "[")
@@ -514,6 +527,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
         let windowItem = NSMenuItem()
         let windowMenu = NSMenu(title: "窗口")
+        let quickItem = windowMenu.addItem(withTitle: "快速窗口", action: #selector(showQuickWindow(_:)), keyEquivalent: "")
+        quickItem.target = self
         windowMenu.addItem(withTitle: "最小化", action: #selector(NSWindow.miniaturize(_:)), keyEquivalent: "m")
         windowMenu.addItem(withTitle: "缩放", action: #selector(NSWindow.zoom(_:)), keyEquivalent: "")
         windowItem.submenu = windowMenu
@@ -633,7 +648,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     },
                     openReleasePage: { [weak self] in
                         self?.openReleasePage()
-                    }
+                    },
+                    setAutoOpenFinderAfterDownload: { enabled in UserDefaults.standard.set(enabled, forKey: "ChatGPTSwiftWeb.DownloadCenter.AutoOpenFinder") },
+                    clearCurrentDraft: { [weak self] in
+                        BrowserWindowController.clearProfileDrafts(profileID: ProfileStore.currentProfileID())
+                        self?.refreshNativeUtilityWindows()
+                    },
+                    setQuickWindowEnabled: { [weak self] enabled in Task { @MainActor in self?.setQuickWindowEnabled(enabled) } },
+                    setQuickWindowShortcut: { [weak self] shortcut in Task { @MainActor in self?.setQuickWindowShortcut(shortcut) } },
+                    showDownloads: { [weak self] in Task { @MainActor in self?.mainController?.showDownloads(nil) } }
+
                 )
             )
             settingsWindowController = controller
@@ -702,10 +726,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     private func setPromptDraftRestoreFromSettings(_ enabled: Bool) {
         guard ensureProfileMetadataWritable() else { return }
         PromptDraftStore.setRestoreEnabled(enabled)
-        if !enabled {
-            PromptDraftStore.clearDraft(for: ProfileStore.currentProfileID())
-        }
-        mainController?.restorePromptDraftIfAvailable(reason: "settings toggled")
+        BrowserWindowController.refreshDraftPreferences()
         refreshNativeUtilityWindows()
     }
 
@@ -847,7 +868,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         refreshNativeUtilityWindows()
     }
 
-    private func refreshNativeUtilityWindows() {
+    func refreshNativeUtilityWindows() {
         settingsWindowController?.update(state: makeAppSettingsState())
         diagnosticsWindowController?.update(state: makeDiagnosticsState())
     }
@@ -1039,7 +1060,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             windowTitleDisplayMode: WindowTitleSettings.mode(),
             notesAutomationStatus: "按需请求；首次插入选中备忘录正文时由 macOS 弹出授权。",
             updateStatus: updateCheckStatus,
-            distributionStatus: "\(sparkleStatus)。当前交付采用本地统一自签名；打包与安装脚本会验收 codesign、universal 架构和最低系统版本。Developer ID 与公证仅是可选外部分发路径。"
+            distributionStatus: "\(sparkleStatus)。当前交付采用本地统一自签名；打包与安装脚本会验收 codesign、universal 架构和最低系统版本。Developer ID 与公证仅是可选外部分发路径。",
+            autoOpenFinderAfterDownload: UserDefaults.standard.bool(forKey: "ChatGPTSwiftWeb.DownloadCenter.AutoOpenFinder"),
+            networkStatus: MainActor.assumeIsolated { "\(NetworkStatusMonitor.shared.availability.title) · \(NetworkStatusMonitor.shared.interfaceDescription)" },
+            quickWindowEnabled: QuickWindowPreferences.isEnabled,
+            quickWindowShortcut: QuickWindowPreferences.shortcut.label
+
         )
     }
 
@@ -1389,6 +1415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                     return
                 }
                 let profileID = ProfileStore.currentProfileID()
+                ProfileSessionStore.clear(profileID: profileID)
                 PromptDraftStore.clearDraft(for: profileID)
                 ProfileStore.disableFingerprint(for: profileID)
                 ProfileStore.clearPendingDataMutation()
@@ -1575,18 +1602,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         controller.show()
     }
 
-    @objc private func switchToProfile(_ sender: NSMenuItem) {
-        guard ensureProfileMetadataWritable() else { return }
-        guard let id = sender.representedObject as? String else {
-            return
+    @objc func switchToProfile(_ sender: NSMenuItem) {
+        guard ensureProfileMetadataWritable(), !profileSwitchInProgress,
+              let id = sender.representedObject as? String,
+              ProfileStore.loadProfiles().contains(where: { $0.id == id }), id != ProfileStore.currentProfileID() else { return }
+        profileSwitchInProgress = true
+        mainController?.showToast("正在切换空间…")
+        let finish = { [weak self] in
+            guard let self, self.profileSwitchInProgress else { return }
+            self.profileSwitchInProgress = false
+            guard !self.profileMutationInProgress, ProfileStore.pendingDataMutation == nil else { return }
+            self.quickController?.dispose()
+            self.quickController = nil
+            ProfileStore.setCurrentProfileID(id)
+            self.updateWebRTCProtectionMenuItem()
+            self.updateEnhancedPrivacyMenuItem()
+            self.rebuildMainController(initialURL: ProfileSessionStore.load(profileID: id)?.url)
         }
-        if id == ProfileStore.currentProfileID() {
-            return
-        }
-        ProfileStore.setCurrentProfileID(id)
-        updateWebRTCProtectionMenuItem()
-        updateEnhancedPrivacyMenuItem()
-        rebuildMainController()
+        if let mainController { mainController.capturePageState(completion: finish) } else { finish() }
     }
 
     @objc private func setCurrentProfileAsDefaultAction(_ sender: Any?) {
@@ -1977,6 +2010,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
         guard profiles.contains(where: { $0.id == defaultProfileID }) else {
             return
         }
+        ProfileSessionStore.clear(profileID: profileID)
+        Task { @MainActor in DownloadCenter.shared.forget(profileID: profileID) }
         ProfileStore.removeAllMetadata(for: profileID)
         ProfileStore.save(profiles)
         ProfileStore.clearStartupProfileIfNeeded(profileID)
@@ -2015,6 +2050,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                         return
                     }
                     self.profileMutationInProgress = false
+                    ProfileSessionStore.clear(profileID: defaultProfileID)
                     PromptDraftStore.clearDraft(for: defaultProfileID)
                     ProfileStore.resetDefaultProfile()
                     ProfileStore.clearPendingDataMutation()
@@ -2378,6 +2414,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func rebuildMainController(initialURL: URL? = nil) {
         let oldController = mainController
+        oldController?.persistMainWindowFrame()
         mainController = nil
         if let oldController, !oldController.isDisposing {
             oldController.dispose()
@@ -2431,6 +2468,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func ensureProfileMetadataWritable() -> Bool {
+        guard !profileSwitchInProgress else { return false }
         guard !profileMutationInProgress else {
             return false
         }
@@ -2644,12 +2682,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func presentAlert(_ text: String, style: NSAlert.Style) {
-        let alert = NSAlert()
-        alert.messageText = "ChatGPT Swift"
-        alert.informativeText = text
-        alert.alertStyle = style
-        alert.addButton(withTitle: "知道了")
-        alert.runModal()
+        let safeText = DiagnosticRedactor.text(text)
+        (BrowserWindowController.keyWindowController() ?? mainController)?.showToast(
+            safeText, actionTitle: style == .warning ? "复制诊断信息" : nil,
+            action: {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(safeText, forType: .string)
+            }, duration: style == .warning ? 12 : 6)
     }
 
     private func promptForURL(title: String, message: String, initial: String, completion: @escaping (URL?) -> Void) {

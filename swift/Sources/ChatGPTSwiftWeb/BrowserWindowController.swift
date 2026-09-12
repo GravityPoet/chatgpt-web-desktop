@@ -34,13 +34,31 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var statusOverlay: BrowserStatusOverlayView!
     private var childControllers: [BrowserWindowController] = []
     private let isPopup: Bool
-    private let persistent: Bool
-    private let profileID: String?
+    let isQuickWindow: Bool
+    let persistent: Bool
+    let profileID: String?
     private let controllerCreatedAt = Date()
     private var closeHandler: (() -> Void)?
     var currentZoom: CGFloat = BrowserWindowController.savedWebZoom()
     var isDisposing = false
     private var downloadDestinations: [ObjectIdentifier: URL] = [:]
+    private var downloadIDs: [ObjectIdentifier: UUID] = [:]
+    private var activeDownloads: [ObjectIdentifier: WKDownload] = [:]
+    private var downloadProgressTimer: Timer?
+    private static let imageSaveQueue = DispatchQueue(label: "ChatGPTSwiftWeb.ImageSave", qos: .userInitiated)
+    private var imageDownloadIDs: Set<UUID> = []
+    private let privateDownloadID = UUID().uuidString
+    var toastView = TransientToastView()
+    var downloadWindowController: DownloadCenterWindowController?
+    var utilityObservers: [NSObjectProtocol] = []
+    var downloadButton: NSButton?
+    var profileButton: NSButton?
+    var hasFailedNavigation = false
+    var lastFailureStatus: String?
+    var networkRetryPending = false
+    var networkRetryUsed = false
+    var hasActiveDownload: Bool { !activeDownloads.isEmpty || !remoteImageLoaders.isEmpty }
+    var downloadScope: String { persistent ? (profileID ?? defaultProfileID) : privateDownloadID }
     private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
     private var didTearDownWebView = false
     private var didFinishWindowClose = false
@@ -56,16 +74,24 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var navigationFailureCount = 0
     private var lastNavigationFailureDescription = "无"
     private var lastRenderProbeSummary = "未运行"
+    var draftCaptureDiagnostics = "未检查"
+    var draftNativeMessageCount = 0
+    var draftNativeSaveCount = 0
+    var draftNativeDropReason = "无"
     private var lastBlankRecoverySummary = "无"
+    private var navigationHTTPFailure: String?
+    private var crashRecoveryCount = 0
+    private var lastRequestedURL: URL?
     private var lastNavigationStartedAt: Date?
     private var lastNavigationFinishedAt: Date?
     private var firstNavigationFinishedAt: Date?
     private var loadingWatchdogGeneration = 0
     private var currentOverlayMode = BrowserStatusOverlayMode.hidden
     var isCloudflareChallengeActive = false
-    private var isAssistantResponseInProgress = false
+    var isAssistantResponseInProgress = false
     private var lastCompletionObservationSummary = "未运行"
     private var lastBackgroundCompletionNotificationAt: Date?
+    var focusWhenReady = false
     private var framePersistenceWorkItem: DispatchWorkItem?
     var isNativeChromeUpdateScheduled = false
     var lastPresentedStatusText: String?
@@ -91,11 +117,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         persistent: Bool = true,
         profileID: String? = nil,
         configuration: WKWebViewConfiguration? = nil,
-        closeHandler: (() -> Void)? = nil
+        closeHandler: (() -> Void)? = nil,
+        isQuickWindow: Bool = false
     ) {
         self.isPopup = isPopup
+        self.isQuickWindow = isQuickWindow
         self.persistent = persistent
         self.profileID = profileID
+        self.lastRequestedURL = initialURL
         self.closeHandler = closeHandler
         self.ownsNativeMessageHandlers = configuration == nil
         super.init()
@@ -120,16 +149,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.pageZoom = currentZoom
 
         let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        let defaultRect = isPopup
-            ? NSRect(x: 120, y: 120, width: 1100, height: 780)
-            : NSRect(x: 80, y: 80, width: 1280, height: 900)
-        let restoredFrame = isPopup ? nil : Self.restoredMainWindowFrame()
+        let defaultRect = isQuickWindow
+            ? NSRect(x: 120, y: 120, width: 580, height: 720)
+            : (isPopup ? NSRect(x: 120, y: 120, width: 1100, height: 780) : NSRect(x: 80, y: 80, width: 1280, height: 900))
+        let restoredFrame = isPopup ? nil : Self.restoredMainWindowFrame(profileID: profileID)
         window = NSWindow(contentRect: restoredFrame ?? defaultRect, styleMask: style, backing: .buffered, defer: false)
         window.title = title
         window.delegate = self
         window.titlebarAppearsTransparent = false
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 900, height: 640)
+        window.minSize = isQuickWindow ? NSSize(width: 480, height: 560) : NSSize(width: 900, height: 640)
         window.tabbingMode = .disallowed
         contentContainer = NSView(frame: NSRect(origin: .zero, size: window.contentLayoutRect.size))
         contentContainer.autoresizingMask = [.width, .height]
@@ -140,6 +169,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         contentContainer.addSubview(webView)
         contentContainer.addSubview(statusOverlay)
+        contentContainer.addSubview(toastView)
+        NSLayoutConstraint.activate([
+            toastView.centerXAnchor.constraint(equalTo: contentContainer.centerXAnchor),
+            toastView.topAnchor.constraint(equalTo: contentContainer.safeAreaLayoutGuide.topAnchor, constant: 12),
+            toastView.widthAnchor.constraint(lessThanOrEqualTo: contentContainer.widthAnchor, constant: -32)
+        ])
         window.contentView = contentContainer
         NSLayoutConstraint.activate([
             webView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
@@ -157,6 +192,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         observeWebViewState()
+        observeUtilityState()
 
         if let initialURL {
             let initialRequest = Self.privacyRequest(for: initialURL, sourceURL: nil, profileID: profileID)
@@ -177,11 +213,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func show() {
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
-        scheduleRenderedContentProbe(reason: "window shown", delay: 1.5)
+        if lastRenderProbeWasBlank || firstNavigationFinishedAt == nil { scheduleRenderedContentProbe(reason: "window shown", delay: 1.5) }
     }
 
     @objc func reload(_ sender: Any?) {
         guard !isDisposing else { return }
+        if hasFailedNavigation {
+            hardReload()
+            return
+        }
         if isShowingBlankContent {
             setStatus("正在恢复空白页面…", showsProgress: true)
             recoverFromBlankContent(reason: "reload action")
@@ -204,7 +244,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     /// list. Falls back to the profile homepage when there is no current URL to recover.
     func hardReload(ignoringCache: Bool = false) {
         guard !isDisposing else { return }
-        let target = webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
+        let target = (hasFailedNavigation ? lastRequestedURL : webView.url) ?? webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
         let cachePolicy: URLRequest.CachePolicy = ignoringCache ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
         webView.stopLoading()
         webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID, cachePolicy: cachePolicy))
@@ -289,6 +329,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func diagnosticsReport() -> String {
+        refreshDraftDiagnostics()
         let frame = window.frame
         let currentItemURL = webView.backForwardList.currentItem?.url
         let profileLabel = DiagnosticRedactor.profileLabel(
@@ -311,6 +352,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("isShowingBlankContent", isShowingBlankContent ? "true" : "false"),
             ("lastRenderProbeWasBlank", lastRenderProbeWasBlank ? "true" : "false"),
             ("lastRenderProbe", DiagnosticRedactor.text(lastRenderProbeSummary)),
+            ("draftCapture", draftCaptureDiagnostics),
+            ("draftNativeMessages", "\(draftNativeMessageCount)（已保存 \(draftNativeSaveCount)，最近 \(draftNativeDropReason)）"),
             ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
             ("lastBlankRecovery", DiagnosticRedactor.text(lastBlankRecoverySummary)),
             ("nativeStatusOverlay", DiagnosticRedactor.text(currentOverlayMode.diagnosticDescription)),
@@ -639,6 +682,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         cancelRemoteImageLoads()
         clearBlockedNavigationStatus()
         webViewObservations.removeAll()
+        stopUtilityObservers()
+        cancelNativeDownloads()
         childControllers.forEach { $0.window.close() }
         childControllers.removeAll()
         closeHandler = nil
@@ -669,7 +714,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func windowDidBecomeKey(_ notification: Notification) {
-        scheduleRenderedContentProbe(reason: "window activation", delay: 0.8)
+        if hasFailedNavigation || lastRenderProbeWasBlank || webView.url == nil {
+            scheduleRenderedContentProbe(reason: "window activation", delay: 0.8)
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -702,6 +749,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         didTearDownWebView = true
+        stopUtilityObservers()
+        cancelNativeDownloads()
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
@@ -709,7 +758,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         let userContentController = webView.configuration.userContentController
-        for name in ["downloadBlob", "promptDraft", "completionState"] {
+        for name in ["downloadBlob", "promptDraft", "completionState", "pageState"] {
             userContentController.removeScriptMessageHandler(forName: name)
         }
         userContentController.removeAllUserScripts()
@@ -756,7 +805,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func scheduleRenderedContentProbe(reason: String, delay: TimeInterval) {
-        guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
+        guard !isDisposing, !hasFailedNavigation, ProfileStore.pendingDataMutation == nil else {
             return
         }
         invalidateRenderedContentProbes()
@@ -834,6 +883,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func recoverFromBlankContent(reason: String) {
+        guard NetworkStatusMonitor.shared.availability != .offline, !hasFailedNavigation else { return }
         guard blankRecoveryAttempts < 2 else {
             browserLogger.error("Blank page recovery suppressed after repeated attempts (\(reason, privacy: .public))")
             setStatus("自动恢复已停止，请手动重新加载", showsProgress: false)
@@ -867,7 +917,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "y": frame.origin.y,
             "width": frame.size.width,
             "height": frame.size.height,
-        ], forKey: mainFrameDefaultsKey)
+        ], forKey: mainFrameDefaultsKey + "." + (profileID ?? defaultProfileID))
     }
 
     private func scheduleMainWindowFramePersistence() {
@@ -899,7 +949,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        navigationHTTPFailure = nil
+        isAssistantResponseInProgress = false
         lastNavigationStartedAt = Date()
+        hasFailedNavigation = false
+        lastFailureStatus = nil
         clearBlockedNavigationStatus()
         lastRenderProbeWasBlank = false
         isCloudflareChallengeActive = false
@@ -1023,7 +1077,23 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
+        if navigationAction.targetFrame?.isMainFrame == true { lastRequestedURL = cleanedURL }
         decisionHandler(.allow)
+    }
+
+    @MainActor
+    func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
+                 decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
+        if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
+            if (500...599).contains(response.statusCode) {
+                navigationHTTPFailure = "服务暂不可用（HTTP \(response.statusCode)），可以稍后重试"
+            } else if response.statusCode == 429 {
+                navigationHTTPFailure = "请求过于频繁（HTTP 429），请稍后重试"
+            }
+        }
+        if !navigationResponse.canShowMIMEType {
+            decisionHandler(.download)
+        } else { decisionHandler(.allow) }
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1031,14 +1101,26 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         lastNavigationFinishedAt = Date()
+        if let navigationHTTPFailure {
+            hasFailedNavigation = true
+            lastFailureStatus = navigationHTTPFailure
+            stopLoadingWatchdog()
+            showStatusOverlay(.failed(navigationHTTPFailure))
+            updateNativeChromeStatus()
+            return
+        }
+        hasFailedNavigation = false
+        networkRetryPending = false
+        lastFailureStatus = nil
         if firstNavigationFinishedAt == nil {
             firstNavigationFinishedAt = lastNavigationFinishedAt
         }
         stopLoadingWatchdog()
-        hideStatusOverlayIfTransient()
+        showStatusOverlay(.hidden)
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
-        schedulePromptDraftRestore(reason: "navigation finished")
+        configureDraftExperience()
+        restorePagePosition()
         scheduleRenderedContentProbe(reason: "navigation finished", delay: 2.0)
         updateNativeChromeStatus()
     }
@@ -1050,6 +1132,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
         // window self-heals instead of stranding the user on a blank page.
         webContentProcessTerminationCount += 1
+        crashRecoveryCount += 1
+        guard crashRecoveryCount <= 2 else {
+            hasFailedNavigation = true
+            lastFailureStatus = "页面进程反复退出，请手动重试"
+            showStatusOverlay(.failed("页面进程反复退出，自动恢复已停止。"))
+            updateNativeChromeStatus()
+            return
+        }
         browserLogger.error("Web content process terminated; reloading to recover blank view")
         setStatus("渲染进程已重启，正在恢复…", showsProgress: true)
         showStatusOverlay(.recovering("WebKit 渲染进程刚刚重启，正在重新载入当前页面。"))
@@ -1072,8 +1162,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastNavigationFailureDescription = safeErrorDescription
         lastRenderProbeWasBlank = true
         stopLoadingWatchdog()
-        setStatus("页面加载失败", showsProgress: false)
-        showStatusOverlay(.failed(safeErrorDescription))
+        hasFailedNavigation = true
+        networkRetryPending = !networkRetryUsed
+        let failure = NavigationFailure.description(for: error, offline: NetworkStatusMonitor.shared.availability == .offline)
+        lastFailureStatus = failure
+        setStatus(failure, showsProgress: false)
+        showStatusOverlay(.failed(failure))
         browserLogger.error("Provisional navigation failed: \(safeErrorDescription, privacy: .public)")
     }
 
@@ -1091,8 +1185,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastNavigationFailureDescription = safeErrorDescription
         lastRenderProbeWasBlank = true
         stopLoadingWatchdog()
-        setStatus("页面加载失败", showsProgress: false)
-        showStatusOverlay(.failed(safeErrorDescription))
+        hasFailedNavigation = true
+        networkRetryPending = !networkRetryUsed
+        let failure = NavigationFailure.description(for: error, offline: NetworkStatusMonitor.shared.availability == .offline)
+        lastFailureStatus = failure
+        setStatus(failure, showsProgress: false)
+        showStatusOverlay(.failed(failure))
         browserLogger.error("Navigation failed: \(safeErrorDescription, privacy: .public)")
     }
 
@@ -1228,12 +1326,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     @available(macOS 11.3, *)
     func webView(_ webView: WKWebView, navigationAction: WKNavigationAction, didBecome download: WKDownload) {
-        download.delegate = self
+        trackDownload(download)
     }
 
     @available(macOS 11.3, *)
     func webView(_ webView: WKWebView, navigationResponse: WKNavigationResponse, didBecome download: WKDownload) {
-        download.delegate = self
+        trackDownload(download)
     }
 
     @available(macOS 11.3, *)
@@ -1244,26 +1342,121 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         suggestedFilename: String,
         completionHandler: @escaping @MainActor @Sendable (URL?) -> Void
     ) {
-        let destination = uniqueDownloadURL(suggestedFilename: suggestedFilename)
+        trackDownload(download)
+        let reserved = Set(Self.controllers.flatMap { $0.downloadDestinations.values.map(\.path) })
+        let directory = DownloadStore.downloadsDirectory()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let destination = DownloadFilename.uniqueDownloadURL(suggestedFilename: suggestedFilename, in: directory,
+            fileExists: { reserved.contains($0) || FileManager.default.fileExists(atPath: $0) })
+        if let id = downloadIDs[ObjectIdentifier(download)] {
+            DownloadCenter.shared.rename(id: id, filename: destination.lastPathComponent)
+        }
         downloadDestinations[ObjectIdentifier(download)] = destination
         completionHandler(destination)
     }
 
     @available(macOS 11.3, *)
     func downloadDidFinish(_ download: WKDownload) {
-        NSSound.beep()
-        if let destination = downloadDestinations.removeValue(forKey: ObjectIdentifier(download)) {
-            NSWorkspace.shared.activateFileViewerSelecting([destination])
+        let key = ObjectIdentifier(download)
+        guard let id = downloadIDs.removeValue(forKey: key) else { return }
+        activeDownloads.removeValue(forKey: key)
+        stopDownloadProgressTimerIfIdle()
+        if let destination = downloadDestinations.removeValue(forKey: key) {
+            finishDownload(id: id, url: destination)
         }
     }
 
     @available(macOS 11.3, *)
     func download(_ download: WKDownload, didFailWithError error: Error, resumeData: Data?) {
-        downloadDestinations.removeValue(forKey: ObjectIdentifier(download))
-        presentError("下载失败：\(error.localizedDescription)")
+        let key = ObjectIdentifier(download)
+        guard let id = downloadIDs.removeValue(forKey: key) else { return }
+        let previousDestination = downloadDestinations.removeValue(forKey: key)
+        activeDownloads.removeValue(forKey: key)
+        stopDownloadProgressTimerIfIdle()
+        let request = download.originalRequest
+        let canRestart = request?.httpMethod == nil || request?.httpMethod == "GET"
+        let safeRequest = request?.url.map { NavigationRules.webViewNavigationBlockReason($0, sourceURL: self.webView.url) == nil } == true
+        var retry: (() -> Void)?
+        if resumeData != nil || (canRestart && safeRequest) {
+            retry = { [weak self] in
+                guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                    DownloadCenter.shared.fail(id: id, message: "原页面已关闭，请回原页面重新下载")
+                    return
+                }
+                let receive: (WKDownload) -> Void = { [weak self] restarted in
+                    guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else { restarted.cancel(nil); DownloadCenter.shared.cancel(id: id); return }
+                    self.trackDownload(restarted, id: id)
+                    if let resumeData, !resumeData.isEmpty, let previousDestination {
+                        self.downloadDestinations[ObjectIdentifier(restarted)] = previousDestination
+                    }
+                }
+                if let resumeData {
+                    self.webView.resumeDownload(fromResumeData: resumeData, completionHandler: receive)
+                } else if let request {
+                    self.webView.startDownload(using: request, completionHandler: receive)
+                }
+            }
+        }
+        failDownload(id: id, error: error, retry: retry)
+    }
+
+    private func trackDownload(_ download: WKDownload, id: UUID? = nil) {
+        let key = ObjectIdentifier(download)
+        guard downloadIDs[key] == nil else { return }
+        let recordID = id ?? DownloadCenter.shared.begin(filename: "ChatGPT 下载", profileID: downloadScope, isPrivate: !persistent)
+        downloadIDs[key] = recordID
+        activeDownloads[key] = download
+        download.delegate = self
+        if downloadProgressTimer == nil {
+            let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated {
+                guard let self else { return }
+                for (key, transfer) in self.activeDownloads {
+                    guard let id = self.downloadIDs[key] else { continue }
+                    let progress = transfer.progress
+                    DownloadCenter.shared.updateProgress(id: id, receivedBytes: progress.completedUnitCount,
+                        expectedBytes: progress.totalUnitCount > 0 ? progress.totalUnitCount : nil)
+                }
+                }
+            }
+            timer.tolerance = 0.05
+            downloadProgressTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopDownloadProgressTimerIfIdle() {
+        if activeDownloads.isEmpty { downloadProgressTimer?.invalidate(); downloadProgressTimer = nil }
+    }
+
+    private func cancelNativeDownloads() {
+        for (key, download) in activeDownloads {
+            download.delegate = nil
+            download.cancel(nil)
+            if let id = downloadIDs[key] { DownloadCenter.shared.cancel(id: id) }
+        }
+        activeDownloads.removeAll()
+        downloadIDs.removeAll()
+        downloadDestinations.removeAll()
+        stopDownloadProgressTimerIfIdle()
+        if !persistent { DownloadCenter.shared.forget(profileID: downloadScope) }
+    }
+
+    func finishDownload(id: UUID, url: URL) {
+        DownloadCenter.shared.complete(id: id, url: url)
+        showToast("下载完成：" + url.lastPathComponent, actionTitle: "查看", action: { [weak self] in self?.showDownloads(nil) })
+    }
+
+    func failDownload(id: UUID, error: Error, retry: (() -> Void)? = nil) {
+        let safeMessage = DiagnosticRedactor.text(error.localizedDescription)
+        DownloadCenter.shared.fail(id: id, message: safeMessage, resume: retry)
+        showToast("下载失败：" + safeMessage, actionTitle: retry == nil ? "下载中心" : "重试", action: { [weak self] in
+            if retry != nil { _ = DownloadCenter.shared.retry(id: id) } else { self?.showDownloads(nil) }
+        }, duration: 10)
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "pageState" { handlePageStateMessage(message); return }
         if message.name == "promptDraft" {
             handlePromptDraftMessage(message)
             return
@@ -1274,7 +1467,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
-        guard message.name == "downloadBlob",
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil, message.name == "downloadBlob",
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any]
@@ -1290,25 +1483,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         saveImageDownloadPayload(payload)
     }
 
-    private func handlePromptDraftMessage(_ message: WKScriptMessage) {
-        guard persistent,
-              !isDisposing,
-              ProfileStore.pendingDataMutation == nil,
-              PromptDraftStore.isRestoreEnabled(),
-              message.frameInfo.isMainFrame,
-              Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
-              let payload = message.body as? [String: Any],
-              let rawText = payload["text"] as? String,
-              rawText.count <= 24_000
-        else {
-            return
-        }
-
-        PromptDraftStore.saveDraft(rawText, profileID: profileID)
-    }
-
     private func handleCompletionStateMessage(_ message: WKScriptMessage) {
-        guard persistent,
+        guard persistent, !isDisposing, ProfileStore.pendingDataMutation == nil,
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any]
@@ -1338,31 +1514,51 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let suggestedName = (payload["filename"] as? String)
             .map { String($0.prefix(512)).trimmingCharacters(in: .whitespacesAndNewlines) }
         if let dataURL = payload["dataURL"] as? String {
-            do {
-                guard Self.isImageDataURL(dataURL) else {
-                    throw NSError(domain: "ChatGPTSwiftWeb", code: 9, userInfo: [NSLocalizedDescriptionKey: "仅支持图像数据"])
-                }
-                let filename = Self.imageFilename(
-                    suggestedFilename: suggestedName,
-                    fallback: "chatgpt-image",
-                    mimeType: Self.dataURLMimeType(dataURL)
-                )
-                let data = try decodeDataURL(dataURL)
-                let outputURL = try DownloadStore.save(data, suggestedFilename: filename)
-                NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-            } catch {
-                presentError("保存下载失败：\(error.localizedDescription)")
-            }
+            let filename = Self.imageFilename(suggestedFilename: suggestedName, fallback: "chatgpt-image", mimeType: Self.dataURLMimeType(dataURL))
+            let id = DownloadCenter.shared.begin(filename: filename, profileID: downloadScope, isPrivate: !persistent)
+            saveImageDataURL(dataURL, filename: filename, recordID: id)
             return
         }
 
         if let rawURL = payload["url"] as? String,
            let url = NavigationRules.validatedExternalURL(rawURL) {
-            downloadRemoteImage(from: url, suggestedFilename: suggestedName)
+            let id = DownloadCenter.shared.begin(filename: suggestedName ?? "chatgpt-image", profileID: downloadScope, isPrivate: !persistent)
+            imageDownloadIDs.insert(id)
+            downloadRemoteImage(from: url, suggestedFilename: suggestedName, recordID: id)
             return
         }
 
         presentError("保存下载失败：下载桥没有收到有效图像数据。")
+    }
+
+    private func saveImageDataURL(_ dataURL: String, filename: String, recordID: UUID) {
+        imageDownloadIDs.insert(recordID)
+        let retry: () -> Void = { [weak self] in
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                DownloadCenter.shared.fail(id: recordID, message: "原页面已关闭，请回原页面重新下载")
+                return
+            }
+            self.saveImageDataURL(dataURL, filename: filename, recordID: recordID)
+        }
+        Self.imageSaveQueue.async { [weak self] in
+            do {
+                guard Self.isImageDataURL(dataURL) else { throw NSError(domain: "ChatGPTSwiftWeb", code: 9, userInfo: [NSLocalizedDescriptionKey: "仅支持图像数据"]) }
+                let data = try Self.decodeDataURL(dataURL)
+                guard !data.isEmpty else { throw NSError(domain: "ChatGPTSwiftWeb", code: 10, userInfo: [NSLocalizedDescriptionKey: "图像数据为空"]) }
+                let outputURL = try DownloadStore.save(data, suggestedFilename: filename)
+                DispatchQueue.main.async {
+                    self?.imageDownloadIDs.remove(recordID)
+                    if let self { self.finishDownload(id: recordID, url: outputURL) }
+                    else { DownloadCenter.shared.complete(id: recordID, url: outputURL) }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.imageDownloadIDs.remove(recordID)
+                    if let self { self.failDownload(id: recordID, error: error, retry: retry) }
+                    else { DownloadCenter.shared.fail(id: recordID, message: "保存未完成，请回原页面重新下载") }
+                }
+            }
+        }
     }
 
     private func showImageDownloadMenu(payload: [String: Any]) {
@@ -1418,7 +1614,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 guard Self.isImageDataURL(dataURL) else {
                     throw NSError(domain: "ChatGPTSwiftWeb", code: 9, userInfo: [NSLocalizedDescriptionKey: "仅支持图像数据"])
                 }
-                let data = try decodeDataURL(dataURL)
+                let data = try Self.decodeDataURL(dataURL)
                 try copyImageDataToPasteboard(data)
             } catch {
                 presentError("拷贝图像失败：\(error.localizedDescription)")
@@ -1456,63 +1652,15 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         try {
           localStorage.removeItem('chatgptWebZoom');
           localStorage.removeItem('htmlZoom');
-          document.documentElement.style.zoom = '';
-          if (document.body) document.body.style.zoom = '';
-          window.dispatchEvent(new Event('resize'));
+          const changed = !!document.documentElement.style.zoom || !!document.body?.style.zoom;
+          if (changed) {
+            document.documentElement.style.zoom = '';
+            if (document.body) document.body.style.zoom = '';
+            window.dispatchEvent(new Event('resize'));
+          }
         } catch (_) {}
         """
         webView.evaluateJavaScript(script, completionHandler: nil)
-    }
-
-    func restorePromptDraftIfAvailable(reason: String) {
-        guard persistent,
-              !isDisposing,
-              ProfileStore.pendingDataMutation == nil,
-              PromptDraftStore.isRestoreEnabled(),
-              Self.canInjectPromptContent(into: webView.url) else {
-            return
-        }
-
-        let draft = PromptDraftStore.draft(for: profileID)
-        guard !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
-        }
-
-        webView.evaluateJavaScript(Self.restorePromptDraftScript(text: draft)) { result, error in
-            if let error {
-                browserLogger.debug("Prompt draft restore failed (\(reason, privacy: .public)): \(error.localizedDescription, privacy: .public)")
-                return
-            }
-
-            guard let report = result as? [String: Any],
-                  Self.boolValue(report["restored"]) else {
-                return
-            }
-            browserLogger.info("Prompt draft restored (\(reason, privacy: .public))")
-        }
-    }
-
-    private func schedulePromptDraftRestore(reason: String) {
-        guard persistent,
-              !isDisposing,
-              ProfileStore.pendingDataMutation == nil,
-              PromptDraftStore.isRestoreEnabled(),
-              !PromptDraftStore.draft(for: profileID).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return
-        }
-
-        for delay in [0.9, 2.8] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak webView] in
-                guard let self,
-                      let webView,
-                      self.webView === webView,
-                      !self.isDisposing,
-                      ProfileStore.pendingDataMutation == nil else {
-                    return
-                }
-                self.restorePromptDraftIfAvailable(reason: reason)
-            }
-        }
     }
 
     private func renderFingerprintReport() {
@@ -1575,12 +1723,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func presentError(_ text: String) {
-        presentAlert(text, style: .warning)
+        let safeText = DiagnosticRedactor.text(text)
+        showToast(safeText, actionTitle: "复制诊断信息", action: {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(safeText, forType: .string)
+        }, duration: 10)
     }
 
-    private func presentInfo(_ text: String) {
-        presentAlert(text, style: .informational)
-    }
+    private func presentInfo(_ text: String) { showToast(text) }
 
     private func presentAlert(_ text: String, style: NSAlert.Style) {
         let alert = NSAlert()
@@ -1773,31 +1923,34 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         CookieImportParser.isSessionCookieName(name)
     }
 
-    private func downloadRemoteImage(from url: URL, suggestedFilename: String?) {
-        loadRemoteImage(from: url) { [weak self] result in
-            guard let self else {
+    private func downloadRemoteImage(from url: URL, suggestedFilename: String?, recordID: UUID) {
+        imageDownloadIDs.insert(recordID)
+        let retry: () -> Void = { [weak self] in
+            guard let self, !self.isDisposing, ProfileStore.pendingDataMutation == nil else {
+                DownloadCenter.shared.fail(id: recordID, message: "原页面已关闭，请回原页面重新下载")
                 return
             }
-
+            self.downloadRemoteImage(from: url, suggestedFilename: suggestedFilename, recordID: recordID)
+        }
+        loadRemoteImage(from: url, progress: { received, expected in
+            DispatchQueue.main.async { DownloadCenter.shared.updateProgress(id: recordID, receivedBytes: received, expectedBytes: expected) }
+        }) { [weak self] result in
+            guard let self else { return }
             switch result {
             case let .success(remoteImage):
-                defer { try? FileManager.default.removeItem(at: remoteImage.fileURL) }
-                let filename = Self.remoteImageFilename(
-                    suggestedFilename: suggestedFilename,
-                    sourceURL: url,
-                    mimeType: remoteImage.mimeType
-                )
-                do {
-                    let outputURL = try DownloadStore.moveTemporaryFile(
-                        remoteImage.fileURL,
-                        suggestedFilename: filename
-                    )
-                    NSWorkspace.shared.activateFileViewerSelecting([outputURL])
-                } catch {
-                    self.presentError("保存下载失败：\(error.localizedDescription)")
+                let filename = Self.remoteImageFilename(suggestedFilename: suggestedFilename, sourceURL: url, mimeType: remoteImage.mimeType)
+                Self.imageSaveQueue.async { [weak self] in
+                    defer { try? FileManager.default.removeItem(at: remoteImage.fileURL) }
+                    do {
+                        let outputURL = try DownloadStore.moveTemporaryFile(remoteImage.fileURL, suggestedFilename: filename)
+                        DispatchQueue.main.async { self?.imageDownloadIDs.remove(recordID); self?.finishDownload(id: recordID, url: outputURL) }
+                    } catch {
+                        DispatchQueue.main.async { self?.imageDownloadIDs.remove(recordID); self?.failDownload(id: recordID, error: error, retry: retry) }
+                    }
                 }
             case let .failure(error):
-                self.presentError("保存下载失败：\(error.localizedDescription)")
+                self.imageDownloadIDs.remove(recordID)
+                self.failDownload(id: recordID, error: error, retry: retry)
             }
         }
     }
@@ -1846,12 +1999,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     private func loadRemoteImage(
         from url: URL,
+        progress: (@Sendable (Int64, Int64?) -> Void)? = nil,
         completion: @escaping (Result<RemoteImageFile, Error>) -> Void
     ) {
         let loaderID = UUID()
         let loader = RemoteImageLoader(
             sourceURL: url,
-            maximumBytes: maximumBridgeDownloadBytes
+            maximumBytes: maximumBridgeDownloadBytes, progress: progress
         ) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else {
@@ -1874,6 +2028,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let loaders = Array(remoteImageLoaders.values)
         remoteImageLoaders.removeAll()
         loaders.forEach { $0.cancel() }
+        imageDownloadIDs.forEach { DownloadCenter.shared.cancel(id: $0) }
+        imageDownloadIDs.removeAll()
     }
 
     private static func remoteImageFilename(suggestedFilename: String?, sourceURL: URL, mimeType: String?) -> String {
@@ -1949,7 +2105,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         CookieImportParser.cookieImportError(message)
     }
 
-    private func decodeDataURL(_ dataURL: String) throws -> Data {
+    nonisolated private static func decodeDataURL(_ dataURL: String) throws -> Data {
         guard dataURL.utf8.count <= maximumBridgeDownloadPayloadCharacters else {
             throw NSError(domain: "ChatGPTSwiftWeb", code: 4, userInfo: [NSLocalizedDescriptionKey: "下载内容超过 \(maximumBridgeDownloadBytes / 1024 / 1024)MB 限制"])
         }
@@ -2175,168 +2331,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     })()
     """
 
-    static let promptDraftCaptureScript = """
-    (() => {
-      const host = String(location.hostname || '').toLowerCase();
-      const isChatGPTPage = location.protocol === 'https:' && (
-        host === 'chatgpt.com' ||
-        host.endsWith('.chatgpt.com') ||
-        host === 'chat.openai.com' ||
-        host.endsWith('.chat.openai.com')
-      );
-      const isCloudflareChallenge = location.pathname.startsWith('/cdn-cgi/challenge-platform/') || !!document.querySelector([
-        'iframe[src*="challenges.cloudflare.com"]',
-        '.cf-turnstile',
-        '#cf-challenge-running',
-        '#challenge-stage',
-        '[data-cf-challenge]'
-      ].join(','));
-      if (!isChatGPTPage || isCloudflareChallenge || window.__chatgptSwiftPromptDraftBridgeInstalled) return;
-      window.__chatgptSwiftPromptDraftBridgeInstalled = true;
-
-      const maxLength = 12000;
-      const readText = (element) => {
-        if (!element) return '';
-        if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
-          return String(element.value || '').slice(0, maxLength);
-        }
-        return String(element.innerText || element.textContent || '').slice(0, maxLength);
-      };
-      const composerFromEvent = (event) => {
-        const target = event.target;
-        if (!(target instanceof Element)) return null;
-        return target.closest([
-          'textarea[data-testid="prompt-textarea"]',
-          '[contenteditable="true"][data-testid="prompt-textarea"]',
-          '#prompt-textarea'
-        ].join(','));
-      };
-
-      let publishTimer = 0;
-      let pendingComposer = null;
-      const publish = (composer) => {
-        pendingComposer = composer;
-        window.clearTimeout(publishTimer);
-        publishTimer = window.setTimeout(() => {
-          try {
-            window.webkit.messageHandlers.promptDraft.postMessage({ text: readText(pendingComposer) });
-          } catch (_) {}
-        }, 250);
-      };
-
-      ['input', 'change'].forEach((eventName) => {
-        document.addEventListener(eventName, (event) => {
-          const composer = composerFromEvent(event);
-          if (composer) publish(composer);
-        }, true);
-      });
-    })()
-    """
-
-    static let completionStateObserverScript = """
-    (() => {
-      const host = String(location.hostname || '').toLowerCase();
-      const isChatGPTPage = location.protocol === 'https:' && (
-        host === 'chatgpt.com' ||
-        host.endsWith('.chatgpt.com') ||
-        host === 'chat.openai.com' ||
-        host.endsWith('.chat.openai.com')
-      );
-      const isCloudflareChallenge = location.pathname.startsWith('/cdn-cgi/challenge-platform/') || !!document.querySelector([
-        'iframe[src*="challenges.cloudflare.com"]',
-        '.cf-turnstile',
-        '#cf-challenge-running',
-        '#challenge-stage',
-        '[data-cf-challenge]'
-      ].join(','));
-      if (!isChatGPTPage || isCloudflareChallenge || window.__chatgptSwiftCompletionObserverInstalled) return;
-      window.__chatgptSwiftCompletionObserverInstalled = true;
-
-      // The scan forces synchronous layout (rect/computed style/innerText), so it must stay rare
-      // and cheap: rect short-circuits before computed style, candidates are capped, and scans run
-      // through requestIdleCallback so streaming-mutation storms never reflow every frame.
-      const visible = (element) => {
-        if (!element) return false;
-        const rect = element.getBoundingClientRect();
-        if (rect.width <= 0 || rect.height <= 0) return false;
-        const style = window.getComputedStyle(element);
-        return style.visibility !== 'hidden' && style.display !== 'none';
-      };
-      const textOf = (element) => String(
-        element?.getAttribute?.('aria-label') ||
-        element?.getAttribute?.('data-testid') ||
-        element?.innerText ||
-        element?.textContent ||
-        ''
-      ).toLowerCase();
-      const busyReason = () => {
-        const candidates = Array.from(document.querySelectorAll([
-          '[aria-busy="true"]',
-          '[data-testid*="stop" i]',
-          'button[aria-label*="stop" i]',
-          'button[aria-label*="停止"]',
-          '[role="button"][aria-label*="stop" i]',
-          '[role="button"][aria-label*="停止"]'
-        ].join(',')))
-          .slice(0, 12)
-          .filter(visible);
-        for (const element of candidates) {
-          const text = textOf(element);
-          if (
-            text.includes('stop') ||
-            text.includes('停止') ||
-            text.includes('streaming') ||
-            text.includes('generating') ||
-            text.includes('回答中') ||
-            text.includes('生成中') ||
-            text.includes('stop-button')
-          ) {
-            return text.slice(0, 80) || 'busy-control';
-          }
-        }
-        if (document.querySelector('[aria-busy="true"]')) return 'aria-busy';
-        return '';
-      };
-
-      let lastBusy = null;
-      let scanScheduled = false;
-      const scheduleIdleScan = window.requestIdleCallback
-        ? ((scan) => window.requestIdleCallback(scan, { timeout: 500 }))
-        : ((scan) => window.setTimeout(scan, 250));
-      const publish = () => {
-        if (scanScheduled) return;
-        scanScheduled = true;
-        window.setTimeout(() => {
-          scheduleIdleScan(() => {
-            scanScheduled = false;
-            const reason = busyReason();
-            const busy = reason.length > 0;
-            if (busy === lastBusy) return;
-            lastBusy = busy;
-            try {
-              window.webkit.messageHandlers.completionState.postMessage({ busy, reason });
-            } catch (_) {}
-          });
-        }, 600);
-      };
-
-      publish();
-      new MutationObserver(publish).observe(document.documentElement, {
-        childList: true,
-        subtree: true,
-        attributes: true,
-        attributeFilter: ['aria-label', 'aria-busy', 'data-testid', 'disabled']
-      });
-      // Poll only while a generation is in flight; an idle page costs nothing until the
-      // MutationObserver reports activity again.
-      window.setInterval(() => {
-        if (lastBusy) publish();
-      }, 3000);
-    })()
-    """
-
     static func canInjectPromptContent(into url: URL?) -> Bool {
         guard url?.scheme?.lowercased() == "https",
+              (url?.port == nil || url?.port == 443),
               let host = url?.host?.lowercased() else {
             return false
         }
@@ -2414,6 +2411,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
         userContentController.add(messageHandler, name: "promptDraft")
+        userContentController.add(messageHandler, name: "pageState")
         userContentController.add(messageHandler, name: "completionState")
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
@@ -2423,6 +2421,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: "window.__chatgptSwiftPersistent = \(persistent ? "true" : "false"); window.__chatgptSwiftDraftEnabled = \(persistent && PromptDraftStore.isRestoreEnabled() ? "true" : "false");", injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
@@ -2525,7 +2524,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         NavigationRules.isAuthContinuationFromTrustedSource(url, sourceURL: sourceURL)
     }
 
-    private static func isTrustedChatGPTBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
+    static func isTrustedChatGPTBridgeOrigin(_ origin: WKSecurityOrigin) -> Bool {
         guard isTrustedChatGPTOrigin(origin) else {
             return false
         }
@@ -2775,8 +2774,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         NavigationRules.isTrackingQueryParameter(name)
     }
 
-    private static func restoredMainWindowFrame() -> NSRect? {
-        guard let raw = UserDefaults.standard.dictionary(forKey: mainFrameDefaultsKey),
+    private static func restoredMainWindowFrame(profileID: String?) -> NSRect? {
+        guard let raw = UserDefaults.standard.dictionary(forKey: mainFrameDefaultsKey + "." + (profileID ?? defaultProfileID)) ?? UserDefaults.standard.dictionary(forKey: mainFrameDefaultsKey),
               let x = raw["x"] as? CGFloat,
               let y = raw["y"] as? CGFloat,
               let width = raw["width"] as? CGFloat,
@@ -2802,6 +2801,24 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return keyController
         }
         return controllers.first(where: { $0.window.isVisible && !$0.isPopup })
+    }
+
+    static func refreshDraftPreferences() {
+        controllers.forEach { $0.configureDraftExperience() }
+    }
+
+    static func clearProfileDrafts(profileID: String) {
+        let saved = PromptDraftStore.profileDrafts(for: profileID)
+        PromptDraftStore.clearAllDrafts(for: profileID)
+        let matching = controllers.filter { $0.profileID == profileID && !$0.isDisposing }
+        matching.forEach {
+            $0.webView.evaluateJavaScript("window.__chatgptSwiftDraftUI?.clear();", completionHandler: nil)
+            $0.configureDraftExperience()
+        }
+        matching.first?.showToast("当前空间本机草稿已清除", actionTitle: "撤销", action: {
+            PromptDraftStore.restoreProfileDrafts(saved, profileID: profileID)
+            matching.forEach { $0.configureDraftExperience() }
+        })
     }
 
     static func refreshWindowTitles() {
@@ -3575,34 +3592,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         });
               }, true);
 
-              document.addEventListener('click', async (event) => {
-        const target = event.target && event.target.closest ? event.target.closest('a[href^="blob:"],a[href^="data:"]') : null;
-        if (!target) return;
-        if (!isTrustedPage()) return;
-
-        const href = target.href || '';
-
-        const cachedBlob = blobURLs.get(href);
-        const exceedsBridge = (cachedBlob && typeof cachedBlob.size === 'number' && cachedBlob.size > maxBlobDownloadBytes)
-          || (href.startsWith('data:') && href.length > maxBlobDownloadBytes * 2 + 4096);
-        if (exceedsBridge) {
-          // Too large for the base64 bridge — let WebKit's native downloader stream it to disk instead
-          // of materializing a multi-hundred-MB data URL across the IPC boundary.
-          return;
-        }
-
-        event.preventDefault();
-        event.stopImmediatePropagation();
-
-        try {
-          const dataURL = await resolveDataURL(href);
-          window.webkit.messageHandlers.downloadBlob.postMessage({
-            filename: target.download || 'chatgpt-download',
-            dataURL
-          });
-        } catch (error) {
-          console.error('[WebView] blob download bridge failed', error);
-        }
+              document.addEventListener('click', (event) => {
+                const target = event.target instanceof Element ? event.target.closest('a[href^="blob:"],a[href^="data:"]') : null;
+                if (!target || !isTrustedPage()) return;
+                // WKDownload streams all file types directly to disk. Keep the image context-menu
+                // bridge separate; base64 IPC is unnecessary for ordinary download links.
+                if (!target.hasAttribute('download')) target.setAttribute('download', 'chatgpt-download');
               }, true);
             };
 
