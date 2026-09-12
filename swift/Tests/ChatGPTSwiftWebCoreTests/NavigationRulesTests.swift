@@ -49,6 +49,58 @@ final class NavigationRulesTests: XCTestCase {
         XCTAssertFalse(NavigationRules.isAllowedWebViewNavigationURL(try XCTUnwrap(credentialComponents.url)))
     }
 
+    func testWebViewNavigationReportsSpecificBlockReasonsWithoutChangingPolicy() throws {
+        let trustedSource = try XCTUnwrap(URL(string: "https://chatgpt.com/"))
+        var embeddedCredentialURL = URLComponents()
+        embeddedCredentialURL.scheme = "https"
+        embeddedCredentialURL.user = "user"
+        embeddedCredentialURL.password = "pass"
+        embeddedCredentialURL.host = "example.com"
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(embeddedCredentialURL.url)),
+            .embeddedCredentials
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "http://example.com/"))),
+            .insecureHTTP
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "file:///tmp/example"))),
+            .localFile
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "javascript:alert(1)"))),
+            .scriptURL
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "custom-scheme://example/"))),
+            .unsupportedScheme
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "about:srcdoc"))),
+            .unsupportedInternalPage
+        )
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "data:text/html,ok"))),
+            .missingContentSource
+        )
+        XCTAssertNil(
+            NavigationRules.webViewNavigationBlockReason(
+                try XCTUnwrap(URL(string: "data:text/html,ok")),
+                sourceURL: trustedSource
+            )
+        )
+        XCTAssertNil(NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "https://example.com/"))))
+        XCTAssertEqual(
+            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "https://example.com:70000/"))),
+            .invalidAddress
+        )
+        // OAuth query parameters are not embedded URL user/password credentials.
+        XCTAssertNil(NavigationRules.webViewNavigationBlockReason(
+            try XCTUnwrap(URL(string: "https://auth.openai.com/callback?token=example&code=example"))
+        ))
+    }
+
     func testSanitizedUserFacingURLRemovesAuthSecrets() throws {
         let authURL = try XCTUnwrap(URL(string: "https://accounts.google.com/o/oauth2/auth?code=secret&state=opaque#token"))
         let sanitized = try XCTUnwrap(NavigationRules.sanitizedUserFacingURL(authURL))

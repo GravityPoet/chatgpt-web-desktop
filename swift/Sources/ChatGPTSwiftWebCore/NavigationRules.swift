@@ -8,6 +8,17 @@ public enum NavigationRules {
         case other
     }
 
+    public enum WebViewNavigationBlockReason: String {
+        case embeddedCredentials
+        case invalidAddress
+        case insecureHTTP
+        case localFile
+        case scriptURL
+        case unsupportedScheme
+        case unsupportedInternalPage
+        case missingContentSource
+    }
+
     public static func validatedExternalURL(_ raw: String) -> URL? {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
@@ -61,22 +72,36 @@ public enum NavigationRules {
     /// Restricts WebKit navigation actions to web content schemes. Credentials and executable
     /// custom schemes never enter an app WebView or popup.
     public static func isAllowedWebViewNavigationURL(_ url: URL, sourceURL: URL? = nil) -> Bool {
-        guard url.user == nil,
-              url.password == nil,
-              !url.absoluteString.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
-            return false
+        webViewNavigationBlockReason(url, sourceURL: sourceURL) == nil
+    }
+
+    public static func webViewNavigationBlockReason(_ url: URL, sourceURL: URL? = nil) -> WebViewNavigationBlockReason? {
+        guard url.user == nil, url.password == nil else {
+            return .embeddedCredentials
+        }
+        guard !url.absoluteString.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
+            return .invalidAddress
         }
         switch url.scheme?.lowercased() {
         case "https":
-            return url.host?.isEmpty == false
-                && (url.port.map { (1 ... 65535).contains($0) } ?? true)
+            guard url.host?.isEmpty == false,
+                  url.port.map({ (1 ... 65535).contains($0) }) ?? true else {
+                return .invalidAddress
+            }
+            return nil
         case "about":
-            return url.absoluteString.lowercased() == "about:blank"
+            return url.absoluteString.lowercased() == "about:blank" ? nil : .unsupportedInternalPage
         case "blob", "data":
             let sourceScheme = sourceURL?.scheme?.lowercased()
-            return ["https", "blob", "data", "about"].contains(sourceScheme)
+            return ["https", "blob", "data", "about"].contains(sourceScheme) ? nil : .missingContentSource
+        case "http":
+            return .insecureHTTP
+        case "file":
+            return .localFile
+        case "javascript":
+            return .scriptURL
         default:
-            return false
+            return .unsupportedScheme
         }
     }
 
