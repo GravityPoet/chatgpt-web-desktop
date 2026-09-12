@@ -108,6 +108,7 @@ final class BrowserStatusOverlayView: NSVisualEffectView {
 
         if let title = mode.primaryButtonTitle {
             primaryButton.title = title
+            primaryButton.setAccessibilityLabel(title + "页面")
             primaryButton.isHidden = false
         } else {
             primaryButton.isHidden = true
@@ -123,7 +124,7 @@ final class BrowserStatusOverlayView: NSVisualEffectView {
         layer?.cornerRadius = 8
         layer?.masksToBounds = true
         translatesAutoresizingMaskIntoConstraints = false
-        setAccessibilityElement(true)
+        setAccessibilityElement(false)
         setAccessibilityRole(.group)
 
         progressIndicator.style = .spinning
@@ -138,7 +139,7 @@ final class BrowserStatusOverlayView: NSVisualEffectView {
 
         detailLabel.font = .systemFont(ofSize: 12, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
-        detailLabel.maximumNumberOfLines = 2
+        detailLabel.maximumNumberOfLines = 0
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
 
         primaryButton.bezelStyle = .rounded
@@ -174,7 +175,7 @@ final class BrowserStatusOverlayView: NSVisualEffectView {
 
             progressIndicator.widthAnchor.constraint(equalToConstant: 16),
             progressIndicator.heightAnchor.constraint(equalToConstant: 16),
-            textStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 220),
+            textStack.widthAnchor.constraint(greaterThanOrEqualToConstant: 160),
             textStack.widthAnchor.constraint(lessThanOrEqualToConstant: 360)
         ])
     }

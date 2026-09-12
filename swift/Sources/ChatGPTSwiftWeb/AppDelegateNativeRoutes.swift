@@ -1,6 +1,17 @@
 import AppKit
 
 extension AppDelegate {
+    @objc func restoreSavedDraftAction(_ sender: Any?) {
+        guard !profileMutationInProgress, ProfileStore.pendingDataMutation == nil else { return }
+        (BrowserWindowController.keyWindowController() ?? mainController)?.restoreSavedDraft(sender)
+    }
+
+    @objc func clearSavedDraftAction(_ sender: Any?) {
+        guard !profileMutationInProgress, ProfileStore.pendingDataMutation == nil else { return }
+        BrowserWindowController.clearProfileDrafts(profileID: ProfileStore.currentProfileID())
+        refreshNativeUtilityWindows()
+    }
+
     @objc func focusPromptAction(_ sender: Any?) {
         guard !profileMutationInProgress,
               ProfileStore.pendingDataMutation == nil,
@@ -53,15 +64,6 @@ extension AppDelegate {
     }
 
     private func presentNotesContextError(_ message: String, for controller: BrowserWindowController) {
-        let alert = NSAlert()
-        alert.messageText = "无法插入备忘录上下文"
-        alert.informativeText = message
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "知道了")
-        if controller.window.isVisible {
-            alert.beginSheetModal(for: controller.window)
-        } else {
-            alert.runModal()
-        }
+        controller.showToast("无法插入备忘录：" + message, actionTitle: "重试", action: { [weak self] in self?.insertNotesContextAction(nil) }, duration: 12)
     }
 }

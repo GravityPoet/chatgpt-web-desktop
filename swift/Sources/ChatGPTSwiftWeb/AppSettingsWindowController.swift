@@ -20,6 +20,11 @@ struct AppSettingsState {
     let notesAutomationStatus: String
     let updateStatus: String
     let distributionStatus: String
+    var autoOpenFinderAfterDownload: Bool = false
+    var networkStatus: String = "未检查"
+    var quickWindowEnabled: Bool = false
+    var quickWindowShortcut: String = "⌘⇧空格"
+
 }
 
 struct AppSettingsCallbacks {
@@ -34,11 +39,18 @@ struct AppSettingsCallbacks {
     let showDiagnostics: () -> Void
     let checkForUpdates: () -> Void
     let openReleasePage: () -> Void
+    var setAutoOpenFinderAfterDownload: (Bool) -> Void = { _ in }
+    var clearCurrentDraft: () -> Void = {}
+    var setQuickWindowEnabled: (Bool) -> Void = { _ in }
+    var setQuickWindowShortcut: (QuickWindowShortcut) -> Void = { _ in }
+    var showDownloads: @MainActor () -> Void = {}
+
 }
 
 final class AppSettingsWindowController: NSWindowController {
     private enum Section: Int, CaseIterable {
         case general
+        case quickWindow
         case privacy
         case notes
         case distribution
@@ -47,6 +59,8 @@ final class AppSettingsWindowController: NSWindowController {
             switch self {
             case .general:
                 return "通用"
+            case .quickWindow:
+                return "快速窗口"
             case .privacy:
                 return "隐私"
             case .notes:
@@ -221,6 +235,8 @@ final class AppSettingsWindowController: NSWindowController {
         switch selectedSection {
         case .general:
             renderGeneral()
+        case .quickWindow:
+            renderQuickWindow()
         case .privacy:
             renderPrivacy()
         case .notes:
@@ -237,21 +253,36 @@ final class AppSettingsWindowController: NSWindowController {
         addKeyValue("启动默认空间", state.startupProfileName)
         addKeyValue("当前空间首页", state.homepage)
         addToggle(
-            "恢复输入草稿（本机）",
-            detail: "刷新、白屏恢复或 WebKit 进程重启后，尽量把当前空间未发送的输入还原到 ChatGPT 输入框。",
+            "在本机保留输入草稿",
+            detail: "后台保存最近输入，不显示聊天提示，不因收到回复而删除。需要时从“编辑”菜单恢复或清除。",
             state: state.promptDraftRestoreEnabled,
             action: #selector(togglePromptDraftRestore(_:))
         )
         addKeyValue("当前草稿", state.promptDraftSummary)
+        addActionButton("清除当前空间草稿", action: #selector(clearCurrentDraft(_:)))
         addToggle(
             "后台完成通知",
             detail: "窗口不在前台时，如果网页状态显示 ChatGPT 回复完成，则发送 macOS 通知。",
             state: state.backgroundCompletionNotificationsEnabled,
             action: #selector(toggleBackgroundCompletionNotifications(_:))
         )
+        addToggle("下载完成后自动打开 Finder", detail: "默认关闭。完成后仅显示应用内提示，可在下载中心查看。", state: state.autoOpenFinderAfterDownload, action: #selector(toggleAutoOpenFinder(_:)))
+        addKeyValue("网络状态", state.networkStatus)
         addKeyValue("通知权限", state.notificationPermissionStatus)
         addKeyValue("数据隔离", state.profileIsolation)
         addActionButton("打开诊断", action: #selector(showDiagnostics(_:)))
+        addActionButton("打开下载中心", action: #selector(showDownloads(_:)))
+    }
+
+    private func renderQuickWindow() {
+        addHeader("快速窗口", "默认关闭。启用后可用全局快捷键打开轻量输入窗口，直接输入、发送并阅读回复。")
+        addToggle("启用快速窗口", detail: "首次使用时加载页面，关闭后释放窗口；再次呼出沿用当前账号空间。", state: state.quickWindowEnabled, action: #selector(toggleQuickWindow(_:)))
+        let recorder = ShortcutRecorderButton(shortcut: QuickWindowPreferences.shortcut) { [weak self] shortcut in
+            self?.callbacks.setQuickWindowShortcut(shortcut)
+        }
+        contentStack.addArrangedSubview(recorder)
+        addKeyValue("快捷键状态", QuickWindowHotKey.shared.statusText)
+
     }
 
     private func renderPrivacy() {
@@ -426,6 +457,16 @@ final class AppSettingsWindowController: NSWindowController {
         spacer.heightAnchor.constraint(equalToConstant: height).isActive = true
         contentStack.addArrangedSubview(spacer)
     }
+
+    @objc private func toggleAutoOpenFinder(_ sender: NSButton) { callbacks.setAutoOpenFinderAfterDownload(sender.state == .on) }
+
+    @objc private func clearCurrentDraft(_ sender: Any?) { callbacks.clearCurrentDraft() }
+
+    @objc private func toggleQuickWindow(_ sender: NSButton) { callbacks.setQuickWindowEnabled(sender.state == .on) }
+
+
+
+    @objc private func showDownloads(_ sender: Any?) { callbacks.showDownloads() }
 
     @objc private func toggleWebRTC(_ sender: NSButton) {
         callbacks.setWebRTCProtection(sender.state == .on)

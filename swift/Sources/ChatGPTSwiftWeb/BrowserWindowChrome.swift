@@ -15,6 +15,8 @@ extension NSToolbarItem.Identifier {
     static let chatGPTBack = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Back")
     static let chatGPTForward = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Forward")
     static let chatGPTReload = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Reload")
+    static let chatGPTDownloads = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Downloads")
+    static let chatGPTProfile = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Profile")
     static let chatGPTStatus = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Status")
 }
 
@@ -27,6 +29,13 @@ extension BrowserWindowController {
         toolbar.allowsUserCustomization = true
         toolbar.autosavesConfiguration = true
         window.toolbar = toolbar
+        // Upgrade the saved toolbar once; future user customizations remain untouched.
+        if persistent && !UserDefaults.standard.bool(forKey: "ChatGPTSwiftWeb.Toolbar.DownloadsIntroduced") {
+            if !toolbar.items.contains(where: { $0.itemIdentifier == .chatGPTDownloads }) {
+                toolbar.insertItem(withItemIdentifier: .chatGPTDownloads, at: min(3, toolbar.items.count))
+            }
+            UserDefaults.standard.set(true, forKey: "ChatGPTSwiftWeb.Toolbar.DownloadsIntroduced")
+        }
         if #available(macOS 11.0, *) {
             window.toolbarStyle = .unifiedCompact
         }
@@ -48,6 +57,7 @@ extension BrowserWindowController {
             },
             webView.observe(\.url, options: [.new]) { [weak self] _, _ in
                 self?.scheduleNativeChromeStatusUpdate()
+                DispatchQueue.main.async { self?.configureDraftExperience() }
             }
         ]
     }
@@ -80,6 +90,8 @@ extension BrowserWindowController {
             .chatGPTBack,
             .chatGPTForward,
             .chatGPTReload,
+            .chatGPTDownloads,
+            .chatGPTProfile,
             .chatGPTStatus,
             .flexibleSpace,
             .space
@@ -91,6 +103,8 @@ extension BrowserWindowController {
             .chatGPTBack,
             .chatGPTForward,
             .chatGPTReload,
+            .chatGPTDownloads,
+            .chatGPTProfile,
             .flexibleSpace,
             .chatGPTStatus
         ]
@@ -123,6 +137,22 @@ extension BrowserWindowController {
                 symbolName: "arrow.clockwise",
                 action: #selector(reload(_:))
             )
+        case .chatGPTDownloads, .chatGPTProfile:
+            let isDownload = itemIdentifier == .chatGPTDownloads
+            let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+            item.label = isDownload ? "下载中心" : "账号空间"
+            item.paletteLabel = item.label
+            let button = NSButton(title: isDownload ? "下载" : "账号空间", target: self,
+                                  action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
+            button.bezelStyle = .texturedRounded
+            button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
+            button.imagePosition = .imageLeading
+            button.setAccessibilityLabel(item.label)
+            item.view = button
+            if isDownload { downloadButton = button } else { profileButton = button }
+            toolbarItems[itemIdentifier] = item
+            if isDownload { updateDownloadButton() }
+            return item
         case .chatGPTStatus:
             return makeStatusToolbarItem(identifier: itemIdentifier)
         default:
@@ -154,6 +184,10 @@ extension BrowserWindowController {
 
         if let blockedNavigationStatus {
             setStatus(blockedNavigationStatus, showsProgress: false)
+        } else if NetworkStatusMonitor.shared.availability == .offline {
+            setStatus("网络已断开", showsProgress: false)
+        } else if let lastFailureStatus {
+            setStatus(lastFailureStatus, showsProgress: false)
         } else if webView.isLoading {
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             setStatus("加载中 \(percent)%", showsProgress: true)
