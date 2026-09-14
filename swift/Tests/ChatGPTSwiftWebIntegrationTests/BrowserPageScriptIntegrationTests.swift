@@ -203,6 +203,127 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(report["blank"] as? Bool, false)
     }
 
+    func testArchivedDialogRecoveryRequestsNativeReloadWithoutMutatingTheDocument() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        let historyState = try stringResult("JSON.stringify(history.state)", in: harness.webView)
+        _ = try stringResult("document.querySelector('#archive-close svg').dispatchEvent(new MouseEvent('click', {bubbles:true})); 'clicked'", in: harness.webView)
+        settle(0.6)
+        XCTAssertEqual(sink.payload(named: "dialogDismissal")?["action"] as? String, "archivedClose")
+        XCTAssertEqual(sink.payload(named: "dialogDismissal")?["url"] as? String, "https://chatgpt.com/c/archive-fixture?mode=fixture#settings/DataControls/ArchivedChats")
+        XCTAssertEqual(try stringResult("location.hash", in: harness.webView), "#settings/DataControls/ArchivedChats")
+        XCTAssertEqual(try stringResult("String(document.querySelector('#archive').hidden)", in: harness.webView), "false")
+        XCTAssertEqual(try stringResult("JSON.stringify(history.state)", in: harness.webView), historyState)
+        XCTAssertEqual(try stringResult("document.querySelector('#prompt-textarea').textContent", in: harness.webView), "unsent fixture draft")
+    }
+
+    func testArchivedDialogRecoveryHandlesRemountAndParentRouteWithStaleModal() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        _ = try stringResult("""
+        document.querySelector('#archive-close').addEventListener('click', () => {
+          const dialog=document.querySelector('#archive');
+          dialog.replaceWith(dialog.cloneNode(true));
+          history.replaceState({}, '', '#settings/DataControls');
+        });
+        document.querySelector('#archive-close').dispatchEvent(new Event('click',{bubbles:true})); 'activated'
+        """, in: harness.webView)
+        settle(0.6)
+        XCTAssertEqual(sink.payload(named: "dialogDismissal")?["url"] as? String, "https://chatgpt.com/c/archive-fixture?mode=fixture#settings/DataControls")
+        XCTAssertEqual(try stringResult("String(window.__chatgptSwiftArchiveDismissal.needsRecovery())", in: harness.webView), "true")
+    }
+
+    func testArchivedDialogEscapeIgnoresCompositionAndRequestsRecoveryOnce() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        _ = try stringResult("document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',isComposing:true,bubbles:true})); 'composing'", in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+        _ = try stringResult("document.dispatchEvent(new KeyboardEvent('keydown', {key:'Escape',bubbles:true})); 'escape'", in: harness.webView)
+        settle(0.6)
+        XCTAssertEqual(sink.messages.filter { $0.name == "dialogDismissal" }.count, 1)
+    }
+
+    func testArchivedDialogRecoveryLeavesWorkingCloseAndLaterNavigationAlone() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        _ = try stringResult("""
+        document.querySelector('#archive-close').onclick = () => {
+          document.querySelector('#archive').hidden = true;
+          history.replaceState({}, '', '#settings/DataControls');
+        };
+        document.querySelector('#archive-close').click(); 'closed'
+        """, in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+        _ = try stringResult("""
+        document.querySelector('#archive-close').onclick = null;
+        history.replaceState({}, '', '#settings/DataControls/ArchivedChats');
+        document.querySelector('#archive').hidden = false;
+        document.querySelector('#archive-close').click();
+        history.replaceState({}, '', '/c/another-fixture#settings/DataControls/ArchivedChats'); 'moved'
+        """, in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+    }
+
+    func testArchivedDialogRecoveryDoesNotDismissNestedConfirmationOrRowActions() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        _ = try stringResult("""
+        document.querySelector('#row-action').click();
+        const confirmation = document.createElement('div');
+        confirmation.setAttribute('role','dialog');
+        confirmation.innerHTML = '<h2>Confirm fixture action</h2><button aria-label="关闭">×</button>';
+        document.body.append(confirmation);
+        confirmation.querySelector('button').click();
+        document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true})); 'nested'
+        """, in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+    }
+
+    func testArchivedDialogRecoveryDoesNotRunOnOtherOriginsRoutesOrChallengePages() throws {
+        for base in ["https://example.com/", "http://chatgpt.com/", "https://chatgpt.com:8443/"] {
+            let sink = ScriptMessageSink(expectations: [:])
+            let harness = try makeArchiveHarness(sink: sink, baseURL: URL(string: base)!)
+            defer { harness.close() }
+            _ = try stringResult("document.querySelector('#archive-close').click(); 'clicked'", in: harness.webView)
+            settle(0.6)
+            XCTAssertNil(sink.payload(named: "dialogDismissal"), base)
+        }
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeArchiveHarness(sink: sink)
+        defer { harness.close() }
+        _ = try stringResult("history.replaceState({}, '', '#settings/DataControls/SharedLinks'); document.querySelector('#archive-close').click(); 'other route'", in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+        _ = try stringResult("history.replaceState({}, '', '#settings/DataControls/ArchivedChats'); document.body.id='challenge-stage'; document.querySelector('#archive-close').click(); 'challenge'", in: harness.webView)
+        settle(0.6)
+        XCTAssertNil(sink.payload(named: "dialogDismissal"))
+    }
+
+    private func makeArchiveHarness(sink: ScriptMessageSink, baseURL: URL = URL(string: "https://chatgpt.com/c/archive-fixture?mode=fixture")!) throws -> WebViewHarness {
+        let harness = try makeHarness(sink: sink, html: """
+        <!doctype html><html><body>
+          <main><div id="prompt-textarea" contenteditable="true">unsent fixture draft</div></main>
+          <div id="archive" role="dialog" aria-modal="true">
+            <h2>已归档的聊天</h2>
+            <button id="archive-close" aria-label="关闭" type="button"><svg width="20" height="20"></svg></button>
+            <button id="row-action" aria-label="取消归档对话 fixture">Fixture action</button>
+          </div>
+          <script>history.replaceState({}, '', '#settings/DataControls/ArchivedChats');</script>
+        </body></html>
+        """, baseURL: baseURL)
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        return harness
+    }
+
     func testDraftRestoreWorksOnlyOnTrustedChatGPTOrigin() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let trusted = try makeHarness(
@@ -291,6 +412,8 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         let controller = WKUserContentController()
         controller.add(sink, name: "promptDraft")
         controller.add(sink, name: "completionState")
+        controller.add(sink, name: "dialogDismissal")
+        controller.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
             source: BrowserWindowController.promptDraftCaptureScript,
             injectionTime: .atDocumentEnd,
@@ -384,6 +507,7 @@ private final class WebViewHarness {
         let controller = webView.configuration.userContentController
         controller.removeScriptMessageHandler(forName: "promptDraft")
         controller.removeScriptMessageHandler(forName: "completionState")
+        controller.removeScriptMessageHandler(forName: "dialogDismissal")
         controller.removeAllUserScripts()
     }
 }
