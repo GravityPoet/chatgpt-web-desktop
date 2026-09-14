@@ -107,6 +107,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var webViewObservations: [NSKeyValueObservation] = []
     private(set) var blockedNavigationStatus: String?
     private var blockedNavigationStatusDismissWorkItem: DispatchWorkItem?
+    private var isRecoveringArchivedDialog = false
     private var blockedNavigationCount = 0
     private var lastBlockedNavigationSummary = "无"
 
@@ -758,7 +759,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         let userContentController = webView.configuration.userContentController
-        for name in ["downloadBlob", "promptDraft", "completionState", "pageState"] {
+        for name in ["downloadBlob", "promptDraft", "completionState", "pageState", "dialogDismissal"] {
             userContentController.removeScriptMessageHandler(forName: name)
         }
         userContentController.removeAllUserScripts()
@@ -1467,6 +1468,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
 
+        if message.name == "dialogDismissal" {
+            handleDialogDismissalMessage(message)
+            return
+        }
+
         guard !isDisposing, ProfileStore.pendingDataMutation == nil, message.name == "downloadBlob",
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
@@ -1481,6 +1487,39 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         saveImageDownloadPayload(payload)
+    }
+
+    private func handleDialogDismissalMessage(_ message: WKScriptMessage) {
+        guard !isDisposing, !isRecoveringArchivedDialog, ProfileStore.pendingDataMutation == nil,
+              message.frameInfo.isMainFrame,
+              Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
+              let payload = message.body as? [String: Any],
+              payload["action"] as? String == "archivedClose",
+              let rawURL = payload["url"] as? String,
+              let current = webView.url, current.absoluteString == rawURL,
+              Self.isTrustedChatGPTURL(current),
+              ["settings/DataControls/ArchivedChats", "settings/DataControls"].contains(current.fragment ?? "") else { return }
+
+        isRecoveringArchivedDialog = true
+        capturePageState { [weak self] in
+            guard let self, !self.isDisposing else { return }
+            // Recheck after the asynchronous draft flush so a page switch or a newly opened
+            // confirmation dialog cannot be interrupted by an old close event.
+            self.webView.evaluateJavaScript("window.__chatgptSwiftArchiveDismissal?.needsRecovery() === true") { [weak self] result, _ in
+                guard let self else { return }
+                self.isRecoveringArchivedDialog = false
+                guard result as? Bool == true, !self.isDisposing,
+                      ProfileStore.pendingDataMutation == nil, self.webView.url == current else { return }
+                var components = URLComponents(url: current, resolvingAgainstBaseURL: false)
+                components?.fragment = "settings/DataControls"
+                guard let parent = components?.url else { return }
+                // A same-document hash change can leave Remix's old modal mounted. Reload a
+                // real parent document, preserving the conversation URL and the saved draft.
+                guard let data = try? JSONEncoder().encode(parent.absoluteString),
+                      let literal = String(data: data, encoding: .utf8) else { return }
+                self.webView.evaluateJavaScript("history.replaceState(history.state, '', \(literal)); location.reload();", completionHandler: nil)
+            }
+        }
     }
 
     private func handleCompletionStateMessage(_ message: WKScriptMessage) {
@@ -2413,6 +2452,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.add(messageHandler, name: "promptDraft")
         userContentController.add(messageHandler, name: "pageState")
         userContentController.add(messageHandler, name: "completionState")
+        userContentController.add(messageHandler, name: "dialogDismissal")
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
@@ -2424,6 +2464,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: "window.__chatgptSwiftPersistent = \(persistent ? "true" : "false"); window.__chatgptSwiftDraftEnabled = \(persistent && PromptDraftStore.isRestoreEnabled() ? "true" : "false");", injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {
             userContentController.addUserScript(WKUserScript(source: FingerprintCatalog.script(for: fingerprint), injectionTime: .atDocumentStart, forMainFrameOnly: false))

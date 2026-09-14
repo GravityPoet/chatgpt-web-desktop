@@ -1711,6 +1711,63 @@ let passkeyLimitationNoticeScript = """
 })();
 """
 
+// Recover only the archive modal that remains visible after its own close handler has settled.
+// Leave the site's DOM and history alone; native WebKit reloads the parent when recovery is needed.
+let chatDialogDismissalRecoveryScript = #"""
+(() => {
+  const host = location.hostname.toLowerCase();
+  if (window !== window.top || location.protocol !== 'https:' ||
+      (location.port && location.port !== '443') ||
+      !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
+  if (window.__chatgptSwiftArchiveDismissal) return;
+  const challenge = () => location.pathname.startsWith('/cdn-cgi/') ||
+    !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
+  if (challenge()) return;
+  const dialogSelector = '[role="dialog"],[aria-modal="true"]';
+  const visible = element => {
+    if (!element.isConnected || element.closest('[hidden],[inert],[aria-hidden="true"]')) return false;
+    const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const archiveDialog = () => {
+    if (!['#settings/DataControls/ArchivedChats','#settings/DataControls'].includes(location.hash) || challenge()) return null;
+    const dialogs = Array.from(document.querySelectorAll(dialogSelector)).filter(visible);
+    const dialog = dialogs[dialogs.length - 1];
+    const heading = dialog?.querySelector('h1,h2,h3,[role="heading"]');
+    return /^(已归档的聊天|已归档对话|archived chats?|archived conversations?)$/i.test((heading?.textContent || '').trim()) ? dialog : null;
+  };
+  let timer = 0, pendingURL = null;
+  const needsRecovery = () => pendingURL === location.href && !!archiveDialog();
+  window.__chatgptSwiftArchiveDismissal = { needsRecovery };
+  const schedule = () => {
+    clearTimeout(timer);
+    const page = location.origin + location.pathname + location.search;
+    timer = setTimeout(() => {
+      timer = 0;
+      if (page !== location.origin + location.pathname + location.search || !archiveDialog()) return;
+      pendingURL = location.href;
+      try {
+        window.webkit.messageHandlers.dialogDismissal.postMessage({action:'archivedClose',url:pendingURL});
+      } catch (_) {}
+    }, 420);
+  };
+  window.addEventListener('pagehide', () => {clearTimeout(timer);pendingURL=null;});
+  document.addEventListener('click', event => {
+    if ((typeof event.button === 'number' && event.button !== 0) || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+    const dialog = archiveDialog();
+    const button = event.target instanceof Element ? event.target.closest('button') : null;
+    if (!dialog || !button || button.disabled || !visible(button) || button.closest(dialogSelector) !== dialog) return;
+    const label = button.getAttribute('aria-label') || button.getAttribute('title') || button.textContent || '';
+    if (/^(关闭|close|dismiss)$/i.test(label.trim())) schedule();
+  }, true);
+  document.addEventListener('keydown', event => {
+    if (event.key === 'Escape' && !event.isComposing && !event.repeat &&
+        !event.altKey && !event.ctrlKey && !event.metaKey && !event.shiftKey && archiveDialog()) schedule();
+  }, true);
+})();
+"""#
+
 let nativeShimScript = """
 (() => {
   if (window.__wkNativeShim) return;
