@@ -354,6 +354,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                     parts.append("menu[\(menu["kind"] ?? "?")]=\(menu["rect"] ?? [:]) open=\(menu["open"] ?? "?") fixed=\(menu["fixed"] ?? "")")
                 }
             }
+            if let buttons = values["composerButtons"] as? [[String: Any]] {
+                parts.append("composerButtons=\(buttons.count)")
+                for button in buttons.prefix(8) {
+                    parts.append("btn[\(button["label"] ?? "?")]=\(button["rect"] ?? [:])")
+                }
+            }
             self.plusMenuDiagnostics = parts.joined(separator: ", ")
         }
     }
