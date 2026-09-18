@@ -1831,6 +1831,7 @@ let composerPlusPopoverFixScript = #"""
   const radixWrappers = () => Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper],[data-base-ui-popper],[data-floating-ui-portal] [role="menu"],[data-positioner]'));
   const textAnchoredMenus = () => {
     const out = [];
+    if (!document.body) return out;
     const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
     const hits = [];
     while (walker.nextNode()) {
@@ -1868,6 +1869,7 @@ let composerPlusPopoverFixScript = #"""
       }
     }
     for (const pop of pops) {
+      try {
       if (!(pop instanceof Element) || !pop.isConnected) continue;
       const content = pop.matches('[data-radix-popper-content-wrapper]') ? pop : null;
       const freshClick = lastPlusClick && Date.now() - lastPlusClick.time < 5000 && lastPlusClick.trigger.isConnected
@@ -1934,6 +1936,7 @@ let composerPlusPopoverFixScript = #"""
       }
       box.style.setProperty('transform', 'none', 'important');
       try { box.dataset.chatgptSwiftPlusFixed = placement; } catch (_) {}
+      } catch (_) {}
     }
   };
   const schedule = targetPop => {
@@ -1969,9 +1972,20 @@ let composerPlusPopoverFixScript = #"""
       document.querySelectorAll('[popover]').forEach(el => pushMenu(el, 'popover'));
       radixWrappers().forEach(el => pushMenu(el, 'radix'));
       textAnchoredMenus().forEach(el => pushMenu(el, 'text'));
+      const composerButtons = [];
+      try {
+        const forms = Array.from(document.querySelectorAll('form'));
+        for (const form of forms) {
+          if (!form.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) continue;
+          for (const btn of Array.from(form.querySelectorAll('button')).slice(0, 10)) {
+            if (composerButtons.length >= 8) break;
+            composerButtons.push(describeTrigger(btn));
+          }
+        }
+      } catch (_) {}
       return {
         vw: window.innerWidth, vh: window.innerHeight,
-        triggers, menus,
+        triggers, menus, composerButtons,
         lastClickMsAgo: lastPlusClick ? Date.now() - lastPlusClick.time : -1
       };
     } catch (_) { return { error: 'diagnose-failed' }; }
