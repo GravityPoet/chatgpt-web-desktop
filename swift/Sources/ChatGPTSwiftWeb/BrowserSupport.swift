@@ -1870,15 +1870,14 @@ let composerPlusPopoverFixScript = #"""
     for (const pop of pops) {
       if (!(pop instanceof Element) || !pop.isConnected) continue;
       const content = pop.matches('[data-radix-popper-content-wrapper]') ? pop : null;
-      let trigger = content
+      const freshClick = lastPlusClick && Date.now() - lastPlusClick.time < 5000 && lastPlusClick.trigger.isConnected
+        ? lastPlusClick.trigger : null;
+      let trigger = freshClick || (content
         ? (Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).find(el => {
             const form = el.closest('form');
             return form && content.isConnected && Math.abs(el.getBoundingClientRect().left - content.getBoundingClientRect().left) < 400;
           }) || triggerFor(pop))
-        : triggerFor(pop);
-      if ((!trigger || !trigger.isConnected) && lastPlusClick && Date.now() - lastPlusClick.time < 5000) {
-        trigger = lastPlusClick.trigger;
-      }
+        : triggerFor(pop));
       if (!trigger || !trigger.isConnected) continue;
       const composer = trigger.closest('form') || trigger.parentElement;
       if (!composer || !composer.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) {
@@ -1892,7 +1891,12 @@ let composerPlusPopoverFixScript = #"""
       const popW = box.offsetWidth || popRect.width, popH = box.offsetHeight || popRect.height;
       if (popW <= 0 || popH <= 0) continue;
       const vw = window.innerWidth, vh = window.innerHeight;
-      const left = clamp(btnRect.left, PAD, Math.max(PAD, vw - popW - PAD));
+      let effW = popW;
+      if (effW > vw - PAD * 2) {
+        box.style.setProperty('max-width', (vw - PAD * 2) + 'px', 'important');
+        effW = vw - PAD * 2;
+      }
+      const left = clamp(btnRect.left, PAD, Math.max(PAD, vw - effW - PAD));
       const aboveTop = btnRect.top - popH - OFFSET;
       const belowTop = btnRect.bottom + OFFSET;
       let top, placement;
@@ -1939,7 +1943,40 @@ let composerPlusPopoverFixScript = #"""
     if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(run);
     else setTimeout(run, 0);
   };
-  window.__chatgptSwiftPlusPopoverFix = { reposition: pop => schedule(pop || null) };
+  const roundRect = rect => ({ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) });
+  const describeTrigger = el => {
+    try {
+      const label = el.getAttribute('aria-label') || el.getAttribute('data-testid') || el.getAttribute('popovertarget') || '?';
+      return { label: String(label).slice(0, 40), rect: roundRect(el.getBoundingClientRect()) };
+    } catch (_) { return { label: '?', rect: null }; }
+  };
+  const diagnose = () => {
+    try {
+      const triggers = Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).filter(el => el.isConnected).slice(0, 5).map(describeTrigger);
+      const seen = new Set(), menus = [];
+      const pushMenu = (box, kind) => {
+        if (!(box instanceof Element) || seen.has(box) || menus.length >= 5) return;
+        seen.add(box);
+        try {
+          menus.push({
+            kind, id: box.id || '', role: box.getAttribute('role') || '',
+            cls: String(box.className || '').slice(0, 60),
+            rect: roundRect(box.getBoundingClientRect()),
+            open: isOpenPopover(box), fixed: (box.dataset && box.dataset.chatgptSwiftPlusFixed) || ''
+          });
+        } catch (_) {}
+      };
+      document.querySelectorAll('[popover]').forEach(el => pushMenu(el, 'popover'));
+      radixWrappers().forEach(el => pushMenu(el, 'radix'));
+      textAnchoredMenus().forEach(el => pushMenu(el, 'text'));
+      return {
+        vw: window.innerWidth, vh: window.innerHeight,
+        triggers, menus,
+        lastClickMsAgo: lastPlusClick ? Date.now() - lastPlusClick.time : -1
+      };
+    } catch (_) { return { error: 'diagnose-failed' }; }
+  };
+  window.__chatgptSwiftPlusPopoverFix = { reposition: pop => schedule(pop || null), diagnose };
   document.addEventListener('click', event => {
     const trigger = event.target instanceof Element ? event.target.closest(TRIGGER_SELECTOR) : null;
     if (!trigger) return;
@@ -1948,6 +1985,7 @@ let composerPlusPopoverFixScript = #"""
     setTimeout(() => schedule(pop), 0);
     setTimeout(() => schedule(null), 120);
     setTimeout(() => schedule(null), 400);
+    setTimeout(() => schedule(null), 900);
   }, true);
   document.addEventListener('toggle', event => {
     const pop = event.target instanceof Element ? event.target : null;
@@ -1968,7 +2006,11 @@ let composerPlusPopoverFixScript = #"""
           schedule(null); return;
         }
       }
-    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-state', 'style', 'class'] });
+    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-state', 'style', 'class', 'hidden', 'aria-expanded', 'aria-hidden'] });
+  } catch (_) {}
+  try {
+    document.addEventListener('transitionend', () => schedule(null), true);
+    document.addEventListener('animationend', () => schedule(null), true);
   } catch (_) {}
   try {
     const resizes = new ResizeObserver(() => schedule(null));

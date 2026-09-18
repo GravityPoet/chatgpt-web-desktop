@@ -75,6 +75,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var lastNavigationFailureDescription = "无"
     private var lastRenderProbeSummary = "未运行"
     var draftCaptureDiagnostics = "未检查"
+    var plusMenuDiagnostics = "未检查"
     var draftNativeMessageCount = 0
     var draftNativeSaveCount = 0
     var draftNativeDropReason = "无"
@@ -329,8 +330,37 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         return "ChatGPT"
     }
 
+    func refreshPlusMenuDiagnostics() {
+        guard !isDisposing, Self.canInjectPromptContent(into: webView.url) else { return }
+        // Rects, selectors and open state only; never page text or chat content.
+        webView.evaluateJavaScript("window.__chatgptSwiftPlusPopoverFix?.diagnose?.() ?? null") { [weak self] result, error in
+            guard let self, !self.isDisposing else { return }
+            guard error == nil, let values = result as? [String: Any] else {
+                self.plusMenuDiagnostics = "页面加号菜单状态不可用"
+                return
+            }
+            var parts: [String] = []
+            if let vw = values["vw"], let vh = values["vh"] { parts.append("viewport=\(vw)x\(vh)") }
+            if let age = values["lastClickMsAgo"] { parts.append("lastClickMsAgo=\(age)") }
+            if let triggers = values["triggers"] as? [[String: Any]] {
+                parts.append("triggers=\(triggers.count)")
+                for trigger in triggers.prefix(3) {
+                    parts.append("trigger[\(trigger["label"] ?? "?")]=\(trigger["rect"] ?? [:])")
+                }
+            }
+            if let menus = values["menus"] as? [[String: Any]] {
+                parts.append("menus=\(menus.count)")
+                for menu in menus.prefix(3) {
+                    parts.append("menu[\(menu["kind"] ?? "?")]=\(menu["rect"] ?? [:]) open=\(menu["open"] ?? "?") fixed=\(menu["fixed"] ?? "")")
+                }
+            }
+            self.plusMenuDiagnostics = parts.joined(separator: ", ")
+        }
+    }
+
     func diagnosticsReport() -> String {
         refreshDraftDiagnostics()
+        refreshPlusMenuDiagnostics()
         let frame = window.frame
         let currentItemURL = webView.backForwardList.currentItem?.url
         let profileLabel = DiagnosticRedactor.profileLabel(
@@ -354,6 +384,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("lastRenderProbeWasBlank", lastRenderProbeWasBlank ? "true" : "false"),
             ("lastRenderProbe", DiagnosticRedactor.text(lastRenderProbeSummary)),
             ("draftCapture", draftCaptureDiagnostics),
+            ("plusMenu", plusMenuDiagnostics),
             ("draftNativeMessages", "\(draftNativeMessageCount)（已保存 \(draftNativeSaveCount)，最近 \(draftNativeDropReason)）"),
             ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
             ("lastBlankRecovery", DiagnosticRedactor.text(lastBlankRecoverySummary)),

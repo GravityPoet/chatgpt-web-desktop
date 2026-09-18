@@ -342,6 +342,11 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(report["fixed"] as? String, "top")
         XCTAssertEqual(Int((report["btnLeft"] as? Double ?? -1)), Int(btnLeft))
         XCTAssertGreaterThan(top, 0)
+        let diag = try dictionaryResult("window.__chatgptSwiftPlusPopoverFix.diagnose()", in: harness.webView)
+        XCTAssertNotNil(diag["vw"])
+        XCTAssertNotNil(diag["vh"])
+        XCTAssertNotNil(diag["triggers"])
+        XCTAssertNotNil(diag["menus"])
     }
 
     func testPlusPopoverLeavesUnrelatedAndHiddenMenusAlone() throws {
