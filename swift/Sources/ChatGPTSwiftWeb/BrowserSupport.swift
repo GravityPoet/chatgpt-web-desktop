@@ -1788,7 +1788,7 @@ let composerPlusPopoverFixScript = #"""
   const TRIGGER_SELECTOR = 'button[popovertarget],button[data-testid*="composer-plus"],button[data-testid*="plus"],button[data-testid*="attach"],button[data-testid*="upload"],button[aria-label*="添加"],button[aria-label*="附加"],button[aria-label*="上传"],button[aria-label*="Attach"],button[aria-label*="Add"],[data-octane-native-image-menu-trigger]';
   const MENU_TEXTS = ['添加照片和文件', '从电脑上传', 'Add photos'];
   const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
-  let lastPlusClick = null;
+  let lastPlusClick = null, lastFix = null;
   const isOpenPopover = pop => {
     try {
       if (typeof pop.matches === 'function' && pop.matches(':popover-open')) return true;
@@ -1885,8 +1885,22 @@ let composerPlusPopoverFixScript = #"""
       if (!composer || !composer.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) {
         if (!trigger.matches(TRIGGER_SELECTOR)) continue;
       }
-      if (!isOpenPopover(content || pop)) continue;
       const box = content || pop;
+      if (!isOpenPopover(box)) {
+        if (box.dataset && box.dataset.chatgptSwiftPlusFixed) {
+          try {
+            delete box.dataset.chatgptSwiftPlusFixed;
+            ['position', 'left', 'top', 'bottom', 'right', 'margin', 'translate', 'position-anchor', 'inset-area', 'transform', 'max-height', 'max-width', 'overflow-y'].forEach(prop => {
+              try { box.style.removeProperty(prop); } catch (_) {}
+            });
+            const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]');
+            if (inner && inner !== box) {
+              try { inner.style.removeProperty('transform'); inner.style.removeProperty('position-anchor'); } catch (_) {}
+            }
+          } catch (_) {}
+        }
+        continue;
+      }
       const btnRect = trigger.getBoundingClientRect();
       if (btnRect.width <= 0 || btnRect.height <= 0) continue;
       const popRect = box.getBoundingClientRect();
@@ -1936,6 +1950,15 @@ let composerPlusPopoverFixScript = #"""
       }
       box.style.setProperty('transform', 'none', 'important');
       try { box.dataset.chatgptSwiftPlusFixed = placement; } catch (_) {}
+      try {
+        lastFix = {
+          at: Date.now(),
+          kind: content ? 'radix' : (pop.hasAttribute('popover') ? 'popover' : 'text'),
+          id: box.id || '', role: box.getAttribute('role') || '',
+          triggerRect: roundRect(btnRect), menuRectBefore: roundRect(popRect),
+          left: Math.round(left), top: Math.round(top), placement
+        };
+      } catch (_) {}
       } catch (_) {}
     }
   };
@@ -1986,7 +2009,8 @@ let composerPlusPopoverFixScript = #"""
       return {
         vw: window.innerWidth, vh: window.innerHeight,
         triggers, menus, composerButtons,
-        lastClickMsAgo: lastPlusClick ? Date.now() - lastPlusClick.time : -1
+        lastClickMsAgo: lastPlusClick ? Date.now() - lastPlusClick.time : -1,
+        lastFix: lastFix ? Object.assign({ ageMs: Date.now() - lastFix.at }, lastFix) : null
       };
     } catch (_) { return { error: 'diagnose-failed' }; }
   };

@@ -360,6 +360,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                     parts.append("btn[\(button["label"] ?? "?")]=\(button["rect"] ?? [:])")
                 }
             }
+            if let fix = values["lastFix"] as? [String: Any] {
+                parts.append("lastFix=\(fix)")
+            }
             self.plusMenuDiagnostics = parts.joined(separator: ", ")
         }
     }
