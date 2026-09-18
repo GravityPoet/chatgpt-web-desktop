@@ -1785,8 +1785,10 @@ let composerPlusPopoverFixScript = #"""
     !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
   if (challenge()) return;
   const OFFSET = 8, PAD = 12;
-  const TRIGGER_SELECTOR = 'button[popovertarget*="composer-actions"],button[data-testid*="composer-plus"],button[data-testid*="plus"],button[aria-label*="添加文件"],button[aria-label*="Attach"],[data-octane-native-image-menu-trigger]';
+  const TRIGGER_SELECTOR = 'button[popovertarget],button[data-testid*="composer-plus"],button[data-testid*="plus"],button[data-testid*="attach"],button[data-testid*="upload"],button[aria-label*="添加"],button[aria-label*="附加"],button[aria-label*="上传"],button[aria-label*="Attach"],button[aria-label*="Add"],[data-octane-native-image-menu-trigger]';
+  const MENU_TEXTS = ['添加照片和文件', '从电脑上传', 'Add photos'];
   const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+  let lastPlusClick = null;
   const isOpenPopover = pop => {
     try {
       if (typeof pop.matches === 'function' && pop.matches(':popover-open')) return true;
@@ -1826,23 +1828,57 @@ let composerPlusPopoverFixScript = #"""
     }
     return null;
   };
-  const radixWrappers = () => Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper]'));
+  const radixWrappers = () => Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper],[data-base-ui-popper],[data-floating-ui-portal] [role="menu"],[data-positioner]'));
+  const textAnchoredMenus = () => {
+    const out = [];
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    const hits = [];
+    while (walker.nextNode()) {
+      const text = walker.currentNode.nodeValue || '';
+      if (MENU_TEXTS.some(t => text.includes(t))) hits.push(walker.currentNode.parentElement);
+    }
+    for (const el of hits) {
+      if (!(el instanceof Element)) continue;
+      let box = el;
+      while (box && box !== document.body) {
+        const style = getComputedStyle(box);
+        const rect = box.getBoundingClientRect();
+        const floating = style.position === 'fixed' || style.position === 'absolute' || box.hasAttribute('popover');
+        if (floating && rect.width > 120 && rect.height > 40) break;
+        box = box.parentElement;
+      }
+      if (box && box !== document.body && !out.includes(box)) out.push(box);
+    }
+    return out;
+  };
   let scheduled = false;
   const reposition = targetPop => {
     const pops = targetPop ? [targetPop] : Array.from(document.querySelectorAll('[popover]'));
     for (const wrap of radixWrappers()) {
       if (!pops.includes(wrap)) pops.push(wrap);
     }
+    for (const box of textAnchoredMenus()) {
+      if (!pops.includes(box)) pops.push(box);
+    }
+    if (lastPlusClick && Date.now() - lastPlusClick.time < 5000) {
+      const ctl = lastPlusClick.trigger.getAttribute && (lastPlusClick.trigger.getAttribute('aria-controls') || lastPlusClick.trigger.getAttribute('popovertarget'));
+      if (ctl) {
+        const byId = document.getElementById(ctl);
+        if (byId && !pops.includes(byId)) pops.push(byId);
+      }
+    }
     for (const pop of pops) {
       if (!(pop instanceof Element) || !pop.isConnected) continue;
       const content = pop.matches('[data-radix-popper-content-wrapper]') ? pop : null;
-      const menu = content ? (content.querySelector('[role="menu"],[role="dialog"],[role="listbox"],[data-radix-menu-content]') || content.firstElementChild) : pop;
-      const trigger = content
+      let trigger = content
         ? (Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).find(el => {
             const form = el.closest('form');
             return form && content.isConnected && Math.abs(el.getBoundingClientRect().left - content.getBoundingClientRect().left) < 400;
           }) || triggerFor(pop))
         : triggerFor(pop);
+      if ((!trigger || !trigger.isConnected) && lastPlusClick && Date.now() - lastPlusClick.time < 5000) {
+        trigger = lastPlusClick.trigger;
+      }
       if (!trigger || !trigger.isConnected) continue;
       const composer = trigger.closest('form') || trigger.parentElement;
       if (!composer || !composer.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) {
@@ -1868,6 +1904,13 @@ let composerPlusPopoverFixScript = #"""
         box.style.setProperty('max-height', Math.max(80, vh - PAD * 2) + 'px', 'important');
         box.style.setProperty('overflow-y', 'auto', 'important');
       }
+      try {
+        if (box.scrollHeight > box.clientHeight + 8) {
+          const roomAbove = Math.max(120, btnRect.top - PAD - OFFSET);
+          box.style.setProperty('max-height', Math.min(roomAbove, vh - PAD * 2) + 'px', 'important');
+          box.style.setProperty('overflow-y', 'auto', 'important');
+        }
+      } catch (_) {}
       const alreadyAbove = popRect.bottom <= btnRect.top - 4 && Math.abs(popRect.left - left) <= 1 && Math.abs(popRect.top - top) <= 1;
       const alreadyBelow = placement === 'bottom' && Math.abs(popRect.top - top) <= 1 && Math.abs(popRect.left - left) <= 1;
       if (alreadyAbove || alreadyBelow) continue;
@@ -1900,9 +1943,11 @@ let composerPlusPopoverFixScript = #"""
   document.addEventListener('click', event => {
     const trigger = event.target instanceof Element ? event.target.closest(TRIGGER_SELECTOR) : null;
     if (!trigger) return;
+    lastPlusClick = { trigger, time: Date.now() };
     const pop = popoverFor(trigger);
     setTimeout(() => schedule(pop), 0);
-    setTimeout(() => schedule(pop), 120);
+    setTimeout(() => schedule(null), 120);
+    setTimeout(() => schedule(null), 400);
   }, true);
   document.addEventListener('toggle', event => {
     const pop = event.target instanceof Element ? event.target : null;

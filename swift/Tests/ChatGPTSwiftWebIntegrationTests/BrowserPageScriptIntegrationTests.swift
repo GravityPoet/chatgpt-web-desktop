@@ -554,6 +554,52 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     </body></html>
     """
 
+    func testPlusTextMenuMovesAboveAndUnclipsHiddenRows() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeHarness(sink: sink, html: Self.plusTextMenuHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("document.querySelector('#plus2').click(); 'clicked'", in: harness.webView)
+        settle(0.6)
+        let report = try dictionaryResult("""
+        (() => {
+          const pop = document.getElementById('clip-menu');
+          const btn = document.getElementById('plus2');
+          const pr = pop.getBoundingClientRect(), br = btn.getBoundingClientRect();
+          const cs = getComputedStyle(pop);
+          return {top: pr.top, bottom: pr.bottom, left: pr.left, width: pr.width,
+            btnTop: br.top, fixed: pop.dataset.chatgptSwiftPlusFixed || '',
+            overflowY: cs.overflowY, maxHeight: cs.maxHeight, winW: window.innerWidth};
+        })()
+        """, in: harness.webView)
+        let bottom = report["bottom"] as? Double ?? 0
+        let btnTop = report["btnTop"] as? Double ?? 0
+        XCTAssertLessThanOrEqual(bottom, btnTop - 4, "加号菜单应对齐官方弹到按钮上方")
+        XCTAssertEqual(report["fixed"] as? String, "top")
+        XCTAssertEqual(report["overflowY"] as? String, "auto")
+        let left = report["left"] as? Double ?? 0
+        let width = report["width"] as? Double ?? 0
+        let winW = report["winW"] as? Double ?? 0
+        XCTAssertGreaterThanOrEqual(left, 12)
+        XCTAssertLessThanOrEqual(left + width, winW - 12)
+    }
+
+    private static let plusTextMenuHTML = """
+    <!doctype html><html><body>
+      <form id="composer2" style="position:relative;width:600px">
+        <div id="editor" contenteditable="true">PLACEHOLDER_LONG_TEXT</div>
+        <button id="plus2" type="button" aria-label="添加附件" style="position:fixed;top:300px;left:100px;width:40px;height:40px">+</button>
+      </form>
+      <div id="clip-menu" style="position:fixed;top:350px;left:100px;width:300px;max-height:60px;overflow:hidden;background:#fff">
+        <div style="height:30px">添加照片和文件</div>
+        <div style="height:30px">从电脑上传</div>
+        <div style="height:30px">网页搜索</div>
+        <div style="height:30px">更多操作</div>
+      </div>
+      <script>document.getElementById('editor').textContent = '长文本 '.repeat(600);</script>
+    </body></html>
+    """
+
     private static let plusPopoverHTML = """
     <!doctype html><html><body>
       <form id="composer" style="position:relative;width:600px">
