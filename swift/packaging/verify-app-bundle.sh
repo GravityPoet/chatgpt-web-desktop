@@ -33,10 +33,14 @@ fi
 
 verify_universal_binary() {
   local binary="$1"
-  if ! /usr/bin/lipo "$binary" -verify_arch "${REQUIRED_ARCHITECTURES[@]}" >/dev/null; then
-    echo "error: binary is not arm64+x86_64 universal: $binary" >&2
-    return 1
-  fi
+  local architecture
+  # Current lipo accepts a single architecture per -verify_arch invocation.
+  for architecture in "${REQUIRED_ARCHITECTURES[@]}"; do
+    if ! /usr/bin/lipo "$binary" -verify_arch "$architecture" >/dev/null; then
+      echo "error: binary is not arm64+x86_64 universal: $binary" >&2
+      return 1
+    fi
+  done
 }
 
 minimum_version_for_architecture() {
