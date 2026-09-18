@@ -349,6 +349,31 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertNotNil(diag["menus"])
     }
 
+    func testPlusPopoverFixClearsOverridesWhenMenuCloses() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
+        settle(0.5)
+        XCTAssertEqual(try stringResult("document.getElementById('composer-actions-popover').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "top")
+        _ = try stringResult("""
+        document.getElementById('composer-actions-popover').style.display = 'none';
+        window.__chatgptSwiftPlusPopoverFix.reposition(); 'hidden'
+        """, in: harness.webView)
+        settle(0.5)
+        let report = try dictionaryResult("""
+        (() => {
+          const pop = document.getElementById('composer-actions-popover');
+          return {left: pop.style.left, marker: pop.dataset.chatgptSwiftPlusFixed || ''};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["left"] as? String, "")
+        XCTAssertEqual(report["marker"] as? String, "")
+        let diag = try dictionaryResult("window.__chatgptSwiftPlusPopoverFix.diagnose()", in: harness.webView)
+        XCTAssertNotNil(diag["lastFix"])
+    }
+
     func testPlusPopoverLeavesUnrelatedAndHiddenMenusAlone() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
