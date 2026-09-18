@@ -1768,6 +1768,182 @@ let chatDialogDismissalRecoveryScript = #"""
 })();
 """#
 
+// Keep the composer "+" menu anchored above its trigger, matching the official
+// top-start floating layer (offset 8, collision padding 12). Long drafts and
+// attachment previews resize the composer asynchronously after the menu opens,
+// which can leave a stale anchor position in WKWebView; re-clamp on trigger and
+// menu resize instead of touching site DOM structure or focus.
+let composerPlusPopoverFixScript = #"""
+(() => {
+  const host = location.hostname.toLowerCase();
+  if (window !== window.top || location.protocol !== 'https:' ||
+      (location.port && location.port !== '443') ||
+      !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
+  if (window.__chatgptSwiftPlusPopoverFix) return;
+  const challenge = () => location.pathname.startsWith('/cdn-cgi/') ||
+    !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
+  if (challenge()) return;
+  const OFFSET = 8, PAD = 12;
+  const TRIGGER_SELECTOR = 'button[popovertarget*="composer-actions"],button[data-testid*="composer-plus"],button[data-testid*="plus"],button[aria-label*="添加文件"],button[aria-label*="Attach"],[data-octane-native-image-menu-trigger]';
+  const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
+  const isOpenPopover = pop => {
+    try {
+      if (typeof pop.matches === 'function' && pop.matches(':popover-open')) return true;
+    } catch (_) {}
+    if (pop.hasAttribute('data-state') && pop.getAttribute('data-state') === 'closed') return false;
+    if (pop.closest('[data-radix-popper-content-wrapper]')) {
+      const wrap = pop.closest('[data-radix-popper-content-wrapper]');
+      const style = getComputedStyle(wrap);
+      if (style.display === 'none' || style.visibility === 'hidden') return false;
+      return true;
+    }
+    const rect = pop.getBoundingClientRect(), style = getComputedStyle(pop);
+    return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const triggerFor = pop => {
+    if (pop.id) {
+      const direct = document.querySelector('button[popovertarget="' + CSS.escape(pop.id) + '"]');
+      if (direct) return direct;
+    }
+    const labelled = Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).filter(el => el.isConnected);
+    if (labelled.length === 1) return labelled[0];
+    const popRect = pop.getBoundingClientRect();
+    let best = null, bestGap = Infinity;
+    for (const el of labelled) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) continue;
+      const gap = Math.abs((rect.top - popRect.bottom)) + Math.abs(rect.left - popRect.left);
+      if (gap < bestGap) { bestGap = gap; best = el; }
+    }
+    return best;
+  };
+  const popoverFor = trigger => {
+    const target = trigger.getAttribute && trigger.getAttribute('popovertarget');
+    if (target) {
+      const byId = document.getElementById(target);
+      if (byId) return byId;
+    }
+    return null;
+  };
+  const radixWrappers = () => Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper]'));
+  let scheduled = false;
+  const reposition = targetPop => {
+    const pops = targetPop ? [targetPop] : Array.from(document.querySelectorAll('[popover]'));
+    for (const wrap of radixWrappers()) {
+      if (!pops.includes(wrap)) pops.push(wrap);
+    }
+    for (const pop of pops) {
+      if (!(pop instanceof Element) || !pop.isConnected) continue;
+      const content = pop.matches('[data-radix-popper-content-wrapper]') ? pop : null;
+      const menu = content ? (content.querySelector('[role="menu"],[role="dialog"],[role="listbox"],[data-radix-menu-content]') || content.firstElementChild) : pop;
+      const trigger = content
+        ? (Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).find(el => {
+            const form = el.closest('form');
+            return form && content.isConnected && Math.abs(el.getBoundingClientRect().left - content.getBoundingClientRect().left) < 400;
+          }) || triggerFor(pop))
+        : triggerFor(pop);
+      if (!trigger || !trigger.isConnected) continue;
+      const composer = trigger.closest('form') || trigger.parentElement;
+      if (!composer || !composer.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) {
+        if (!trigger.matches(TRIGGER_SELECTOR)) continue;
+      }
+      if (!isOpenPopover(content || pop)) continue;
+      const box = content || pop;
+      const btnRect = trigger.getBoundingClientRect();
+      if (btnRect.width <= 0 || btnRect.height <= 0) continue;
+      const popRect = box.getBoundingClientRect();
+      const popW = box.offsetWidth || popRect.width, popH = box.offsetHeight || popRect.height;
+      if (popW <= 0 || popH <= 0) continue;
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const left = clamp(btnRect.left, PAD, Math.max(PAD, vw - popW - PAD));
+      const aboveTop = btnRect.top - popH - OFFSET;
+      const belowTop = btnRect.bottom + OFFSET;
+      let top, placement;
+      if (aboveTop >= PAD) { top = aboveTop; placement = 'top'; }
+      else if (vh - btnRect.bottom - OFFSET - popH >= PAD) { top = belowTop; placement = 'bottom'; }
+      else {
+        top = clamp(aboveTop, PAD, Math.max(PAD, vh - popH - PAD));
+        placement = 'clamped';
+        box.style.setProperty('max-height', Math.max(80, vh - PAD * 2) + 'px', 'important');
+        box.style.setProperty('overflow-y', 'auto', 'important');
+      }
+      const alreadyAbove = popRect.bottom <= btnRect.top - 4 && Math.abs(popRect.left - left) <= 1 && Math.abs(popRect.top - top) <= 1;
+      const alreadyBelow = placement === 'bottom' && Math.abs(popRect.top - top) <= 1 && Math.abs(popRect.left - left) <= 1;
+      if (alreadyAbove || alreadyBelow) continue;
+      box.style.setProperty('position', 'fixed', 'important');
+      box.style.setProperty('left', left + 'px', 'important');
+      box.style.setProperty('top', top + 'px', 'important');
+      box.style.setProperty('bottom', 'auto', 'important');
+      box.style.setProperty('right', 'auto', 'important');
+      box.style.setProperty('margin', '0', 'important');
+      box.style.setProperty('translate', 'none', 'important');
+      box.style.setProperty('position-anchor', 'none', 'important');
+      box.style.setProperty('inset-area', 'none', 'important');
+      const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]');
+      if (inner && inner !== box) {
+        inner.style.setProperty('transform', 'none', 'important');
+        inner.style.setProperty('position-anchor', 'none', 'important');
+      }
+      box.style.setProperty('transform', 'none', 'important');
+      try { box.dataset.chatgptSwiftPlusFixed = placement; } catch (_) {}
+    }
+  };
+  const schedule = targetPop => {
+    if (scheduled && !targetPop) return;
+    scheduled = true;
+    const run = () => { scheduled = false; if (!challenge()) reposition(targetPop || null); };
+    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(run);
+    else setTimeout(run, 0);
+  };
+  window.__chatgptSwiftPlusPopoverFix = { reposition: pop => schedule(pop || null) };
+  document.addEventListener('click', event => {
+    const trigger = event.target instanceof Element ? event.target.closest(TRIGGER_SELECTOR) : null;
+    if (!trigger) return;
+    const pop = popoverFor(trigger);
+    setTimeout(() => schedule(pop), 0);
+    setTimeout(() => schedule(pop), 120);
+  }, true);
+  document.addEventListener('toggle', event => {
+    const pop = event.target instanceof Element ? event.target : null;
+    if (!pop || !pop.hasAttribute('popover')) return;
+    if (triggerFor(pop)) schedule(pop);
+  }, true);
+  try {
+    new MutationObserver(mutations => {
+      for (const mutation of mutations) {
+        for (const node of mutation.addedNodes) {
+          if (!(node instanceof Element)) continue;
+          if (node.hasAttribute && node.hasAttribute('popover') && triggerFor(node)) { schedule(node); return; }
+          const nested = node.querySelector && (node.querySelector('[popover],[data-radix-popper-content-wrapper]'));
+          if (nested) { schedule(null); return; }
+        }
+        if (mutation.type === 'attributes' && mutation.target instanceof Element &&
+            (mutation.target.hasAttribute('popover') || mutation.target.hasAttribute('data-state'))) {
+          schedule(null); return;
+        }
+      }
+    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-state', 'style', 'class'] });
+  } catch (_) {}
+  try {
+    const resizes = new ResizeObserver(() => schedule(null));
+    const observeTrigger = () => {
+      document.querySelectorAll(TRIGGER_SELECTOR).forEach(el => { try { resizes.observe(el); } catch (_) {} });
+      const pop = document.querySelector('[popover]');
+      if (pop) { try { resizes.observe(pop); } catch (_) {} }
+    };
+    observeTrigger();
+    new MutationObserver(observeTrigger).observe(document.documentElement, { childList: true, subtree: true });
+  } catch (_) {}
+  window.addEventListener('resize', () => schedule(null), { passive: true });
+  document.addEventListener('scroll', () => schedule(null), { capture: true, passive: true });
+  try { window.visualViewport?.addEventListener('resize', () => schedule(null)); } catch (_) {}
+  document.addEventListener('input', event => {
+    if (event.target instanceof Element && event.target.closest('form')) schedule(null);
+  }, true);
+})();
+"""#
+
 let nativeShimScript = """
 (() => {
   if (window.__wkNativeShim) return;

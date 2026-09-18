@@ -308,6 +308,71 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertNil(sink.payload(named: "dialogDismissal"))
     }
 
+    func testPlusPopoverMovesStaleMenuAboveTriggerWithLongTextAndImage() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        XCTAssertEqual(try stringResult("String(!!window.__chatgptSwiftPlusPopoverFix)", in: harness.webView), "true")
+        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
+        settle(0.5)
+        let report = try dictionaryResult("""
+        (() => {
+          const pop = document.getElementById('composer-actions-popover');
+          const btn = document.getElementById('plus');
+          const pr = pop.getBoundingClientRect(), br = btn.getBoundingClientRect();
+          return {top: pr.top, bottom: pr.bottom, left: pr.left, width: pr.width, height: pr.height,
+            btnTop: br.top, btnBottom: br.bottom, btnLeft: br.left,
+            fixed: pop.dataset.chatgptSwiftPlusFixed || '', composerLen: document.getElementById('prompt-textarea').value.length,
+            images: document.querySelectorAll('#composer img').length, winW: window.innerWidth, winH: window.innerHeight};
+        })()
+        """, in: harness.webView)
+        XCTAssertGreaterThan(report["composerLen"] as? Int ?? 0, 1000)
+        XCTAssertEqual(report["images"] as? Int, 1)
+        let top = report["top"] as? Double ?? 0
+        let bottom = report["bottom"] as? Double ?? 0
+        let left = report["left"] as? Double ?? 0
+        let width = report["width"] as? Double ?? 0
+        let btnTop = report["btnTop"] as? Double ?? 0
+        let btnLeft = report["btnLeft"] as? Double ?? 0
+        let winW = report["winW"] as? Double ?? 0
+        XCTAssertLessThanOrEqual(bottom, btnTop - 4, "加号菜单应对齐官方弹到按钮上方")
+        XCTAssertGreaterThanOrEqual(left, 12)
+        XCTAssertLessThanOrEqual(left + width, winW - 12)
+        XCTAssertEqual(report["fixed"] as? String, "top")
+        XCTAssertEqual(Int((report["btnLeft"] as? Double ?? -1)), Int(btnLeft))
+        XCTAssertGreaterThan(top, 0)
+    }
+
+    func testPlusPopoverLeavesUnrelatedAndHiddenMenusAlone() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
+        settle(0.5)
+        let report = try dictionaryResult("""
+        (() => {
+          const other = document.getElementById('other-popover');
+          const hidden = document.getElementById('hidden-popover');
+          const orect = other.getBoundingClientRect();
+          return {otherTop: orect.top, otherFixed: other.dataset.chatgptSwiftPlusFixed || '',
+            hiddenFixed: hidden.dataset.chatgptSwiftPlusFixed || ''};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["otherTop"] as? Double, 350)
+        XCTAssertEqual(report["otherFixed"] as? String, "")
+        XCTAssertEqual(report["hiddenFixed"] as? String, "")
+    }
+
+    func testPlusPopoverFixDoesNotRunOnUntrustedOrigin() throws {
+        let sink = ScriptMessageSink(expectations: [:])
+        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML, baseURL: URL(string: "https://example.com/")!)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        XCTAssertEqual(try stringResult("String(!!window.__chatgptSwiftPlusPopoverFix)", in: harness.webView), "false")
+    }
+
     private func makeArchiveHarness(sink: ScriptMessageSink, baseURL: URL = URL(string: "https://chatgpt.com/c/archive-fixture?mode=fixture")!) throws -> WebViewHarness {
         let harness = try makeHarness(sink: sink, html: """
         <!doctype html><html><body>
@@ -414,6 +479,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         controller.add(sink, name: "completionState")
         controller.add(sink, name: "dialogDismissal")
         controller.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        controller.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
             source: BrowserWindowController.promptDraftCaptureScript,
             injectionTime: .atDocumentEnd,
@@ -485,6 +551,21 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     private static let genericTextAreaHTML = """
     <!doctype html><html><body>
       <main style="width:600px;height:400px"><textarea></textarea></main>
+    </body></html>
+    """
+
+    private static let plusPopoverHTML = """
+    <!doctype html><html><body>
+      <form id="composer" style="position:relative;width:600px">
+        <textarea id="prompt-textarea" style="width:560px;height:220px">PLACEHOLDER_LONG_TEXT</textarea>
+        <div class="attachments"><img src="data:image/png;base64,iVBORw0KGgo=" width="64" height="64" alt="fixture"></div>
+        <button id="plus" type="button" aria-label="添加文件" popovertarget="composer-actions-popover" style="position:fixed;top:300px;left:100px;width:40px;height:40px">+</button>
+        <button id="other-btn" type="button" aria-label="其他" popovertarget="other-popover" style="position:fixed;top:300px;left:400px;width:40px;height:40px">?</button>
+      </form>
+      <div id="composer-actions-popover" popover="auto" style="position:fixed;top:350px;left:100px;width:220px;height:200px;background:#fff">menu</div>
+      <div id="other-popover" popover="auto" style="position:fixed;top:350px;left:400px;width:180px;height:120px;background:#eee">other</div>
+      <div id="hidden-popover" popover="auto" style="display:none;position:fixed;top:350px;left:100px;width:220px;height:200px">hidden</div>
+      <script>document.getElementById('prompt-textarea').value = '长文本 '.repeat(600);</script>
     </body></html>
     """
 }
