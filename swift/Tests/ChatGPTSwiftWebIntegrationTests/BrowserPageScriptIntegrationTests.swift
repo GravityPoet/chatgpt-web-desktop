@@ -308,7 +308,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertNil(sink.payload(named: "dialogDismissal"))
     }
 
-    func testPlusPopoverMovesStaleMenuAboveTriggerWithLongTextAndImage() throws {
+    func testPlusPopoverFlipsAboveTriggerWhenNoRoomBelow() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
         defer { harness.close() }
@@ -584,7 +584,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     </body></html>
     """
 
-    func testPlusTextMenuMovesAboveAndUnclipsHiddenRows() throws {
+    func testPlusTextMenuOpensBelowAndUnclipsHiddenRows() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let harness = try makeHarness(sink: sink, html: Self.plusTextMenuHTML)
         defer { harness.close() }
@@ -598,14 +598,14 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
           const pr = pop.getBoundingClientRect(), br = btn.getBoundingClientRect();
           const cs = getComputedStyle(pop);
           return {top: pr.top, bottom: pr.bottom, left: pr.left, width: pr.width,
-            btnTop: br.top, fixed: pop.dataset.chatgptSwiftPlusFixed || '',
+            btnBottom: br.bottom, fixed: pop.dataset.chatgptSwiftPlusFixed || '',
             overflowY: cs.overflowY, maxHeight: cs.maxHeight, winW: window.innerWidth};
         })()
         """, in: harness.webView)
-        let bottom = report["bottom"] as? Double ?? 0
-        let btnTop = report["btnTop"] as? Double ?? 0
-        XCTAssertLessThanOrEqual(bottom, btnTop - 4, "加号菜单应对齐官方弹到按钮上方")
-        XCTAssertEqual(report["fixed"] as? String, "top")
+        let top = report["top"] as? Double ?? 0
+        let btnBottom = report["btnBottom"] as? Double ?? 0
+        XCTAssertGreaterThanOrEqual(top, btnBottom + 4, "加号菜单应对齐官方弹到按钮下方")
+        XCTAssertEqual(report["fixed"] as? String, "bottom")
         XCTAssertEqual(report["overflowY"] as? String, "auto")
         let left = report["left"] as? Double ?? 0
         let width = report["width"] as? Double ?? 0

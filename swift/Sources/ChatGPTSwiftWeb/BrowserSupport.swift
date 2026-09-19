@@ -1768,11 +1768,12 @@ let chatDialogDismissalRecoveryScript = #"""
 })();
 """#
 
-// Keep the composer "+" menu anchored above its trigger, matching the official
-// top-start floating layer (offset 8, collision padding 12). Long drafts and
-// attachment previews resize the composer asynchronously after the menu opens,
-// which can leave a stale anchor position in WKWebView; re-clamp on trigger and
-// menu resize instead of touching site DOM structure or focus.
+// Keep the composer "+" menu anchored below its trigger, matching the official
+// bottom-start floating layer (offset 8, collision padding 12); it flips above
+// only when there is no room below. Long drafts and attachment previews resize
+// the composer asynchronously after the menu opens, which can leave a stale
+// anchor position in WKWebView; re-clamp on trigger and menu resize instead of
+// touching site DOM structure or focus.
 let composerPlusPopoverFixScript = #"""
 (() => {
   const host = location.hostname.toLowerCase();
@@ -1931,8 +1932,8 @@ let composerPlusPopoverFixScript = #"""
       const aboveTop = btnRect.top - popH - OFFSET;
       const belowTop = btnRect.bottom + OFFSET;
       let top, placement;
-      if (aboveTop >= PAD) { top = aboveTop; placement = 'top'; }
-      else if (vh - btnRect.bottom - OFFSET - popH >= PAD) { top = belowTop; placement = 'bottom'; }
+      if (vh - btnRect.bottom - OFFSET - popH >= PAD) { top = belowTop; placement = 'bottom'; }
+      else if (aboveTop >= PAD) { top = aboveTop; placement = 'top'; }
       else {
         top = clamp(aboveTop, PAD, Math.max(PAD, vh - popH - PAD));
         placement = 'clamped';
@@ -1941,8 +1942,10 @@ let composerPlusPopoverFixScript = #"""
       }
       try {
         if (box.scrollHeight > box.clientHeight + 8) {
-          const roomAbove = Math.max(120, btnRect.top - PAD - OFFSET);
-          box.style.setProperty('max-height', Math.min(roomAbove, vh - PAD * 2) + 'px', 'important');
+          const room = placement === 'bottom'
+            ? Math.max(120, vh - btnRect.bottom - PAD - OFFSET)
+            : Math.max(120, btnRect.top - PAD - OFFSET);
+          box.style.setProperty('max-height', Math.min(room, vh - PAD * 2) + 'px', 'important');
           box.style.setProperty('overflow-y', 'auto', 'important');
         }
       } catch (_) {}
