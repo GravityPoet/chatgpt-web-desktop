@@ -1852,7 +1852,20 @@ let composerPlusPopoverFixScript = #"""
     }
     return out;
   };
-  let scheduled = false;
+  let scheduled = false, enforceTimer = 0, enforceUntil = 0;
+  const ensureEnforce = () => {
+    if (enforceTimer || Date.now() > enforceUntil) return;
+    try {
+      enforceTimer = setInterval(() => {
+        if (Date.now() > enforceUntil) {
+          try { clearInterval(enforceTimer); } catch (_) {}
+          enforceTimer = 0;
+          return;
+        }
+        schedule(null);
+      }, 250);
+    } catch (_) {}
+  };
   const reposition = targetPop => {
     const pops = targetPop ? [targetPop] : Array.from(document.querySelectorAll('[popover]'));
     for (const wrap of radixWrappers()) {
@@ -1893,12 +1906,14 @@ let composerPlusPopoverFixScript = #"""
             ['position', 'left', 'top', 'bottom', 'right', 'margin', 'translate', 'position-anchor', 'inset-area', 'transform', 'max-height', 'max-width', 'overflow-y'].forEach(prop => {
               try { box.style.removeProperty(prop); } catch (_) {}
             });
-            const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]');
+            const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]') ||
+              (box.firstElementChild instanceof Element ? box.firstElementChild : null);
             if (inner && inner !== box) {
               try { inner.style.removeProperty('transform'); inner.style.removeProperty('position-anchor'); } catch (_) {}
             }
           } catch (_) {}
         }
+        enforceUntil = 0;
         continue;
       }
       const btnRect = trigger.getBoundingClientRect();
@@ -1943,13 +1958,16 @@ let composerPlusPopoverFixScript = #"""
       box.style.setProperty('translate', 'none', 'important');
       box.style.setProperty('position-anchor', 'none', 'important');
       box.style.setProperty('inset-area', 'none', 'important');
-      const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]');
+      const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]') ||
+        (box.firstElementChild instanceof Element ? box.firstElementChild : null);
       if (inner && inner !== box) {
         inner.style.setProperty('transform', 'none', 'important');
         inner.style.setProperty('position-anchor', 'none', 'important');
       }
       box.style.setProperty('transform', 'none', 'important');
       try { box.dataset.chatgptSwiftPlusFixed = placement; } catch (_) {}
+      enforceUntil = Date.now() + 3000;
+      ensureEnforce();
       try {
         lastFix = {
           at: Date.now(),
