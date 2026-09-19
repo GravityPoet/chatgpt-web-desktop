@@ -1768,12 +1768,7 @@ let chatDialogDismissalRecoveryScript = #"""
 })();
 """#
 
-// Keep the composer "+" menu anchored below its trigger, matching the official
-// bottom-start floating layer (offset 8, collision padding 12); it flips above
-// only when there is no room below. Long drafts and attachment previews resize
-// the composer asynchronously after the menu opens, which can leave a stale
-// anchor position in WKWebView; re-clamp on trigger and menu resize instead of
-// touching site DOM structure or focus.
+// Keep only the composer upload menu aligned with its button and outside the draft.
 let composerPlusPopoverFixScript = #"""
 (() => {
   const host = location.hostname.toLowerCase();
@@ -1782,311 +1777,155 @@ let composerPlusPopoverFixScript = #"""
       !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
         host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
   if (window.__chatgptSwiftPlusPopoverFix) return;
-  const challenge = () => location.pathname.startsWith('/cdn-cgi/') ||
+  const blocked = () => location.pathname.startsWith('/cdn-cgi/') ||
     !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
-  if (challenge()) return;
-  const OFFSET = 8, PAD = 12;
-  const TRIGGER_SELECTOR = 'button[popovertarget],button[data-testid*="composer-plus"],button[data-testid*="plus"],button[data-testid*="attach"],button[data-testid*="upload"],button[aria-label*="添加"],button[aria-label*="附加"],button[aria-label*="上传"],button[aria-label*="Attach"],button[aria-label*="Add"],[data-octane-native-image-menu-trigger]';
-  const MENU_TEXTS = ['添加照片和文件', '从电脑上传', 'Add photos'];
-  const clamp = (value, min, max) => Math.min(Math.max(value, min), Math.max(min, max));
-  let lastPlusClick = null, lastFix = null;
-  const isOpenPopover = pop => {
-    try {
-      if (typeof pop.matches === 'function' && pop.matches(':popover-open')) return true;
-    } catch (_) {}
-    if (pop.hasAttribute('data-state') && pop.getAttribute('data-state') === 'closed') return false;
-    if (pop.closest('[data-radix-popper-content-wrapper]')) {
-      const wrap = pop.closest('[data-radix-popper-content-wrapper]');
-      const style = getComputedStyle(wrap);
-      if (style.display === 'none' || style.visibility === 'hidden') return false;
-      return true;
-    }
-    const rect = pop.getBoundingClientRect(), style = getComputedStyle(pop);
+  const triggerSelector = '#composer-plus-btn,button[data-testid="composer-plus-btn"],button[aria-label^="添加文件"],button[aria-label="添加附件"],button[aria-label^="Add files"],button[aria-label^="Attach"]';
+  const menuSelector = '.popover,[popover],[role="menu"]';
+  const editorSelector = '#prompt-textarea,textarea,[contenteditable="true"],#mobile-composer-prompt';
+  const visible = el => {
+    if (!el?.isConnected || el.closest('[hidden],[inert],[aria-hidden="true"],[data-state="closed"]')) return false;
+    const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
     return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
   };
-  const triggerFor = pop => {
-    if (pop.id) {
-      const direct = document.querySelector('button[popovertarget="' + CSS.escape(pop.id) + '"]');
-      if (direct) return direct;
-    }
-    const labelled = Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).filter(el => el.isConnected);
-    if (labelled.length === 1) return labelled[0];
-    const popRect = pop.getBoundingClientRect();
-    let best = null, bestGap = Infinity;
-    for (const el of labelled) {
-      const rect = el.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) continue;
-      const gap = Math.abs((rect.top - popRect.bottom)) + Math.abs(rect.left - popRect.left);
-      if (gap < bestGap) { bestGap = gap; best = el; }
-    }
-    return best;
+  const clamp = (n, low, high) => Math.max(low, Math.min(n, high));
+  const rectSummary = r => ({x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)});
+  const saved = new Map();
+  let lastFix = null, lastClick = 0, timer = 0, resizeTargets = [];
+  const write = (el, property, value) => {
+    let properties = saved.get(el);
+    if (!properties) { properties = new Map(); saved.set(el, properties); }
+    if (!properties.has(property)) properties.set(property, [el.style.getPropertyValue(property), el.style.getPropertyPriority(property)]);
+    if (el.style.getPropertyValue(property) !== value || el.style.getPropertyPriority(property) !== 'important') el.style.setProperty(property, value, 'important');
   };
-  const popoverFor = trigger => {
-    const target = trigger.getAttribute && trigger.getAttribute('popovertarget');
-    if (target) {
-      const byId = document.getElementById(target);
-      if (byId) return byId;
+  const restore = el => {
+    for (const [property, [value, priority]] of saved.get(el) || []) {
+      if (value) el.style.setProperty(property, value, priority);
+      else el.style.removeProperty(property);
+    }
+    delete el.dataset.chatgptSwiftPlusFixed;
+    saved.delete(el);
+  };
+  const composerFor = trigger => {
+    for (let el = trigger.parentElement; el && el !== document.body; el = el.parentElement) {
+      const editor = el.querySelector(editorSelector);
+      if (editor && visible(editor)) return {element:el, editor};
     }
     return null;
   };
-  const radixWrappers = () => Array.from(document.querySelectorAll('[data-radix-popper-content-wrapper],[data-base-ui-popper],[data-floating-ui-portal] [role="menu"],[data-positioner]'));
-  const textAnchoredMenus = () => {
-    const out = [];
-    if (!document.body) return out;
-    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-    const hits = [];
-    while (walker.nextNode()) {
-      const text = walker.currentNode.nodeValue || '';
-      if (MENU_TEXTS.some(t => text.includes(t))) hits.push(walker.currentNode.parentElement);
+  const findMenus = trigger => {
+    const controls = [trigger.getAttribute('popovertarget'), trigger.getAttribute('aria-controls')].filter(Boolean);
+    const candidates = new Set([...document.querySelectorAll(menuSelector), ...controls.map(id => document.getElementById(id)).filter(Boolean)]);
+    const menus = [];
+    for (const el of candidates) {
+      if (!visible(el) || el.matches('[role="tooltip"]') || el.querySelector('[role="tooltip"]')) continue;
+      // Only the plus button's controlled panel or its upload menu is eligible.
+      // A nearby tooltip, profile menu or a chat message must never become a menu.
+      const uploadMenu = /添加照片和文件|从电脑上传|Add photos|Upload from computer/i.test(el.textContent || '');
+      if (!controls.includes(el.id) && !uploadMenu) continue;
+      const box = el.closest('[data-radix-popper-content-wrapper]') || el;
+      if (!menus.some(menu => menu.box === box)) menus.push({box, content:el});
     }
-    for (const el of hits) {
-      if (!(el instanceof Element)) continue;
-      let box = el;
-      while (box && box !== document.body) {
-        const style = getComputedStyle(box);
-        const rect = box.getBoundingClientRect();
-        const floating = style.position === 'fixed' || style.position === 'absolute' || box.hasAttribute('popover');
-        if (floating && rect.width > 120 && rect.height > 40) break;
-        box = box.parentElement;
-      }
-      if (box && box !== document.body && !out.includes(box)) out.push(box);
-    }
-    return out;
+    return menus.filter(menu => !menus.some(other => other !== menu && other.box.contains(menu.box)));
   };
-  let scheduled = false, enforceTimer = 0, enforceUntil = 0;
-  const ensureEnforce = () => {
-    if (enforceTimer || Date.now() > enforceUntil) return;
-    try {
-      enforceTimer = setInterval(() => {
-        if (Date.now() > enforceUntil) {
-          try { clearInterval(enforceTimer); } catch (_) {}
-          enforceTimer = 0;
-          return;
-        }
-        schedule(null);
-      }, 250);
-    } catch (_) {}
-  };
-  const reposition = targetPop => {
-    const pops = targetPop ? [targetPop] : Array.from(document.querySelectorAll('[popover]'));
-    for (const wrap of radixWrappers()) {
-      if (!pops.includes(wrap)) pops.push(wrap);
+  const reposition = () => {
+    const trigger = Array.from(document.querySelectorAll(triggerSelector)).find(visible);
+    const composer = trigger && composerFor(trigger);
+    const menus = !blocked() && composer ? findMenus(trigger) : [];
+    const keep = new Set(menus.flatMap(({box,content}) => [box,content]));
+    for (const el of saved.keys()) if (!keep.has(el)) restore(el);
+    if (!composer || !menus.length) { watchSizes([]); return; }
+    const anchor = trigger.getBoundingClientRect(), editor = composer.editor.getBoundingClientRect();
+    const view = window.visualViewport;
+    const bounds = {left:(view?.offsetLeft || 0)+12,top:(view?.offsetTop || 0)+12,
+      right:(view?.offsetLeft || 0)+(view?.width || innerWidth)-12,
+      bottom:(view?.offsetTop || 0)+(view?.height || innerHeight)-12};
+    // Reserve the whole editable region, not just the bottom-row plus button.
+    const below = Math.max(anchor.bottom, editor.bottom) + 8;
+    const above = Math.min(anchor.top, editor.top) - 8;
+    const roomBelow = Math.max(0, bounds.bottom - below), roomAbove = Math.max(0, above - bounds.top);
+    for (const {box,content} of menus) {
+      const before = box.getBoundingClientRect();
+      const scaleX = before.width / (box.offsetWidth || before.width);
+      const scaleY = before.height / (box.offsetHeight || before.height);
+      const naturalHeight = Math.max(box.scrollHeight, content.scrollHeight, box.offsetHeight) * scaleY;
+      // Prefer below, including a scrollable menu, rather than cover a long draft.
+      const placement = roomBelow >= Math.min(naturalHeight, 144) || roomBelow >= roomAbove ? 'bottom' : 'top';
+      const room = placement === 'bottom' ? roomBelow : roomAbove;
+      if (room < 1) continue;
+      write(box,'box-sizing','border-box');
+      write(box,'max-width',Math.max(1,(bounds.right-bounds.left)/scaleX)+'px');
+      write(box,'max-height',(room/scaleY)+'px');
+      write(box,'overflow-y','auto');
+      if (content !== box) {
+        write(content,'max-height',(room/scaleY)+'px');
+        write(content,'overflow-y','auto');
+      }
+      write(box,'position','fixed');
+      write(box,'right','auto');
+      write(box,'bottom','auto');
+      write(box,'margin','0');
+      write(box,'transform','none');
+      write(box,'translate','none');
+      write(box,'position-anchor','auto');
+      write(box,'position-area','none');
+      write(box,'left','0px');
+      write(box,'top','0px');
+      // Fixed positioning can still be relative to a transformed/contained ancestor.
+      // Measure that origin instead of writing viewport coordinates into its space.
+      const origin = box.getBoundingClientRect();
+      const left = clamp(anchor.left,bounds.left,bounds.right-origin.width);
+      const top = placement === 'bottom' ? below : above-origin.height;
+      write(box,'left',((left-origin.left)/scaleX)+'px');
+      write(box,'top',((top-origin.top)/scaleY)+'px');
+      box.dataset.chatgptSwiftPlusFixed = placement;
+      lastFix = {placement,triggerRect:rectSummary(anchor),menuRectBefore:rectSummary(before),
+        menuRect:rectSummary(box.getBoundingClientRect()),left:Math.round(left),top:Math.round(top)};
     }
-    for (const box of textAnchoredMenus()) {
-      if (!pops.includes(box)) pops.push(box);
-    }
-    if (lastPlusClick && Date.now() - lastPlusClick.time < 5000) {
-      const ctl = lastPlusClick.trigger.getAttribute && (lastPlusClick.trigger.getAttribute('aria-controls') || lastPlusClick.trigger.getAttribute('popovertarget'));
-      if (ctl) {
-        const byId = document.getElementById(ctl);
-        if (byId && !pops.includes(byId)) pops.push(byId);
-      }
-    }
-    for (const pop of pops) {
-      try {
-      if (!(pop instanceof Element) || !pop.isConnected) continue;
-      const content = pop.matches('[data-radix-popper-content-wrapper]') ? pop : null;
-      const freshClick = lastPlusClick && Date.now() - lastPlusClick.time < 5000 && lastPlusClick.trigger.isConnected
-        ? lastPlusClick.trigger : null;
-      let trigger = freshClick || (content
-        ? (Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).find(el => {
-            const form = el.closest('form');
-            return form && content.isConnected && Math.abs(el.getBoundingClientRect().left - content.getBoundingClientRect().left) < 400;
-          }) || triggerFor(pop))
-        : triggerFor(pop));
-      if (!trigger || !trigger.isConnected) continue;
-      const composer = trigger.closest('form') || trigger.parentElement;
-      if (!composer || !composer.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) {
-        if (!trigger.matches(TRIGGER_SELECTOR)) continue;
-      }
-      const box = content || pop;
-      if (!isOpenPopover(box)) {
-        if (box.dataset && box.dataset.chatgptSwiftPlusFixed) {
-          try {
-            delete box.dataset.chatgptSwiftPlusFixed;
-            ['position', 'left', 'top', 'bottom', 'right', 'margin', 'translate', 'position-anchor', 'inset-area', 'transform', 'max-height', 'max-width', 'overflow-y'].forEach(prop => {
-              try { box.style.removeProperty(prop); } catch (_) {}
-            });
-            const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]') ||
-              (box.firstElementChild instanceof Element ? box.firstElementChild : null);
-            if (inner && inner !== box) {
-              try { inner.style.removeProperty('transform'); inner.style.removeProperty('position-anchor'); } catch (_) {}
-            }
-          } catch (_) {}
-        }
-        enforceUntil = 0;
-        continue;
-      }
-      const btnRect = trigger.getBoundingClientRect();
-      if (btnRect.width <= 0 || btnRect.height <= 0) continue;
-      const popRect = box.getBoundingClientRect();
-      const popW = box.offsetWidth || popRect.width, popH = box.offsetHeight || popRect.height;
-      if (popW <= 0 || popH <= 0) continue;
-      const vw = window.innerWidth, vh = window.innerHeight;
-      let effW = popW;
-      if (effW > vw - PAD * 2) {
-        box.style.setProperty('max-width', (vw - PAD * 2) + 'px', 'important');
-        effW = vw - PAD * 2;
-      }
-      const left = clamp(btnRect.left, PAD, Math.max(PAD, vw - effW - PAD));
-      const aboveTop = btnRect.top - popH - OFFSET;
-      const belowTop = btnRect.bottom + OFFSET;
-      let top, placement;
-      if (vh - btnRect.bottom - OFFSET - popH >= PAD) { top = belowTop; placement = 'bottom'; }
-      else if (aboveTop >= PAD) { top = aboveTop; placement = 'top'; }
-      else {
-        top = clamp(aboveTop, PAD, Math.max(PAD, vh - popH - PAD));
-        placement = 'clamped';
-        box.style.setProperty('max-height', Math.max(80, vh - PAD * 2) + 'px', 'important');
-        box.style.setProperty('overflow-y', 'auto', 'important');
-      }
-      try {
-        if (box.scrollHeight > box.clientHeight + 8) {
-          const room = placement === 'bottom'
-            ? Math.max(120, vh - btnRect.bottom - PAD - OFFSET)
-            : Math.max(120, btnRect.top - PAD - OFFSET);
-          box.style.setProperty('max-height', Math.min(room, vh - PAD * 2) + 'px', 'important');
-          box.style.setProperty('overflow-y', 'auto', 'important');
-        }
-      } catch (_) {}
-      const alreadyAbove = popRect.bottom <= btnRect.top - 4 && Math.abs(popRect.left - left) <= 1 && Math.abs(popRect.top - top) <= 1;
-      const alreadyBelow = placement === 'bottom' && Math.abs(popRect.top - top) <= 1 && Math.abs(popRect.left - left) <= 1;
-      if (alreadyAbove || alreadyBelow) continue;
-      box.style.setProperty('position', 'fixed', 'important');
-      box.style.setProperty('left', left + 'px', 'important');
-      box.style.setProperty('top', top + 'px', 'important');
-      box.style.setProperty('bottom', 'auto', 'important');
-      box.style.setProperty('right', 'auto', 'important');
-      box.style.setProperty('margin', '0', 'important');
-      box.style.setProperty('translate', 'none', 'important');
-      box.style.setProperty('position-anchor', 'none', 'important');
-      box.style.setProperty('inset-area', 'none', 'important');
-      const inner = box.querySelector('[data-radix-popper-content],[role="menu"],[role="dialog"]') ||
-        (box.firstElementChild instanceof Element ? box.firstElementChild : null);
-      if (inner && inner !== box) {
-        inner.style.setProperty('transform', 'none', 'important');
-        inner.style.setProperty('position-anchor', 'none', 'important');
-      }
-      box.style.setProperty('transform', 'none', 'important');
-      try { box.dataset.chatgptSwiftPlusFixed = placement; } catch (_) {}
-      enforceUntil = Date.now() + 3000;
-      ensureEnforce();
-      try {
-        lastFix = {
-          at: Date.now(),
-          kind: content ? 'radix' : (pop.hasAttribute('popover') ? 'popover' : 'text'),
-          id: box.id || '', role: box.getAttribute('role') || '',
-          triggerRect: roundRect(btnRect), menuRectBefore: roundRect(popRect),
-          left: Math.round(left), top: Math.round(top), placement
-        };
-      } catch (_) {}
-      } catch (_) {}
-    }
+    watchSizes([trigger,composer.editor,composer.element,...menus.flatMap(m => [m.box,m.content])]);
   };
-  const schedule = targetPop => {
-    if (scheduled && !targetPop) return;
-    scheduled = true;
-    const run = () => { scheduled = false; if (!challenge()) reposition(targetPop || null); };
-    if (typeof window.requestAnimationFrame === 'function') window.requestAnimationFrame(run);
-    else setTimeout(run, 0);
+  const schedule = () => {
+    if (timer) return;
+    // Hidden WKWebViews suspend animation frames; a bounded task also covers
+    // menu mount, background activation and layout tests without a polling loop.
+    timer = setTimeout(() => {
+      timer = 0;
+      mutations.disconnect();
+      try { reposition(); } finally { observeMutations(); }
+    }, 0);
   };
-  const roundRect = rect => ({ x: Math.round(rect.left), y: Math.round(rect.top), w: Math.round(rect.width), h: Math.round(rect.height) });
-  const describeTrigger = el => {
-    try {
-      const label = el.getAttribute('aria-label') || el.getAttribute('data-testid') || el.getAttribute('popovertarget') || '?';
-      return { label: String(label).slice(0, 40), rect: roundRect(el.getBoundingClientRect()) };
-    } catch (_) { return { label: '?', rect: null }; }
+  const sizes = new ResizeObserver(schedule);
+  const watchSizes = elements => {
+    const next = Array.from(new Set(elements));
+    if (next.length === resizeTargets.length && next.every(el => resizeTargets.includes(el))) return;
+    sizes.disconnect(); resizeTargets = next;
+    next.forEach(el => sizes.observe(el));
   };
+  const mutations = new MutationObserver(records => {
+    if (records.some(record => record.type === 'childList' || saved.has(record.target) ||
+        record.target.matches?.(triggerSelector + ',' + menuSelector))) schedule();
+  });
+  const observeMutations = () => mutations.observe(document.documentElement,{childList:true,subtree:true,attributes:true,
+    attributeFilter:['style','class','hidden','data-state','aria-expanded','aria-hidden']});
   const diagnose = () => {
-    try {
-      const triggers = Array.from(document.querySelectorAll(TRIGGER_SELECTOR)).filter(el => el.isConnected).slice(0, 5).map(describeTrigger);
-      const seen = new Set(), menus = [];
-      const pushMenu = (box, kind) => {
-        if (!(box instanceof Element) || seen.has(box) || menus.length >= 5) return;
-        seen.add(box);
-        try {
-          menus.push({
-            kind, id: box.id || '', role: box.getAttribute('role') || '',
-            cls: String(box.className || '').slice(0, 60),
-            rect: roundRect(box.getBoundingClientRect()),
-            open: isOpenPopover(box), fixed: (box.dataset && box.dataset.chatgptSwiftPlusFixed) || ''
-          });
-        } catch (_) {}
-      };
-      document.querySelectorAll('[popover]').forEach(el => pushMenu(el, 'popover'));
-      radixWrappers().forEach(el => pushMenu(el, 'radix'));
-      textAnchoredMenus().forEach(el => pushMenu(el, 'text'));
-      const composerButtons = [];
-      try {
-        const forms = Array.from(document.querySelectorAll('form'));
-        for (const form of forms) {
-          if (!form.querySelector('textarea,#prompt-textarea,[contenteditable="true"],#mobile-composer-prompt')) continue;
-          for (const btn of Array.from(form.querySelectorAll('button')).slice(0, 10)) {
-            if (composerButtons.length >= 8) break;
-            composerButtons.push(describeTrigger(btn));
-          }
-        }
-      } catch (_) {}
-      return {
-        vw: window.innerWidth, vh: window.innerHeight,
-        triggers, menus, composerButtons,
-        lastClickMsAgo: lastPlusClick ? Date.now() - lastPlusClick.time : -1,
-        lastFix: lastFix ? Object.assign({ ageMs: Date.now() - lastFix.at }, lastFix) : null
-      };
-    } catch (_) { return { error: 'diagnose-failed' }; }
+    const triggers = Array.from(document.querySelectorAll(triggerSelector)).filter(visible);
+    const menus = triggers.flatMap(findMenus);
+    return {version:2,vw:innerWidth,vh:innerHeight,
+      triggers:triggers.map(el => ({label:el.getAttribute('aria-label') || el.id,rect:rectSummary(el.getBoundingClientRect())})),
+      menus:menus.map(({box}) => ({kind:'plus',rect:rectSummary(box.getBoundingClientRect()),open:visible(box),fixed:box.dataset.chatgptSwiftPlusFixed || ''})),
+      lastClickMsAgo:lastClick ? Date.now()-lastClick : -1,lastFix};
   };
-  window.__chatgptSwiftPlusPopoverFix = { reposition: pop => schedule(pop || null), diagnose };
-  document.addEventListener('click', event => {
-    const trigger = event.target instanceof Element ? event.target.closest(TRIGGER_SELECTOR) : null;
-    if (!trigger) return;
-    lastPlusClick = { trigger, time: Date.now() };
-    const pop = popoverFor(trigger);
-    setTimeout(() => schedule(pop), 0);
-    setTimeout(() => schedule(null), 120);
-    setTimeout(() => schedule(null), 400);
-    setTimeout(() => schedule(null), 900);
-  }, true);
-  document.addEventListener('toggle', event => {
-    const pop = event.target instanceof Element ? event.target : null;
-    if (!pop || !pop.hasAttribute('popover')) return;
-    if (triggerFor(pop)) schedule(pop);
-  }, true);
-  try {
-    new MutationObserver(mutations => {
-      for (const mutation of mutations) {
-        for (const node of mutation.addedNodes) {
-          if (!(node instanceof Element)) continue;
-          if (node.hasAttribute && node.hasAttribute('popover') && triggerFor(node)) { schedule(node); return; }
-          const nested = node.querySelector && (node.querySelector('[popover],[data-radix-popper-content-wrapper]'));
-          if (nested) { schedule(null); return; }
-        }
-        if (mutation.type === 'attributes' && mutation.target instanceof Element &&
-            (mutation.target.hasAttribute('popover') || mutation.target.hasAttribute('data-state'))) {
-          schedule(null); return;
-        }
-      }
-    }).observe(document.documentElement, { childList: true, subtree: true, attributes: true, attributeFilter: ['data-state', 'style', 'class', 'hidden', 'aria-expanded', 'aria-hidden'] });
-  } catch (_) {}
-  try {
-    document.addEventListener('transitionend', () => schedule(null), true);
-    document.addEventListener('animationend', () => schedule(null), true);
-  } catch (_) {}
-  try {
-    const resizes = new ResizeObserver(() => schedule(null));
-    const observeTrigger = () => {
-      document.querySelectorAll(TRIGGER_SELECTOR).forEach(el => { try { resizes.observe(el); } catch (_) {} });
-      const pop = document.querySelector('[popover]');
-      if (pop) { try { resizes.observe(pop); } catch (_) {} }
-    };
-    observeTrigger();
-    new MutationObserver(observeTrigger).observe(document.documentElement, { childList: true, subtree: true });
-  } catch (_) {}
-  window.addEventListener('resize', () => schedule(null), { passive: true });
-  document.addEventListener('scroll', () => schedule(null), { capture: true, passive: true });
-  try { window.visualViewport?.addEventListener('resize', () => schedule(null)); } catch (_) {}
-  document.addEventListener('input', event => {
-    if (event.target instanceof Element && event.target.closest('form')) schedule(null);
-  }, true);
+  window.__chatgptSwiftPlusPopoverFix = {reposition:schedule,diagnose};
+  document.addEventListener('click',event => {
+    if (event.target instanceof Element && event.target.closest(triggerSelector)) { lastClick=Date.now(); schedule(); }
+  },true);
+  document.addEventListener('toggle',schedule,true);
+  document.addEventListener('input',event => { if (event.target instanceof Element && event.target.matches(editorSelector)) schedule(); },true);
+  document.addEventListener('scroll',schedule,{capture:true,passive:true});
+  window.addEventListener('resize',schedule,{passive:true});
+  window.visualViewport?.addEventListener('resize',schedule);
+  window.visualViewport?.addEventListener('scroll',schedule);
+  observeMutations();
+  schedule();
 })();
 """#
 

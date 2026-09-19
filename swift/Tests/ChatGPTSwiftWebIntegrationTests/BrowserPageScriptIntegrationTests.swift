@@ -308,100 +308,143 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertNil(sink.payload(named: "dialogDismissal"))
     }
 
-    func testPlusPopoverFlipsAboveTriggerWhenNoRoomBelow() throws {
-        let sink = ScriptMessageSink(expectations: [:])
-        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+    func testPlusMenuUsesViewportCoordinatesInsideOffsetContainingBlock() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
         defer { harness.close() }
         wait(for: [harness.navigationExpectation], timeout: 3)
-        XCTAssertEqual(try stringResult("String(!!window.__chatgptSwiftPlusPopoverFix)", in: harness.webView), "true")
-        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
-        settle(0.5)
-        let report = try dictionaryResult("""
-        (() => {
-          const pop = document.getElementById('composer-actions-popover');
-          const btn = document.getElementById('plus');
-          const pr = pop.getBoundingClientRect(), br = btn.getBoundingClientRect();
-          return {top: pr.top, bottom: pr.bottom, left: pr.left, width: pr.width, height: pr.height,
-            btnTop: br.top, btnBottom: br.bottom, btnLeft: br.left,
-            fixed: pop.dataset.chatgptSwiftPlusFixed || '', composerLen: document.getElementById('prompt-textarea').value.length,
-            images: document.querySelectorAll('#composer img').length, winW: window.innerWidth, winH: window.innerHeight};
-        })()
-        """, in: harness.webView)
-        XCTAssertGreaterThan(report["composerLen"] as? Int ?? 0, 1000)
-        XCTAssertEqual(report["images"] as? Int, 1)
-        let top = report["top"] as? Double ?? 0
-        let bottom = report["bottom"] as? Double ?? 0
-        let left = report["left"] as? Double ?? 0
-        let width = report["width"] as? Double ?? 0
-        let btnTop = report["btnTop"] as? Double ?? 0
-        let btnLeft = report["btnLeft"] as? Double ?? 0
-        let winW = report["winW"] as? Double ?? 0
-        XCTAssertLessThanOrEqual(bottom, btnTop - 4, "加号菜单应对齐官方弹到按钮上方")
-        XCTAssertGreaterThanOrEqual(left, 12)
-        XCTAssertLessThanOrEqual(left + width, winW - 12)
-        XCTAssertEqual(report["fixed"] as? String, "top")
-        XCTAssertEqual(Int((report["btnLeft"] as? Double ?? -1)), Int(btnLeft))
-        XCTAssertGreaterThan(top, 0)
-        let diag = try dictionaryResult("window.__chatgptSwiftPlusPopoverFix.diagnose()", in: harness.webView)
-        XCTAssertNotNil(diag["vw"])
-        XCTAssertNotNil(diag["vh"])
-        XCTAssertNotNil(diag["triggers"])
-        XCTAssertNotNil(diag["menus"])
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'opened'", in: harness.webView)
+        settle(0.2)
+        let report = try dictionaryResult(Self.plusMenuGeometry, in: harness.webView)
+        XCTAssertEqual(try XCTUnwrap(report["left"] as? Double), try XCTUnwrap(report["anchorLeft"] as? Double), accuracy: 1)
+        XCTAssertEqual(try XCTUnwrap(report["top"] as? Double), try XCTUnwrap(report["anchorBottom"] as? Double) + 8, accuracy: 1)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(report["right"] as? Double), 628)
+        XCTAssertLessThanOrEqual(try XCTUnwrap(report["bottom"] as? Double), 468)
+        XCTAssertEqual(report["placement"] as? String, "bottom")
+        XCTAssertEqual(report["draftLength"] as? Int, 6000)
+        XCTAssertEqual(report["attachmentCount"] as? Int, 1)
     }
 
-    func testPlusPopoverFixClearsOverridesWhenMenuCloses() throws {
-        let sink = ScriptMessageSink(expectations: [:])
-        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+    func testPlusMenuAboveLongDraftDoesNotOverlapInputAndCanScrollToLastRow() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
         defer { harness.close() }
         wait(for: [harness.navigationExpectation], timeout: 3)
-        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
-        settle(0.5)
-        XCTAssertEqual(try stringResult("document.getElementById('composer-actions-popover').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "top")
         _ = try stringResult("""
-        document.getElementById('composer-actions-popover').style.display = 'none';
-        window.__chatgptSwiftPlusPopoverFix.reposition(); 'hidden'
+        const c = document.querySelector('#composer'); c.style.top='220px';
+        document.querySelector('#prompt-textarea').style.height='175px';
+        document.querySelector('#composer-plus-btn').click(); 'opened'
         """, in: harness.webView)
-        settle(0.5)
-        let report = try dictionaryResult("""
-        (() => {
-          const pop = document.getElementById('composer-actions-popover');
-          return {left: pop.style.left, marker: pop.dataset.chatgptSwiftPlusFixed || ''};
-        })()
+        settle(0.2)
+        let report = try dictionaryResult(Self.plusMenuGeometry, in: harness.webView)
+        XCTAssertEqual(report["placement"] as? String, "top")
+        XCTAssertLessThanOrEqual(try XCTUnwrap(report["bottom"] as? Double), try XCTUnwrap(report["editorTop"] as? Double) - 8)
+        XCTAssertGreaterThanOrEqual(try XCTUnwrap(report["top"] as? Double), 12)
+        XCTAssertEqual(report["scrollable"] as? Bool, true)
+        let reached = try dictionaryResult("""
+        (() => {const menu=document.querySelector('#plus-menu'); menu.scrollTop=menu.scrollHeight;
+          const last=menu.lastElementChild.getBoundingClientRect(), r=menu.getBoundingClientRect();
+          return {reachable:last.bottom<=r.bottom+1, preserved:document.querySelector('#prompt-textarea').value.length===6000};})()
         """, in: harness.webView)
-        XCTAssertEqual(report["left"] as? String, "")
-        XCTAssertEqual(report["marker"] as? String, "")
-        let diag = try dictionaryResult("window.__chatgptSwiftPlusPopoverFix.diagnose()", in: harness.webView)
-        XCTAssertNotNil(diag["lastFix"])
+        XCTAssertEqual(reached["reachable"] as? Bool, true)
+        XCTAssertEqual(reached["preserved"] as? Bool, true)
     }
 
-    func testPlusPopoverLeavesUnrelatedAndHiddenMenusAlone() throws {
-        let sink = ScriptMessageSink(expectations: [:])
-        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML)
+    func testPlusMenuTracksComposerResizeAndRestoresOriginalStylesOnClose() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
         defer { harness.close() }
         wait(for: [harness.navigationExpectation], timeout: 3)
-        _ = try stringResult("document.querySelector('#plus').click(); 'clicked'", in: harness.webView)
-        settle(0.5)
-        let report = try dictionaryResult("""
-        (() => {
-          const other = document.getElementById('other-popover');
-          const hidden = document.getElementById('hidden-popover');
-          const orect = other.getBoundingClientRect();
-          return {otherTop: orect.top, otherFixed: other.dataset.chatgptSwiftPlusFixed || '',
-            hiddenFixed: hidden.dataset.chatgptSwiftPlusFixed || ''};
-        })()
-        """, in: harness.webView)
-        XCTAssertEqual(report["otherTop"] as? Double, 350)
-        XCTAssertEqual(report["otherFixed"] as? String, "")
-        XCTAssertEqual(report["hiddenFixed"] as? String, "")
+        let original = try stringResult("JSON.stringify(Array.from(document.querySelector('#plus-menu').style).sort().map(p => [p, document.querySelector('#plus-menu').style.getPropertyValue(p)]))", in: harness.webView)
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'opened'", in: harness.webView)
+        settle(0.2)
+        _ = try stringResult("document.querySelector('#prompt-textarea').style.height='175px'; window.dispatchEvent(new Event('resize')); 'resized'", in: harness.webView)
+        settle(0.2)
+        let report = try dictionaryResult(Self.plusMenuGeometry, in: harness.webView)
+        XCTAssertEqual(try XCTUnwrap(report["top"] as? Double), try XCTUnwrap(report["anchorBottom"] as? Double) + 8, accuracy: 1)
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'closed'", in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("JSON.stringify(Array.from(document.querySelector('#plus-menu').style).sort().map(p => [p, document.querySelector('#plus-menu').style.getPropertyValue(p)]))", in: harness.webView), original)
+        XCTAssertEqual(try stringResult("document.querySelector('#plus-menu').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "")
     }
 
-    func testPlusPopoverFixDoesNotRunOnUntrustedOrigin() throws {
-        let sink = ScriptMessageSink(expectations: [:])
-        let harness = try makeHarness(sink: sink, html: Self.plusPopoverHTML, baseURL: URL(string: "https://example.com/")!)
+    func testPlusMenuDoesNotRepositionTooltipOrUnrelatedPopover() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
         defer { harness.close() }
         wait(for: [harness.navigationExpectation], timeout: 3)
-        XCTAssertEqual(try stringResult("String(!!window.__chatgptSwiftPlusPopoverFix)", in: harness.webView), "false")
+        let original = try stringResult("document.querySelector('#tooltip-wrapper').getAttribute('style')", in: harness.webView)
+        let unrelated = try stringResult("document.querySelector('#other-menu').getAttribute('style')", in: harness.webView)
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'opened'", in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("document.querySelector('#tooltip-wrapper').getAttribute('style')", in: harness.webView), original)
+        XCTAssertEqual(try stringResult("document.querySelector('#other-menu').getAttribute('style')", in: harness.webView), unrelated)
+        XCTAssertEqual(try stringResult("document.querySelector('#tooltip-wrapper').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "")
     }
+
+    func testPlusNativePopoverKeepsOpeningAndClosingBehavior() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("""
+        const b=document.querySelector('#composer-plus-btn'), m=document.querySelector('#plus-menu');
+        b.onclick=null; m.removeAttribute('hidden'); m.setAttribute('popover','auto'); b.setAttribute('popovertarget','plus-menu');
+        b.click(); 'opened'
+        """, in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("String(document.querySelector('#plus-menu').matches(':popover-open'))", in: harness.webView), "true")
+        let report = try dictionaryResult(Self.plusMenuGeometry, in: harness.webView)
+        XCTAssertEqual(try XCTUnwrap(report["left"] as? Double), try XCTUnwrap(report["anchorLeft"] as? Double), accuracy: 1)
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'closed'", in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("String(document.querySelector('#plus-menu').matches(':popover-open'))", in: harness.webView), "false")
+        XCTAssertEqual(try stringResult("document.querySelector('#plus-menu').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "")
+    }
+
+    func testPlusMenuDoesNotRunOnUntrustedOriginOrChallenge() throws {
+        for base in ["https://example.com/", "https://chatgpt.com:8443/", "http://chatgpt.com/"] {
+            let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML, baseURL: URL(string: base)!)
+            defer { harness.close() }
+            wait(for: [harness.navigationExpectation], timeout: 3)
+            _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'opened'", in: harness.webView)
+            settle(0.1)
+            XCTAssertEqual(try stringResult("document.querySelector('#plus-menu').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "", base)
+        }
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML.replacingOccurrences(of: "<body>", with: "<body id='challenge-stage'>"))
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("document.querySelector('#composer-plus-btn').click(); 'opened'", in: harness.webView)
+        settle(0.1)
+        XCTAssertEqual(try stringResult("document.querySelector('#plus-menu').dataset.chatgptSwiftPlusFixed || ''", in: harness.webView), "")
+    }
+
+    private static let plusMenuGeometry = """
+    (() => {const m=document.querySelector('#plus-menu'), b=document.querySelector('#composer-plus-btn'), e=document.querySelector('#prompt-textarea');
+      const r=m.getBoundingClientRect(), a=b.getBoundingClientRect();
+      return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,anchorLeft:a.left,anchorBottom:a.bottom,editorTop:e.getBoundingClientRect().top,
+        placement:m.dataset.chatgptSwiftPlusFixed || '',scrollable:m.scrollHeight>m.clientHeight && getComputedStyle(m).overflowY==='auto',
+        draftLength:e.value.length,attachmentCount:document.querySelectorAll('#composer img').length};})()
+    """
+
+    private static let plusMenuHTML = """
+    <!doctype html><html><head><style>
+      * {box-sizing:border-box} body {margin:0} #offset-container {position:absolute;left:180px;top:0;width:440px;height:480px;transform:translateZ(0)}
+      #composer {position:absolute;left:20px;top:90px;width:380px;margin:0}
+      #prompt-textarea {display:block;width:360px;height:40px} #composer-plus-btn {width:36px;height:36px}
+      #plus-menu>div {height:36px} #tooltip-wrapper {position:fixed}
+    </style></head><body>
+      <div id="offset-container"><form id="composer">
+        <textarea id="prompt-textarea"></textarea>
+        <button id="composer-plus-btn" type="button" aria-label="添加文件等" aria-controls="plus-menu">+</button>
+        <img src="data:image/png;base64,iVBORw0KGgo=" width="12" height="12" alt="fixture">
+      </form>
+      <div id="plus-menu" class="popover" hidden style="position:fixed;left:200px;top:350px;width:380px;max-height:70px;overflow:hidden;background:white">
+        <div>添加照片和文件</div><div>从资料库添加</div><div>创建图片</div><div>网页搜索</div><div>深度研究</div><div>绘图</div><div>最后一项</div>
+      </div></div>
+      <div id="tooltip-wrapper" data-radix-popper-content-wrapper style="left:170px;top:145px;transform:translate(5px,5px)"><div role="tooltip">添加文件等 @</div></div>
+      <div id="other-menu" class="popover" role="menu" style="position:fixed;left:15px;top:20px;width:90px;height:30px">其他操作</div>
+      <script>
+        document.querySelector('#prompt-textarea').value='长文本 '.repeat(1500);
+        document.querySelector('#composer-plus-btn').onclick=() => {const m=document.querySelector('#plus-menu'); m.hidden=!m.hidden;};
+      </script>
+    </body></html>
+    """
 
     private func makeArchiveHarness(sink: ScriptMessageSink, baseURL: URL = URL(string: "https://chatgpt.com/c/archive-fixture?mode=fixture")!) throws -> WebViewHarness {
         let harness = try makeHarness(sink: sink, html: """
@@ -584,66 +627,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     </body></html>
     """
 
-    func testPlusTextMenuOpensBelowAndUnclipsHiddenRows() throws {
-        let sink = ScriptMessageSink(expectations: [:])
-        let harness = try makeHarness(sink: sink, html: Self.plusTextMenuHTML)
-        defer { harness.close() }
-        wait(for: [harness.navigationExpectation], timeout: 3)
-        _ = try stringResult("document.querySelector('#plus2').click(); 'clicked'", in: harness.webView)
-        settle(0.6)
-        let report = try dictionaryResult("""
-        (() => {
-          const pop = document.getElementById('clip-menu');
-          const btn = document.getElementById('plus2');
-          const pr = pop.getBoundingClientRect(), br = btn.getBoundingClientRect();
-          const cs = getComputedStyle(pop);
-          return {top: pr.top, bottom: pr.bottom, left: pr.left, width: pr.width,
-            btnBottom: br.bottom, fixed: pop.dataset.chatgptSwiftPlusFixed || '',
-            overflowY: cs.overflowY, maxHeight: cs.maxHeight, winW: window.innerWidth};
-        })()
-        """, in: harness.webView)
-        let top = report["top"] as? Double ?? 0
-        let btnBottom = report["btnBottom"] as? Double ?? 0
-        XCTAssertGreaterThanOrEqual(top, btnBottom + 4, "加号菜单应对齐官方弹到按钮下方")
-        XCTAssertEqual(report["fixed"] as? String, "bottom")
-        XCTAssertEqual(report["overflowY"] as? String, "auto")
-        let left = report["left"] as? Double ?? 0
-        let width = report["width"] as? Double ?? 0
-        let winW = report["winW"] as? Double ?? 0
-        XCTAssertGreaterThanOrEqual(left, 12)
-        XCTAssertLessThanOrEqual(left + width, winW - 12)
-    }
 
-    private static let plusTextMenuHTML = """
-    <!doctype html><html><body>
-      <form id="composer2" style="position:relative;width:600px">
-        <div id="editor" contenteditable="true">PLACEHOLDER_LONG_TEXT</div>
-        <button id="plus2" type="button" aria-label="添加附件" style="position:fixed;top:300px;left:100px;width:40px;height:40px">+</button>
-      </form>
-      <div id="clip-menu" style="position:fixed;top:350px;left:100px;width:300px;max-height:60px;overflow:hidden;background:#fff">
-        <div style="height:30px">添加照片和文件</div>
-        <div style="height:30px">从电脑上传</div>
-        <div style="height:30px">网页搜索</div>
-        <div style="height:30px">更多操作</div>
-      </div>
-      <script>document.getElementById('editor').textContent = '长文本 '.repeat(600);</script>
-    </body></html>
-    """
-
-    private static let plusPopoverHTML = """
-    <!doctype html><html><body>
-      <form id="composer" style="position:relative;width:600px">
-        <textarea id="prompt-textarea" style="width:560px;height:220px">PLACEHOLDER_LONG_TEXT</textarea>
-        <div class="attachments"><img src="data:image/png;base64,iVBORw0KGgo=" width="64" height="64" alt="fixture"></div>
-        <button id="plus" type="button" aria-label="添加文件" popovertarget="composer-actions-popover" style="position:fixed;top:300px;left:100px;width:40px;height:40px">+</button>
-        <button id="other-btn" type="button" aria-label="其他" popovertarget="other-popover" style="position:fixed;top:300px;left:400px;width:40px;height:40px">?</button>
-      </form>
-      <div id="composer-actions-popover" popover="auto" style="position:fixed;top:350px;left:100px;width:220px;height:200px;background:#fff">menu</div>
-      <div id="other-popover" popover="auto" style="position:fixed;top:350px;left:400px;width:180px;height:120px;background:#eee">other</div>
-      <div id="hidden-popover" popover="auto" style="display:none;position:fixed;top:350px;left:100px;width:220px;height:200px">hidden</div>
-      <script>document.getElementById('prompt-textarea').value = '长文本 '.repeat(600);</script>
-    </body></html>
-    """
 }
 
 @MainActor
