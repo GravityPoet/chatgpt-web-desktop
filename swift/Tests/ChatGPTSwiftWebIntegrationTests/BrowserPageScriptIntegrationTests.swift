@@ -324,6 +324,85 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(report["attachmentCount"] as? Int, 1)
     }
 
+    func testPopoverPreservesSelectionAndPositionsActionsWithoutStealingFocus() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.popoverChromeHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("selectEmail(); showPanel('selection'); 'opened'", in: harness.webView)
+        settle(0.2)
+        let report = try dictionaryResult("""
+        (() => {
+          const panel=document.querySelector('#selection'), p=panel.getBoundingClientRect();
+          const s=getSelection(), r=s.getRangeAt(0).getBoundingClientRect(), c=getComputedStyle(panel);
+          return {selected:String(s),focus:document.activeElement.id,tab:document.querySelector('#ask').tabIndex,
+            geometry:[p.left,p.top,p.width,p.height,r.left,r.top,r.width,r.height],
+            rightGap:p.left-r.right,centerOffset:(p.top+p.height/2)-(r.top+r.height/2),
+            side:p.left>=r.right+7 || p.right<=r.left-7,within:p.left>=8 && p.right<=innerWidth-8,
+            border:c.borderTopWidth,padding:c.padding,background:c.backgroundColor,
+            inner:getComputedStyle(document.querySelector('#selection-inner')).backgroundColor};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["selected"] as? String, "fixture@example.com")
+        XCTAssertEqual(report["focus"] as? String, "source")
+        XCTAssertEqual(report["tab"] as? Int, 0)
+        XCTAssertEqual(report["side"] as? Bool, true, String(describing: report["geometry"]))
+        XCTAssertEqual(try XCTUnwrap(report["rightGap"] as? Double), 8, accuracy: 1)
+        XCTAssertEqual(try XCTUnwrap(report["centerOffset"] as? Double), 0, accuracy: 1)
+        XCTAssertEqual(report["within"] as? Bool, true)
+        XCTAssertEqual(report["border"] as? String, "0px")
+        XCTAssertEqual(report["padding"] as? String, "0px")
+        XCTAssertEqual(report["background"] as? String, "rgba(0, 0, 0, 0)")
+        XCTAssertEqual(report["inner"] as? String, "rgb(255, 255, 255)")
+
+        _ = try stringResult("""
+        document.dispatchEvent(new PointerEvent('pointermove',{clientX:230,clientY:200}));
+        'observing'
+        """, in: harness.webView)
+        settle(1)
+        XCTAssertEqual(try stringResult("String(getSelection())", in: harness.webView), "fixture@example.com")
+        let settled = try dictionaryResult("""
+        (() => {const p=document.querySelector('#selection').getBoundingClientRect(),r=getSelection().getRangeAt(0).getBoundingClientRect();
+          return {side:p.left>=r.right+7 || p.right<=r.left-7,within:p.left>=8 && p.right<=innerWidth-8};})()
+        """, in: harness.webView)
+        XCTAssertEqual(settled["side"] as? Bool, true)
+        XCTAssertEqual(settled["within"] as? Bool, true)
+        _ = try stringResult("document.querySelector('#ask').click(); 'clicked'", in: harness.webView)
+        XCTAssertEqual(try stringResult("window.actionSelection", in: harness.webView), "fixture@example.com")
+        _ = try stringResult("document.querySelector('#ask').focus(); 'focused'", in: harness.webView)
+        XCTAssertEqual(try stringResult("document.activeElement.id", in: harness.webView), "ask")
+        _ = try stringResult("document.querySelector('#composer').focus(); getSelection().removeAllRanges(); 'cleared'", in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("String(getSelection())", in: harness.webView), "")
+        XCTAssertEqual(try stringResult("document.activeElement.id", in: harness.webView), "composer")
+    }
+
+    func testTooltipKeepsCapsuleOutsideSendButtonAndDoesNotInterceptClicks() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.popoverChromeHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try stringResult("showPanel('tooltip'); 'opened'", in: harness.webView)
+        settle(0.2)
+        let report = try dictionaryResult("""
+        (() => {
+          const b=document.querySelector('#send').getBoundingClientRect(), el=document.querySelector('#tooltip'),r=el.getBoundingClientRect(),c=getComputedStyle(el);
+          return {above:r.bottom<=b.top-7,border:c.borderTopWidth,padding:c.padding,background:c.backgroundColor,
+            capsule:getComputedStyle(document.querySelector('#tooltip-inner')).backgroundColor,
+            hit:document.elementFromPoint(b.left+b.width/2,b.top+b.height/2).id};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["above"] as? Bool, true)
+        XCTAssertEqual(report["border"] as? String, "0px")
+        XCTAssertEqual(report["padding"] as? String, "0px")
+        XCTAssertEqual(report["background"] as? String, "rgba(0, 0, 0, 0)")
+        XCTAssertEqual(report["capsule"] as? String, "rgb(27, 27, 27)")
+        XCTAssertEqual(report["hit"] as? String, "send")
+        _ = try stringResult("document.querySelector('#send').click(); 'clicked'", in: harness.webView)
+        XCTAssertEqual(try stringResult("String(window.sent)", in: harness.webView), "true")
+        _ = try stringResult("document.querySelector('#tooltip').classList.remove(':popover-open'); document.dispatchEvent(new Event('toggle')); 'closed'", in: harness.webView)
+        settle(0.2)
+        XCTAssertEqual(try stringResult("document.querySelector('#tooltip').getAttribute('data-swift-popover-positioned') || ''", in: harness.webView), "")
+    }
+
     func testPlusMenuAboveLongDraftDoesNotOverlapInputAndCanScrollToLastRow() throws {
         let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.plusMenuHTML)
         defer { harness.close() }
@@ -446,6 +525,40 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     </body></html>
     """
 
+    private static let popoverChromeHTML = """
+    <!doctype html><html><head><style>
+      body {margin:0} #source {position:absolute;left:210px;top:190px}
+      #send {position:fixed;left:540px;bottom:10px;width:40px;height:40px}
+      [popover] {display:none;position:fixed;inset:0;border:3px solid black;padding:4px;margin:auto;background:white;width:max-content;height:max-content}
+      [popover][class] {display:block}
+      #tooltip-inner {background:rgb(27,27,27);color:white;padding:5px 12px;border-radius:20px}
+      #selection-inner {background:white;color:black;padding:8px 12px;border-radius:12px}
+    </style></head><body>
+      <main id="source" tabindex="-1"><a id="email" href="mailto:fixture@example.com">fixture@example.com</a></main>
+      <textarea id="composer"></textarea>
+      <button id="send" style="anchor-name: --send" onclick="window.sent=true">发送</button>
+      <div id="tooltip" role="tooltip" popover="hint" style="position-anchor: --send"><div id="tooltip-inner">发送消息</div></div>
+      <div id="selection" popover="manual" style="position-anchor: --targeted-action-selection"><div id="selection-inner"><button id="ask" onclick="window.actionSelection=String(getSelection())">询问 ChatGPT</button><button>分享所选内容</button></div></div>
+      <script>
+        function selectEmail() {
+          document.querySelector('#source').focus();
+          const r=document.createRange();r.selectNodeContents(document.querySelector('#email'));
+          getSelection().removeAllRanges();getSelection().addRange(r);
+        }
+        // Reproduce the deployed polyfill: beforetoggle, show the panel, focus its first
+        // focusable child even without autofocus, then emit toggle asynchronously.
+        function showPanel(id) {
+          const el=document.getElementById(id);
+          el.dispatchEvent(new ToggleEvent('beforetoggle',{oldState:'closed',newState:'open'}));
+          el.classList.add(':popover-open');
+          const focusable=[el,...el.querySelectorAll('*')].find(x=>x.tabIndex>=0);
+          if(focusable)focusable.focus();
+          setTimeout(()=>el.dispatchEvent(new ToggleEvent('toggle',{oldState:'closed',newState:'open'})),0);
+        }
+      </script>
+    </body></html>
+    """
+
     private func makeArchiveHarness(sink: ScriptMessageSink, baseURL: URL = URL(string: "https://chatgpt.com/c/archive-fixture?mode=fixture")!) throws -> WebViewHarness {
         let harness = try makeHarness(sink: sink, html: """
         <!doctype html><html><body>
@@ -552,6 +665,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         controller.add(sink, name: "completionState")
         controller.add(sink, name: "dialogDismissal")
         controller.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        controller.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
             source: BrowserWindowController.promptDraftCaptureScript,

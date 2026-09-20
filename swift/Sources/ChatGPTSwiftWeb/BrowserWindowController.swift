@@ -111,6 +111,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var isRecoveringArchivedDialog = false
     private var blockedNavigationCount = 0
     private var lastBlockedNavigationSummary = "无"
+    var openMailURL: (URL) -> Bool = { NSWorkspace.shared.open($0) }
 
     init(
         initialURL: URL?,
@@ -1026,6 +1027,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let sourceURL = webView.url
         let cleanedURL = Self.cleanTrackingParameters(from: url)
 
+        if handleMailNavigation(cleanedURL, action: navigationAction) {
+            decisionHandler(.cancel)
+            return
+        }
+
         if let reason = NavigationRules.webViewNavigationBlockReason(cleanedURL, sourceURL: sourceURL) {
             reportBlockedNavigation(
                 reason: reason,
@@ -1241,6 +1247,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         if let url = navigationAction.request.url {
             let cleanedURL = Self.cleanTrackingParameters(from: url)
+            if handleMailNavigation(cleanedURL, action: navigationAction) { return nil }
             if let reason = NavigationRules.webViewNavigationBlockReason(cleanedURL, sourceURL: webView.url) {
                 reportBlockedNavigation(
                     reason: reason,
@@ -1274,6 +1281,17 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         childControllers.append(child)
         child.show()
         return child.webView
+    }
+
+    private func handleMailNavigation(_ url: URL, action: WKNavigationAction) -> Bool {
+        guard url.scheme?.lowercased() == "mailto" else { return false }
+        // A mail link belongs to the system mail handler, never a WebView or an empty popup.
+        guard action.navigationType == .linkActivated, action.sourceFrame.isMainFrame else { return true }
+        clearBlockedNavigationStatus()
+        if !openMailURL(url) {
+            showToast("无法打开邮件应用；可以右键复制邮箱地址。")
+        }
+        return true
     }
 
     func webViewDidClose(_ webView: WKWebView) {
@@ -2505,6 +2523,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if let fingerprint {

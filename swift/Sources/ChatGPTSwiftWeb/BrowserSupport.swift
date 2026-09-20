@@ -1929,6 +1929,157 @@ let composerPlusPopoverFixScript = #"""
 })();
 """#
 
+// ChatGPT's popover polyfill applies UA-like chrome and focuses the first button even
+// without autofocus. Reset only its transparent shells and keep native text selection intact.
+let popoverChromeFixScript = #"""
+(() => {
+  const host = location.hostname.toLowerCase();
+  if (window !== window.top || location.protocol !== 'https:' ||
+      (location.port && location.port !== '443') ||
+      !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
+  if (window.__chatgptSwiftPopoverCompatibility) return;
+  const selectionPanel = '[popover="manual"][style*="--targeted-action-selection"]';
+  const tooltipPanel = '[popover][role="tooltip"]';
+  const panelSelector = selectionPanel + ',' + tooltipPanel;
+  const style = document.createElement('style');
+  style.id = 'chatgpt-swift-popover-chrome';
+  style.textContent = `
+    ${panelSelector} {
+      border: 0 !important; outline: none !important; padding: 0 !important;
+      background: transparent !important; box-shadow: none !important;
+    }
+    [role="tooltip"], [role="tooltip"] * {
+      pointer-events: none !important;
+    }
+    [data-radix-popper-content-wrapper]:has([role="tooltip"]) { pointer-events: none !important; }
+    [data-swift-popover-positioned] {
+      position: fixed !important; inset: auto !important; margin: 0 !important;
+      left: var(--swift-popover-x) !important; top: var(--swift-popover-y) !important;
+      transform: none !important; translate: none !important;
+      position-anchor: auto !important; position-area: none !important;
+      position-try-fallbacks: none !important; position-visibility: always !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+  const open = el => el.isConnected && (el.classList.contains(':popover-open') || el.matches(':popover-open'));
+  const rectSummary = r => r ? {x:r.x,y:r.y,w:r.width,h:r.height} : null;
+  const selectedRect = () => {
+    const s = getSelection();
+    if (!s || s.isCollapsed || !s.rangeCount) return null;
+    const element = s.anchorNode?.nodeType === 1 ? s.anchorNode : s.anchorNode?.parentElement;
+    if (!element?.closest('main,[data-message-author-role]') ||
+        element.closest('[contenteditable="true"],textarea,input,' + panelSelector)) return null;
+    const r = s.getRangeAt(0).getBoundingClientRect();
+    return r.width || r.height ? r : null;
+  };
+  const tooltipAnchor = el => {
+    const name = el.style.getPropertyValue('position-anchor').trim();
+    if (name) {
+      const candidates = [...document.querySelectorAll('[style*="anchor-name"]'),
+        ...el.parentElement.querySelectorAll('button,a,[tabindex]')];
+      const anchor = candidates.find(x => x !== el && getComputedStyle(x).getPropertyValue('anchor-name').split(/[,\s]+/).includes(name));
+      if (anchor) return anchor.getBoundingClientRect();
+    }
+    // Some page versions assign the anchor through a CSS rule on a sibling button.
+    const trigger = el.parentElement.querySelector('button[aria-describedby],#composer-plus-btn');
+    return trigger ? trigger.getBoundingClientRect() : null;
+  };
+  const positioned = new Set();
+  const clearPosition = el => {
+    el.removeAttribute('data-swift-popover-positioned');
+    el.style.removeProperty('--swift-popover-x'); el.style.removeProperty('--swift-popover-y');
+    positioned.delete(el);
+  };
+  const place = (el, anchor, kind) => {
+    const view = window.visualViewport;
+    const minX = (view?.offsetLeft || 0) + 8, minY = (view?.offsetTop || 0) + 8;
+    const maxX = minX + (view?.width || innerWidth) - 16, maxY = minY + (view?.height || innerHeight) - 16;
+    if (anchor.bottom < minY || anchor.top > maxY) return;
+    if (!positioned.has(el)) {
+      el.style.setProperty('--swift-popover-x','0px'); el.style.setProperty('--swift-popover-y','0px');
+      el.setAttribute('data-swift-popover-positioned',kind);
+    }
+    const r = el.getBoundingClientRect();
+    if (!r.width || !r.height) return;
+    const scaleX = r.width / (el.offsetWidth || r.width), scaleY = r.height / (el.offsetHeight || r.height);
+    // Keep ChatGPT's own actions to the side of the selection so PopClip can occupy
+    // its normal upper/left position without either floating surface covering the other.
+    let left, top;
+    if (kind === 'selection') {
+      const topAligned = Math.max(minY, Math.min(anchor.top + (anchor.height-r.height)/2, maxY-r.height));
+      if (anchor.right + 8 + r.width <= maxX) {
+        left = anchor.right + 8;
+        top = topAligned;
+      } else if (anchor.left - 8 - r.width >= minX) {
+        left = anchor.left - r.width - 8;
+        top = topAligned;
+      } else {
+        const above = anchor.top-r.height-8, below = anchor.bottom+8;
+        left = Math.max(minX, Math.min(anchor.left + (anchor.width-r.width)/2, maxX-r.width));
+        top = below+r.height <= maxY ? below : above;
+      }
+    } else {
+      const above = anchor.top-r.height-8, below = anchor.bottom+8;
+      left = Math.max(minX,Math.min(anchor.left + (anchor.width-r.width)/2,maxX-r.width));
+      top = below+r.height <= maxY ? below : above;
+    }
+    // Adjust from the existing position without briefly moving the panel to the corner.
+    const adjust = (property, delta) => {
+      if (Math.abs(delta) < 0.5) return;
+      const previous = parseFloat(el.style.getPropertyValue(property)) || 0;
+      el.style.setProperty(property,(previous+delta)+'px');
+    };
+    adjust('--swift-popover-x',(left-r.left)/scaleX);
+    adjust('--swift-popover-y',(Math.max(minY,Math.min(top,maxY-r.height))-r.top)/scaleY);
+    positioned.add(el);
+  };
+  const reposition = () => {
+    for (const el of [...positioned]) if (!open(el)) clearPosition(el);
+    for (const el of document.querySelectorAll(panelSelector)) {
+      if (!open(el)) continue;
+      const kind = el.matches(selectionPanel) ? 'selection' : 'tooltip';
+      const anchor = kind === 'selection' ? selectedRect() : tooltipAnchor(el);
+      if (anchor) place(el,anchor,kind);
+    }
+  };
+  let timer = 0;
+  const schedule = () => {
+    if (timer) return;
+    timer = setTimeout(() => { timer=0; reposition(); },0);
+  };
+  document.addEventListener('beforetoggle',event => {
+    if (event.newState !== 'open' || !event.target.matches?.(selectionPanel) || !selectedRect()) return;
+    // The polyfill searches tabindex, including ordinary buttons, synchronously after beforetoggle.
+    // Restore every attribute before the next event so click and keyboard navigation remain native.
+    const elements = [event.target,...event.target.querySelectorAll('button,a[href],input,select,textarea,[tabindex],[autofocus]')];
+    const saved = elements.map(el => [el,el.getAttribute('tabindex'),el.getAttribute('autofocus')]);
+    for (const [el] of saved) { el.tabIndex=-1; el.removeAttribute('autofocus'); }
+    queueMicrotask(() => {
+      for (const [el,tabindex,autofocus] of saved) {
+        if (tabindex === null) el.removeAttribute('tabindex'); else el.setAttribute('tabindex',tabindex);
+        if (autofocus !== null) el.setAttribute('autofocus',autofocus);
+      }
+      schedule();
+    });
+  },true);
+  document.addEventListener('selectionchange',schedule,true);
+  document.addEventListener('toggle',schedule,true);
+  document.addEventListener('scroll',schedule,{capture:true,passive:true});
+  window.addEventListener('resize',schedule,{passive:true});
+  window.visualViewport?.addEventListener('resize',schedule);
+  window.visualViewport?.addEventListener('scroll',schedule);
+  document.fonts?.ready.then(schedule);
+  window.__chatgptSwiftPopoverCompatibility = {diagnose:() => ({
+    selectionLength:String(getSelection()).length,selectionRect:rectSummary(selectedRect()),
+    panels:[...document.querySelectorAll(panelSelector)].filter(open).map(el => ({
+      kind:el.matches(selectionPanel)?'selection':'tooltip',rect:rectSummary(el.getBoundingClientRect()),
+      anchor:el.matches(tooltipPanel)?rectSummary(tooltipAnchor(el)):null}))
+  })};
+  schedule();
+})();
+"""#
+
 let nativeShimScript = """
 (() => {
   if (window.__wkNativeShim) return;

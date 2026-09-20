@@ -91,6 +91,30 @@ final class BrowserNavigationNoticeIntegrationTests: XCTestCase {
         XCTAssertEqual(controller.statusLabel?.stringValue, "已阻止不支持的 notice-test: 链接")
     }
 
+    func testMailtoUserClickOpensSystemHandlerWithoutBlockedNotice() throws {
+        let (controller, delegate) = try makeHarness()
+        defer { controller.window.close() }
+        var openedURL: URL?
+        controller.openMailURL = { url in
+            openedURL = url
+            return true
+        }
+
+        let action = try navigate("""
+        const link = document.createElement('a');
+        link.href = 'mailto:12888154@qq.com?subject=fixture';
+        link.textContent = '12888154@qq.com';
+        document.body.append(link);
+        link.click();
+        """, controller: controller, delegate: delegate)
+
+        XCTAssertEqual(action.navigationType, .linkActivated)
+        XCTAssertEqual(delegate.lastPolicy, .cancel)
+        XCTAssertEqual(openedURL?.absoluteString, "mailto:12888154@qq.com?subject=fixture")
+        XCTAssertNil(controller.blockedNavigationStatus)
+        XCTAssertFalse(controller.diagnosticsReport().contains("unsupported scheme"))
+    }
+
     func testBackgroundSubframePopupDoesNotReplaceMainStatus() throws {
         let (controller, delegate) = try makeHarness()
         defer { controller.window.close() }
