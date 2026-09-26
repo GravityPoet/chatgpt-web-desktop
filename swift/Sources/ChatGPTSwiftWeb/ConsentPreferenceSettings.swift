@@ -84,23 +84,31 @@ enum CookieConsentSettings {
             return
         }
 
-        let cookies = rejectionCookies(now: now)
-        guard !cookies.isEmpty else {
-            completion()
-            return
-        }
-
-        let group = DispatchGroup()
-        for cookie in cookies {
-            guard isEnabled(defaults: defaults) else {
-                break
+        // Read-before-write: when the four managed rejection cookies are already correct,
+        // skip the async setCookie batch so first navigation does not pay for redundant writes.
+        // Only managed cookies are inspected; login/security cookies are never touched here.
+        dataStore.httpCookieStore.getAllCookies { existing in
+            if rejectionIsApplied(in: existing) {
+                DispatchQueue.main.async(execute: completion)
+                return
             }
-            group.enter()
-            dataStore.httpCookieStore.setCookie(cookie) {
-                group.leave()
+            let cookies = rejectionCookies(now: now)
+            guard !cookies.isEmpty else {
+                DispatchQueue.main.async(execute: completion)
+                return
             }
+            let group = DispatchGroup()
+            for cookie in cookies {
+                guard isEnabled(defaults: defaults) else {
+                    break
+                }
+                group.enter()
+                dataStore.httpCookieStore.setCookie(cookie) {
+                    group.leave()
+                }
+            }
+            group.notify(queue: .main, execute: completion)
         }
-        group.notify(queue: .main, execute: completion)
     }
 
     static func isManagedRejectionCookie(_ cookie: HTTPCookie) -> Bool {

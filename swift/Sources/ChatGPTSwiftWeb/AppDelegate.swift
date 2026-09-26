@@ -2413,6 +2413,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
     }
 
     private func rebuildMainController(initialURL: URL? = nil) {
+        // Profile switch keeps full WebView rebuild: each profile owns an isolated
+        // WKWebsiteDataStore, so reusing one WebView across profiles would leak cookies
+        // across spaces. Callers (switchToProfile) flush draft/page state via
+        // capturePageState before reaching here.
         let oldController = mainController
         oldController?.persistMainWindowFrame()
         mainController = nil
