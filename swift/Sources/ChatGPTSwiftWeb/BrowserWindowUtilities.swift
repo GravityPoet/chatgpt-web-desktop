@@ -27,6 +27,7 @@ extension BrowserWindowController {
             }
         })
         updateDownloadButton()
+        updateProfileButton()
     }
 
     func stopUtilityObservers() {
@@ -41,10 +42,50 @@ extension BrowserWindowController {
         let active = records.filter { $0.state == .downloading }
         let fractions = active.compactMap(\.progress)
         let percent = fractions.isEmpty ? "" : " · \(Int(fractions.reduce(0, +) / Double(fractions.count) * 100))%"
-        let title = active.isEmpty ? "下载 \(records.count)" : "下载 \(active.count)\(percent)"
+        // Compact: icon-only when idle-empty, short count otherwise. Never a persistent
+        // long "下载 0" title that squeezes the toolbar at narrow widths.
+        let title: String
+        let accessibility: String
+        let toolTip: String
+        if !active.isEmpty {
+            title = active.count > 99 ? "99+" : "\(active.count)"
+            accessibility = "下载中心，\(active.count) 项正在下载\(percent)"
+            toolTip = "打开下载中心（\(active.count) 项正在下载\(percent)）"
+        } else if !records.isEmpty {
+            title = "\(records.count)"
+            accessibility = "下载中心，\(records.count) 项记录"
+            toolTip = "打开下载中心（\(records.count) 项记录）"
+        } else {
+            title = ""
+            accessibility = "下载中心，无记录"
+            toolTip = "打开下载中心"
+        }
         downloadButton?.title = title
-        downloadButton?.setAccessibilityLabel(active.isEmpty ? "下载中心，\(records.count) 项记录" : "\(active.count) 项正在下载\(percent)")
-        downloadButton?.toolTip = "打开下载中心"
+        downloadButton?.imagePosition = title.isEmpty ? .imageOnly : .imageLeading
+        downloadButton?.setAccessibilityLabel(accessibility)
+        downloadButton?.toolTip = toolTip
+        toolbarItems[.chatGPTDownloads]?.label = "下载中心"
+        toolbarItems[.chatGPTDownloads]?.toolTip = toolTip
+        toolbarItems[.chatGPTDownloads]?.menuFormRepresentation?.title = toolTip
+    }
+
+    func updateProfileButton() {
+        let currentID = profileID ?? defaultProfileID
+        let name = ProfileStore.loadProfiles().first(where: { $0.id == currentID })?.name
+            ?? (currentID == defaultProfileID ? "默认" : "账号空间")
+        // Compact icon/dot: full space name lives in tooltip/AX/menu, never as a
+        // persistent long toolbar title.
+        profileButton?.title = ""
+        profileButton?.imagePosition = .imageOnly
+        profileButton?.image = NSImage(systemSymbolName: "person.crop.circle", accessibilityDescription: "账号空间")
+        let toolTip = "账号空间：\(name) — 点击切换"
+        let accessibility = "账号空间，当前\(name)，点击切换账号空间"
+        profileButton?.toolTip = toolTip
+        profileButton?.setAccessibilityLabel(accessibility)
+        toolbarItems[.chatGPTProfile]?.label = "账号空间"
+        toolbarItems[.chatGPTProfile]?.paletteLabel = "账号空间"
+        toolbarItems[.chatGPTProfile]?.toolTip = toolTip
+        toolbarItems[.chatGPTProfile]?.menuFormRepresentation?.title = toolTip
     }
 
     func networkChanged(restored: Bool) {
@@ -82,7 +123,12 @@ extension BrowserWindowController {
         let manage = NSMenuItem(title: "账号空间管理在“文件”菜单中", action: nil, keyEquivalent: "")
         manage.isEnabled = false
         menu.addItem(manage)
-        if let button = profileButton { menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button) }
+        if let button = profileButton, button.window != nil {
+            menu.popUp(positioning: nil, at: NSPoint(x: 0, y: button.bounds.height + 4), in: button)
+        } else {
+            // Overflow items have no visible button to anchor to.
+            menu.popUp(positioning: nil, at: NSEvent.mouseLocation, in: nil)
+        }
     }
 
     static func profileColorImage(id: String) -> NSImage {

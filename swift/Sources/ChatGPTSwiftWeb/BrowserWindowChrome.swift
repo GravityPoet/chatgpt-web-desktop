@@ -7,11 +7,17 @@ private enum NativeToolbarMetrics {
     static let statusHeight: CGFloat = 24
     static let progressWidth: CGFloat = 48
     static let progressSpacing: CGFloat = 8
-    static let statusMinWidth: CGFloat = 160
-    static let statusMaxWidth: CGFloat = 220
+    static let statusMinWidth: CGFloat = 96
+    static let statusMaxWidth: CGFloat = 180
+}
+
+enum NativeToolbarLayout {
+    static let versionKey = "ChatGPTSwiftWeb.Toolbar.LayoutVersion"
+    static let currentVersion = 4
 }
 
 extension NSToolbarItem.Identifier {
+    static let chatGPTNavigation = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Navigation")
     static let chatGPTBack = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Back")
     static let chatGPTForward = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Forward")
     static let chatGPTReload = NSToolbarItem.Identifier("ChatGPTSwiftWeb.Toolbar.Reload")
@@ -32,13 +38,60 @@ extension BrowserWindowController {
         // Upgrade the saved toolbar once; future user customizations remain untouched.
         if persistent && !UserDefaults.standard.bool(forKey: "ChatGPTSwiftWeb.Toolbar.DownloadsIntroduced") {
             if !toolbar.items.contains(where: { $0.itemIdentifier == .chatGPTDownloads }) {
-                toolbar.insertItem(withItemIdentifier: .chatGPTDownloads, at: min(3, toolbar.items.count))
+                let flexibleIndex = toolbar.items.firstIndex(where: { $0.itemIdentifier == .flexibleSpace })
+                let insertAt = flexibleIndex.map { $0 + 1 } ?? min(3, toolbar.items.count)
+                toolbar.insertItem(withItemIdentifier: .chatGPTDownloads, at: min(insertAt, toolbar.items.count))
             }
             UserDefaults.standard.set(true, forKey: "ChatGPTSwiftWeb.Toolbar.DownloadsIntroduced")
         }
+        if persistent { migrateToolbarLayoutIfNeeded(toolbar) }
         if #available(macOS 11.0, *) {
             window.toolbarStyle = .unifiedCompact
         }
+    }
+
+    /// Upgrade stock layouts only. A custom arrangement is user data, not a failed migration.
+    func migrateToolbarLayoutIfNeeded(_ toolbar: NSToolbar, defaults: UserDefaults = .standard) {
+        let stored = defaults.integer(forKey: NativeToolbarLayout.versionKey)
+        if stored >= NativeToolbarLayout.currentVersion {
+            return
+        }
+        let currentIDs = toolbar.items.map(\.itemIdentifier)
+        // Fresh toolbars have no saved items yet; AppKit will query the new defaults below.
+        if currentIDs.isEmpty {
+            defaults.set(NativeToolbarLayout.currentVersion, forKey: NativeToolbarLayout.versionKey)
+            return
+        }
+        let original: [NSToolbarItem.Identifier] = [.chatGPTBack, .chatGPTForward, .chatGPTReload,
+            .chatGPTDownloads, .chatGPTProfile, .flexibleSpace, .chatGPTStatus]
+        let versionTwo: [NSToolbarItem.Identifier] = [.chatGPTBack, .chatGPTForward, .chatGPTReload,
+            .flexibleSpace, .chatGPTDownloads, .chatGPTProfile, .chatGPTStatus]
+        let versionThree: [NSToolbarItem.Identifier] = [.chatGPTBack, .chatGPTForward, .chatGPTReload,
+            .flexibleSpace, .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile]
+        let newOrder = toolbarDefaultItemIdentifiers(toolbar)
+        if currentIDs == original || currentIDs == versionTwo || currentIDs == versionThree {
+            while toolbar.items.count > 0 {
+                toolbar.removeItem(at: 0)
+            }
+            for (index, identifier) in newOrder.enumerated() {
+                toolbar.insertItem(withItemIdentifier: identifier, at: index)
+            }
+        } else if currentIDs.contains(where: { [.chatGPTBack, .chatGPTForward, .chatGPTReload].contains($0) }) {
+            var mapped: [NSToolbarItem.Identifier] = []
+            var inserted = currentIDs.contains(.chatGPTNavigation)
+            for identifier in currentIDs {
+                if [.chatGPTBack, .chatGPTForward, .chatGPTReload].contains(identifier) {
+                    if !inserted { mapped.append(.chatGPTNavigation); inserted = true }
+                } else {
+                    mapped.append(identifier)
+                }
+            }
+            while toolbar.items.count > 0 { toolbar.removeItem(at: 0) }
+            for (index, identifier) in mapped.enumerated() {
+                toolbar.insertItem(withItemIdentifier: identifier, at: index)
+            }
+        }
+        defaults.set(NativeToolbarLayout.currentVersion, forKey: NativeToolbarLayout.versionKey)
     }
 
     func observeWebViewState() {
@@ -86,27 +139,31 @@ extension BrowserWindowController {
     }
 
     func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        [
-            .chatGPTBack,
-            .chatGPTForward,
-            .chatGPTReload,
+        var identifiers: [NSToolbarItem.Identifier] = [
+            .chatGPTNavigation,
             .chatGPTDownloads,
             .chatGPTProfile,
             .chatGPTStatus,
             .flexibleSpace,
             .space
         ]
+        // Keep legacy identifiers available only long enough for a saved pre-group layout
+        // to be read and migrated; never expose them in the current customization palette.
+        if UserDefaults.standard.integer(forKey: NativeToolbarLayout.versionKey) < NativeToolbarLayout.currentVersion {
+            identifiers.insert(contentsOf: [.chatGPTBack, .chatGPTForward, .chatGPTReload], at: 1)
+        }
+        return identifiers
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        // One coherent leading navigation group, then the flexible separator and compact
+        // trailing actions. This keeps macOS titlebar controls from splitting navigation.
         [
-            .chatGPTBack,
-            .chatGPTForward,
-            .chatGPTReload,
-            .chatGPTDownloads,
-            .chatGPTProfile,
+            .chatGPTNavigation,
             .flexibleSpace,
-            .chatGPTStatus
+            .chatGPTStatus,
+            .chatGPTDownloads,
+            .chatGPTProfile
         ]
     }
 
@@ -116,45 +173,74 @@ extension BrowserWindowController {
         willBeInsertedIntoToolbar flag: Bool
     ) -> NSToolbarItem? {
         switch itemIdentifier {
+        case .chatGPTNavigation:
+            return makeNavigationToolbarItem(identifier: itemIdentifier)
         case .chatGPTBack:
-            return makeToolbarItem(
+            let item = makeToolbarItem(
                 identifier: itemIdentifier,
                 label: "后退",
                 symbolName: "chevron.left",
                 action: #selector(goBack(_:))
             )
+            item.visibilityPriority = .high
+            return item
         case .chatGPTForward:
-            return makeToolbarItem(
+            let item = makeToolbarItem(
                 identifier: itemIdentifier,
                 label: "前进",
                 symbolName: "chevron.right",
                 action: #selector(goForward(_:))
             )
+            item.visibilityPriority = .high
+            return item
         case .chatGPTReload:
-            return makeToolbarItem(
+            let item = makeToolbarItem(
                 identifier: itemIdentifier,
                 label: "重新加载",
                 symbolName: "arrow.clockwise",
                 action: #selector(reload(_:))
             )
+            item.visibilityPriority = .high
+            return item
         case .chatGPTDownloads, .chatGPTProfile:
             let isDownload = itemIdentifier == .chatGPTDownloads
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
             item.label = isDownload ? "下载中心" : "账号空间"
             item.paletteLabel = item.label
-            let button = NSButton(title: isDownload ? "下载" : "账号空间", target: self,
+            item.visibilityPriority = .standard
+            // Compact icon-first buttons: full meaning lives in tooltip/AX/menu, not in
+            // a persistent long title that squeezes the toolbar at ~900-1038px.
+            let button = NSButton(title: "", target: self,
                                   action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
             button.bezelStyle = .texturedRounded
             button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
-            button.imagePosition = .imageLeading
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(greaterThanOrEqualToConstant: 36),
+                button.heightAnchor.constraint(equalToConstant: 28)
+            ])
             button.setAccessibilityLabel(item.label)
+            button.toolTip = item.label
             item.view = button
+            if isDownload {
+                let menuItem = NSMenuItem(title: "打开下载中心", action: #selector(showDownloads(_:)), keyEquivalent: "")
+                menuItem.target = self
+                item.menuFormRepresentation = menuItem
+            } else {
+                let menuItem = NSMenuItem(title: "账号空间", action: #selector(showProfileSwitcher(_:)), keyEquivalent: "")
+                menuItem.target = self
+                item.menuFormRepresentation = menuItem
+            }
             if isDownload { downloadButton = button } else { profileButton = button }
             toolbarItems[itemIdentifier] = item
-            if isDownload { updateDownloadButton() }
+            if isDownload { updateDownloadButton() } else { updateProfileButton() }
             return item
         case .chatGPTStatus:
-            return makeStatusToolbarItem(identifier: itemIdentifier)
+            let item = makeStatusToolbarItem(identifier: itemIdentifier)
+            item.visibilityPriority = .low
+            return item
         default:
             return nil
         }
@@ -168,18 +254,14 @@ extension BrowserWindowController {
             return
         }
 
+        navigationBackButton?.isEnabled = webView.canGoBack
+        navigationForwardButton?.isEnabled = webView.canGoForward
         toolbarItems[.chatGPTBack]?.isEnabled = webView.canGoBack
         toolbarItems[.chatGPTForward]?.isEnabled = webView.canGoForward
-
-        let reloadItem = toolbarItems[.chatGPTReload]
-        if isShowingBlankContent {
-            reloadItem?.label = "恢复"
-            reloadItem?.paletteLabel = "恢复"
-            reloadItem?.toolTip = "恢复空白页面"
-        } else {
-            reloadItem?.label = "重新加载"
-            reloadItem?.paletteLabel = "重新加载"
-            reloadItem?.toolTip = "重新加载"
+        updateRefreshButtonAppearance()
+        if let menuItems = toolbarItems[.chatGPTNavigation]?.menuFormRepresentation?.submenu?.items {
+            menuItems[0].isEnabled = webView.canGoBack
+            menuItems[1].isEnabled = webView.canGoForward
         }
 
         if let blockedNavigationStatus {
@@ -198,7 +280,8 @@ extension BrowserWindowController {
         } else {
             let location = Self.statusLocationText(for: webView.url)
             let zoom = Int(round(currentZoom * 100))
-            setStatus("\(location) · \(zoom)%", showsProgress: false)
+            setStatus("\(location) · \(zoom)%", showsProgress: false,
+                      quiet: Self.canInjectPromptContent(into: webView.url) && zoom == 100)
         }
 
         window.toolbar?.validateVisibleItems()
@@ -214,7 +297,7 @@ extension BrowserWindowController {
         return "未载入"
     }
 
-    func setStatus(_ text: String, showsProgress: Bool) {
+    func setStatus(_ text: String, showsProgress: Bool, quiet: Bool = false) {
         if blockedNavigationStatus != nil, text != blockedNavigationStatus {
             clearBlockedNavigationStatus()
         }
@@ -224,21 +307,32 @@ extension BrowserWindowController {
         if statusLabel != nil {
             guard text != lastPresentedStatusText
                     || showsProgress != lastPresentedStatusShowsProgress
+                    || quiet != lastPresentedStatusIsQuiet
                     || progressPercent != lastPresentedProgressPercent else {
                 return
             }
             lastPresentedStatusText = text
             lastPresentedStatusShowsProgress = showsProgress
+            lastPresentedStatusIsQuiet = quiet
             lastPresentedProgressPercent = progressPercent
         }
 
-        statusLabel?.stringValue = text
+        statusLabel?.stringValue = quiet ? "" : text
         statusLabel?.setAccessibilityLabel(text)
         statusContainer?.setAccessibilityLabel(text)
+        toolbarItems[.chatGPTStatus]?.menuFormRepresentation?.title = text
+        toolbarItems[.chatGPTStatus]?.toolTip = text
+        if #available(macOS 15.0, *) {
+            toolbarItems[.chatGPTStatus]?.isHidden = quiet
+        }
+        statusContainer?.isHidden = quiet
+        for (index, constraint) in statusInsetConstraints.enumerated() {
+            constraint.constant = quiet ? 0 : (index == 0 ? 1 : -1) * NativeToolbarMetrics.statusHorizontalPadding
+        }
         progressIndicator?.isHidden = !showsProgress
         statusProgressWidthConstraint?.constant = showsProgress ? NativeToolbarMetrics.progressWidth : 0
         statusProgressLabelSpacingConstraint?.constant = showsProgress ? NativeToolbarMetrics.progressSpacing : 0
-        let statusWidth = Self.statusToolbarWidth(
+        let statusWidth = quiet ? 0 : Self.statusToolbarWidth(
             label: statusLabel,
             showsProgress: showsProgress,
             fallbackText: text
@@ -267,6 +361,90 @@ extension BrowserWindowController {
         item.action = action
         item.image = image ?? NSImage(systemSymbolName: symbolName, accessibilityDescription: label)
         toolbarItems[identifier] = item
+        return item
+    }
+
+    private func makeNavigationToolbarItem(identifier: NSToolbarItem.Identifier) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = "导航"
+        item.paletteLabel = "导航"
+        item.toolTip = "后退、前进、重新加载"
+        item.visibilityPriority = .high
+        item.isNavigational = true
+
+        // Three 28 pt targets, two 2 pt gaps, and breathing room before the window title.
+        let stack = NSStackView(frame: NSRect(x: 0, y: 0, width: 104, height: 28))
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 2
+        stack.edgeInsets = NSEdgeInsets(top: 0, left: 2, bottom: 0, right: 14)
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            stack.widthAnchor.constraint(equalToConstant: 104),
+            stack.heightAnchor.constraint(equalToConstant: 28)
+        ])
+        stack.setAccessibilityElement(true)
+        stack.setAccessibilityRole(.group)
+        stack.setAccessibilityLabel("导航")
+
+        func makeButton(_ label: String, _ symbol: String, _ action: Selector) -> NSButton {
+            let button = NSButton(title: "", target: self, action: action)
+            button.bezelStyle = .texturedRounded
+            button.isBordered = true
+            button.showsBorderOnlyWhileMouseInside = true
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: label)
+            button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .medium)
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleProportionallyDown
+            button.toolTip = label
+            button.setAccessibilityLabel(label)
+            button.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                button.widthAnchor.constraint(equalToConstant: 28),
+                button.heightAnchor.constraint(equalToConstant: 28)
+            ])
+            return button
+        }
+
+        let back = makeButton("后退", "chevron.backward", #selector(goBack(_:)))
+        let forward = makeButton("前进", "chevron.forward", #selector(goForward(_:)))
+        let reload = makeButton("重新加载", "arrow.clockwise", #selector(reload(_:)))
+        back.isEnabled = webView.canGoBack
+        forward.isEnabled = webView.canGoForward
+        navigationBackButton = back
+        navigationForwardButton = forward
+        navigationReloadButton = reload
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .small
+        spinner.isIndeterminate = true
+        spinner.isHidden = true
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        reload.addSubview(spinner)
+        NSLayoutConstraint.activate([
+            spinner.centerXAnchor.constraint(equalTo: reload.centerXAnchor),
+            spinner.centerYAnchor.constraint(equalTo: reload.centerYAnchor),
+            spinner.widthAnchor.constraint(equalToConstant: 16),
+            spinner.heightAnchor.constraint(equalToConstant: 16)
+        ])
+        navigationReloadSpinner = spinner
+        stack.addArrangedSubview(back)
+        stack.addArrangedSubview(forward)
+        stack.addArrangedSubview(reload)
+        let menu = NSMenu(title: "导航")
+        menu.autoenablesItems = false
+        for button in [back, forward, reload] {
+            let entry = NSMenuItem(title: button.toolTip ?? "", action: button.action, keyEquivalent: "")
+            entry.target = self
+            entry.isEnabled = button.isEnabled
+            menu.addItem(entry)
+        }
+        let menuItem = NSMenuItem(title: "导航", action: nil, keyEquivalent: "")
+        menuItem.submenu = menu
+        item.menuFormRepresentation = menuItem
+        item.view = stack
+        toolbarItems[identifier] = item
+        updateRefreshButtonAppearance()
         return item
     }
 
@@ -312,19 +490,22 @@ extension BrowserWindowController {
             constant: 0
         )
 
-        NSLayoutConstraint.activate([
-            progress.leadingAnchor.constraint(
+        let leadingInset = progress.leadingAnchor.constraint(
                 equalTo: container.leadingAnchor,
                 constant: NativeToolbarMetrics.statusHorizontalPadding
-            ),
+            )
+        let trailingInset = label.trailingAnchor.constraint(
+                equalTo: container.trailingAnchor,
+                constant: -NativeToolbarMetrics.statusHorizontalPadding
+            )
+        statusInsetConstraints = [leadingInset, trailingInset]
+        NSLayoutConstraint.activate([
+            leadingInset,
             progress.centerYAnchor.constraint(equalTo: container.centerYAnchor),
             progressWidthConstraint,
 
             progressLabelSpacingConstraint,
-            label.trailingAnchor.constraint(
-                equalTo: container.trailingAnchor,
-                constant: -NativeToolbarMetrics.statusHorizontalPadding
-            ),
+            trailingInset,
             label.centerYAnchor.constraint(equalTo: container.centerYAnchor),
 
             widthConstraint,
@@ -334,7 +515,11 @@ extension BrowserWindowController {
         let item = NSToolbarItem(itemIdentifier: identifier)
         item.label = "状态"
         item.paletteLabel = "状态"
+        item.toolTip = label.stringValue
         item.view = container
+        let menuItem = NSMenuItem(title: label.stringValue, action: nil, keyEquivalent: "")
+        menuItem.isEnabled = false
+        item.menuFormRepresentation = menuItem
         progressIndicator = progress
         statusLabel = label
         statusContainer = container

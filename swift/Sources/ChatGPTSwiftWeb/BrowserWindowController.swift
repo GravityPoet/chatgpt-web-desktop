@@ -53,6 +53,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var utilityObservers: [NSObjectProtocol] = []
     var downloadButton: NSButton?
     var profileButton: NSButton?
+    var navigationBackButton: NSButton?
+    var navigationForwardButton: NSButton?
+    var navigationReloadButton: NSButton?
+    var navigationReloadSpinner: NSProgressIndicator?
+    let refreshFeedback = BrowserRefreshFeedback()
+    var refreshButtonState: RefreshButtonState { refreshFeedback.state }
     var hasFailedNavigation = false
     var lastFailureStatus: String?
     var networkRetryPending = false
@@ -97,6 +103,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var isNativeChromeUpdateScheduled = false
     var lastPresentedStatusText: String?
     var lastPresentedStatusShowsProgress = false
+    var lastPresentedStatusIsQuiet = false
     var lastPresentedProgressPercent = -1
     var toolbarItems: [NSToolbarItem.Identifier: NSToolbarItem] = [:]
     var statusLabel: NSTextField?
@@ -104,6 +111,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var statusWidthConstraint: NSLayoutConstraint?
     var statusProgressWidthConstraint: NSLayoutConstraint?
     var statusProgressLabelSpacingConstraint: NSLayoutConstraint?
+    var statusInsetConstraints: [NSLayoutConstraint] = []
     var progressIndicator: NSProgressIndicator?
     var webViewObservations: [NSKeyValueObservation] = []
     private(set) var blockedNavigationStatus: String?
@@ -131,6 +139,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         self.closeHandler = closeHandler
         self.ownsNativeMessageHandlers = configuration == nil
         super.init()
+        refreshFeedback.onChange = { [weak self] in
+            self?.updateRefreshButtonAppearance()
+        }
         Self.controllers.append(self)
 
         let webConfiguration = configuration ?? Self.makeConfiguration(messageHandler: self, persistent: persistent, profileID: profileID)
@@ -220,21 +231,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func reload(_ sender: Any?) {
-        guard !isDisposing else { return }
-        if hasFailedNavigation {
-            hardReload()
-            return
-        }
-        if isShowingBlankContent {
-            setStatus("正在恢复空白页面…", showsProgress: true)
-            recoverFromBlankContent(reason: "reload action")
-            return
-        }
-
-        // Reload immediately instead of waiting for a JS probe round-trip: when the page's main
-        // thread is busy (exactly when users reach for reload) the probe callback is delayed and the
-        // reload feels stuck. Blank pages are still caught by the scheduled post-navigation probe.
-        webView.reload()
+        guard !isDisposing, refreshFeedback.beginRefresh() else { return }
+        // Start feedback synchronously, without waiting for JavaScript on a busy page.
+        let navigation = hasFailedNavigation || isShowingBlankContent ? hardReload() : webView.reload()
+        refreshFeedback.trackRequestedNavigation(navigation)
     }
 
     /// True when the web view has no live, loaded content — the content process crashed, a provisional
@@ -245,12 +245,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     /// Re-issue a full load (restarting a dead content process) instead of refreshing the back-forward
     /// list. Falls back to the profile homepage when there is no current URL to recover.
-    func hardReload(ignoringCache: Bool = false) {
-        guard !isDisposing else { return }
+    @discardableResult
+    func hardReload(ignoringCache: Bool = false) -> WKNavigation? {
+        guard !isDisposing else { return nil }
         let target = (hasFailedNavigation ? lastRequestedURL : webView.url) ?? webView.url ?? ProfileStore.homepageURL(for: profileID ?? defaultProfileID)
         let cachePolicy: URLRequest.CachePolicy = ignoringCache ? .reloadIgnoringLocalCacheData : .useProtocolCachePolicy
         webView.stopLoading()
-        webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID, cachePolicy: cachePolicy))
+        return webView.load(Self.privacyRequest(for: target, sourceURL: nil, profileID: profileID, cachePolicy: cachePolicy))
     }
 
     var canGoBack: Bool {
@@ -341,7 +342,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 return
             }
             var parts: [String] = []
+            if let version = values["version"] { parts.append("v=\(version)") }
             if let vw = values["vw"], let vh = values["vh"] { parts.append("viewport=\(vw)x\(vh)") }
+            if let open = values["open"] { parts.append("open=\(open)") }
+            if let wakes = values["wakes"], let skips = values["skips"] { parts.append("wakes=\(wakes) skips=\(skips)") }
+            if let reason = values["lastReason"] as? String { parts.append("lastReason=\(reason)") }
             if let age = values["lastClickMsAgo"] { parts.append("lastClickMsAgo=\(age)") }
             if let triggers = values["triggers"] as? [[String: Any]] {
                 parts.append("triggers=\(triggers.count)")
@@ -387,6 +392,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("历史当前项", currentItemURL.map(Self.loggableURL) ?? "nil"),
             ("标题", DiagnosticRedactor.pageTitle(webView.title)),
             ("isLoading", webView.isLoading ? "true" : "false"),
+            ("refreshButtonState", refreshFeedback.state.rawValue),
             ("estimatedProgress", String(format: "%.3f", webView.estimatedProgress)),
             ("canGoBack / canGoForward", "\(webView.canGoBack) / \(webView.canGoForward)"),
             ("zoom", "\(Int(round(currentZoom * 100)))%"),
@@ -791,6 +797,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         didTearDownWebView = true
+        refreshFeedback.invalidate()
+        navigationReloadSpinner?.stopAnimation(nil)
         stopUtilityObservers()
         cancelNativeDownloads()
         webView.stopLoading()
@@ -898,7 +906,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             let textLength = Self.intValue(report["textLength"])
             let visibleElements = Self.intValue(report["visibleElements"])
             let bodyChildren = Self.intValue(report["bodyChildren"])
-            lastRenderProbeSummary = "blank=\(isBlank), cloudflareChallenge=\(isChallenge), readyState=\(readyState), textLength=\(textLength), visibleElements=\(visibleElements), bodyChildren=\(bodyChildren)"
+            let domCount = Self.intValue(report["domCount"])
+            lastRenderProbeSummary = "blank=\(isBlank), cloudflareChallenge=\(isChallenge), readyState=\(readyState), textLength=\(textLength), visibleElements=\(visibleElements), bodyChildren=\(bodyChildren), domCount=\(domCount)"
             updateNativeChromeStatus()
 
             if isChallenge {
@@ -991,6 +1000,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        guard refreshFeedback.navigationStarted(navigation) else { return }
         navigationHTTPFailure = nil
         isAssistantResponseInProgress = false
         lastNavigationStartedAt = Date()
@@ -1056,6 +1066,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
            navigationAction.targetFrame?.isMainFrame == true {
             // Links flagged for download (e.g. <a download> for large blob/data exports) stream to disk
             // through WKDownload instead of the base64 bridge, so there is no size ceiling.
+            refreshFeedback.navigationBecameDownload()
             decisionHandler(.download)
             return
         }
@@ -1119,7 +1130,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                sourceURL: sourceURL,
                profileID: profileID
            ) {
-            webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: sourceURL, profileID: profileID))
+            let replacement = webView.load(Self.privacyRequest(for: cleanedURL, sourceURL: sourceURL, profileID: profileID))
+            if refreshFeedback.isManualRefresh, refreshFeedback.state == .loading {
+                refreshFeedback.trackRequestedNavigation(replacement)
+            }
             decisionHandler(.cancel)
             return
         }
@@ -1132,25 +1146,37 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
         if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
-            if (500...599).contains(response.statusCode) {
-                navigationHTTPFailure = "服务暂不可用（HTTP \(response.statusCode)），可以稍后重试"
-            } else if response.statusCode == 429 {
-                navigationHTTPFailure = "请求过于频繁（HTTP 429），请稍后重试"
-            }
+            navigationHTTPFailure = Self.navigationHTTPFailureMessage(for: response.statusCode)
         }
         if !navigationResponse.canShowMIMEType {
+            if navigationResponse.isForMainFrame { refreshFeedback.navigationBecameDownload() }
             decisionHandler(.download)
         } else { decisionHandler(.allow) }
+    }
+
+    static func navigationHTTPFailureMessage(for statusCode: Int) -> String? {
+        if (500...599).contains(statusCode) {
+            return "服务暂不可用（HTTP \(statusCode)），可以稍后重试"
+        }
+        if statusCode == 429 {
+            return "请求过于频繁（HTTP 429），请稍后重试"
+        }
+        if (400...499).contains(statusCode) {
+            return "页面请求未完成（HTTP \(statusCode)），可以重试"
+        }
+        return nil
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        guard refreshFeedback.accepts(navigation) else { return }
         lastNavigationFinishedAt = Date()
         if let navigationHTTPFailure {
             hasFailedNavigation = true
             lastFailureStatus = navigationHTTPFailure
+            refreshFeedback.navigationFailed(navigation)
             stopLoadingWatchdog()
             showStatusOverlay(.failed(navigationHTTPFailure))
             updateNativeChromeStatus()
@@ -1163,6 +1189,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             firstNavigationFinishedAt = lastNavigationFinishedAt
         }
         stopLoadingWatchdog()
+        if refreshFeedback.navigationFinished(navigation), let navigation {
+            verifyRefreshedPage(navigation: navigation)
+        }
         showStatusOverlay(.hidden)
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
@@ -1176,6 +1205,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        refreshFeedback.processTerminated()
         // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
         // window self-heals instead of stranding the user on a blank page.
         webContentProcessTerminationCount += 1
@@ -1198,7 +1228,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        guard refreshFeedback.accepts(navigation) else { return }
         guard !Self.isBenignNavigationError(error) else {
+            refreshFeedback.navigationCancelled(navigation)
             updateNativeChromeStatus()
             return
         }
@@ -1212,6 +1244,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         hasFailedNavigation = true
         networkRetryPending = !networkRetryUsed
         let failure = NavigationFailure.description(for: error, offline: NetworkStatusMonitor.shared.availability == .offline)
+        refreshFeedback.navigationFailed(navigation)
         lastFailureStatus = failure
         setStatus(failure, showsProgress: false)
         showStatusOverlay(.failed(failure))
@@ -1222,7 +1255,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        guard refreshFeedback.accepts(navigation) else { return }
         guard !Self.isBenignNavigationError(error) else {
+            refreshFeedback.navigationCancelled(navigation)
             updateNativeChromeStatus()
             return
         }
@@ -1235,6 +1270,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         hasFailedNavigation = true
         networkRetryPending = !networkRetryUsed
         let failure = NavigationFailure.description(for: error, offline: NetworkStatusMonitor.shared.availability == .offline)
+        refreshFeedback.navigationFailed(navigation)
         lastFailureStatus = failure
         setStatus(failure, showsProgress: false)
         showStatusOverlay(.failed(failure))
@@ -2373,7 +2409,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
           title: document.title,
           textLength: 0,
           visibleElements: 0,
-          bodyChildren: document.body ? document.body.children.length : 0
+          bodyChildren: document.body ? document.body.children.length : 0,
+          domCount: document.getElementsByTagName('*').length
         };
       }
 
@@ -2415,6 +2452,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
       }
 
       const bodyChildren = body ? body.children.length : 0;
+      const domCount = document.getElementsByTagName('*').length;
       return {
         blank: !cloudflareChallenge && (!body || (textLength < 8 && visibleElements === 0)),
         cloudflareChallenge,
@@ -2423,7 +2461,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         title: document.title,
         textLength,
         visibleElements,
-        bodyChildren
+        bodyChildren,
+        domCount
       };
     })()
     """
@@ -2504,6 +2543,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         """
     }
 
+    static func shouldInjectDraftCapture(persistent: Bool, draftRestoreEnabled: Bool) -> Bool {
+        // Keep the lightweight bridge installed for persistent windows even when capture is
+        // disabled. The settings toggle can then reconfigure the existing page without
+        // rebuilding a WKWebView (and page-state restoration remains available).
+        persistent
+    }
+
     private static func makeConfiguration(messageHandler: WKScriptMessageHandler, persistent: Bool, profileID: String?) -> WKWebViewConfiguration {
         let userContentController = WKUserContentController()
         userContentController.add(messageHandler, name: "downloadBlob")
@@ -2520,7 +2566,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: openAIPasskeyFallbackScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         userContentController.addUserScript(WKUserScript(source: downloadBridgeScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: "window.__chatgptSwiftPersistent = \(persistent ? "true" : "false"); window.__chatgptSwiftDraftEnabled = \(persistent && PromptDraftStore.isRestoreEnabled() ? "true" : "false");", injectionTime: .atDocumentStart, forMainFrameOnly: true))
-        userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        // Page-state capture and live preference changes need the bridge even when drafts
+        // are disabled. Input capture itself is gated inside the script.
+        if Self.shouldInjectDraftCapture(persistent: persistent, draftRestoreEnabled: PromptDraftStore.isRestoreEnabled()) {
+            userContentController.addUserScript(WKUserScript(source: promptDraftCaptureScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))

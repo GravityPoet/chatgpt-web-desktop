@@ -1791,6 +1791,11 @@ let composerPlusPopoverFixScript = #"""
   const rectSummary = r => ({x:Math.round(r.left),y:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)});
   const saved = new Map();
   let lastFix = null, lastClick = 0, timer = 0, resizeTargets = [];
+  let menuOpen = false;
+  let currentTrigger = null, menuTargets = [], discovering = false, discoveryTimer = 0;
+  let trackingViewport = false;
+  const stats = {wakes:0, skips:0, lastReason:'init', placementMs:0, maxPlacementMs:0};
+  const wakeSelector = triggerSelector + ',' + menuSelector;
   const write = (el, property, value) => {
     let properties = saved.get(el);
     if (!properties) { properties = new Map(); saved.set(el, properties); }
@@ -1827,13 +1832,20 @@ let composerPlusPopoverFixScript = #"""
     }
     return menus.filter(menu => !menus.some(other => other !== menu && other.box.contains(menu.box)));
   };
-  const reposition = () => {
+  const reposition = (reason) => {
     const trigger = Array.from(document.querySelectorAll(triggerSelector)).find(visible);
+    currentTrigger = trigger || null;
     const composer = trigger && composerFor(trigger);
     const menus = !blocked() && composer ? findMenus(trigger) : [];
     const keep = new Set(menus.flatMap(({box,content}) => [box,content]));
     for (const el of saved.keys()) if (!keep.has(el)) restore(el);
+    menuOpen = !!(composer && menus.length);
+    menuTargets = menus.map(menu => menu.box);
+    if (menuOpen) { discovering = false; clearTimeout(discoveryTimer); }
+    trackViewport(menuOpen);
     if (!composer || !menus.length) { watchSizes([]); return; }
+    // Read phase: batch all geometry reads before any style write to avoid
+    // interleaved read/write layout thrash across menus.
     const anchor = trigger.getBoundingClientRect(), editor = composer.editor.getBoundingClientRect();
     const view = window.visualViewport;
     const bounds = {left:(view?.offsetLeft || 0)+12,top:(view?.offsetTop || 0)+12,
@@ -1843,6 +1855,7 @@ let composerPlusPopoverFixScript = #"""
     const below = Math.max(anchor.bottom, editor.bottom) + 8;
     const above = Math.min(anchor.top, editor.top) - 8;
     const roomBelow = Math.max(0, bounds.bottom - below), roomAbove = Math.max(0, above - bounds.top);
+    const plans = [];
     for (const {box,content} of menus) {
       const before = box.getBoundingClientRect();
       const scaleX = before.width / (box.offsetWidth || before.width);
@@ -1852,6 +1865,11 @@ let composerPlusPopoverFixScript = #"""
       const placement = roomBelow >= Math.min(naturalHeight, 144) || roomBelow >= roomAbove ? 'bottom' : 'top';
       const room = placement === 'bottom' ? roomBelow : roomAbove;
       if (room < 1) continue;
+      plans.push({box,content,before,scaleX,scaleY,placement,room});
+    }
+    // Write phase: no geometry reads except the single transformed-ancestor origin
+    // probe and the final verification rect per menu.
+    for (const {box,content,before,scaleX,scaleY,placement,room} of plans) {
       write(box,'box-sizing','border-box');
       write(box,'max-width',Math.max(1,(bounds.right-bounds.left)/scaleX)+'px');
       write(box,'max-height',(room/scaleY)+'px');
@@ -1883,49 +1901,127 @@ let composerPlusPopoverFixScript = #"""
     }
     watchSizes([trigger,composer.editor,composer.element,...menus.flatMap(m => [m.box,m.content])]);
   };
-  const schedule = () => {
+  const schedule = (reason) => {
     if (timer) return;
+    // Closed menus ignore scroll/resize/viewport/input wakeups: those fire constantly
+    // during long-conversation streaming and scrolling but cannot affect placement
+    // until the menu mounts. Click/toggle/mutation still wake to detect opening.
+    const reasonText = String(reason || 'unknown');
+    if (!menuOpen && (reasonText === 'scroll' || reasonText === 'resize' || reasonText === 'viewport' || reasonText === 'input')) {
+      stats.skips++; stats.lastReason = ('skip-closed:' + reasonText).slice(0, 64);
+      return;
+    }
+    stats.wakes++; stats.lastReason = String(reason || 'unknown').slice(0, 64);
     // Hidden WKWebViews suspend animation frames; a bounded task also covers
     // menu mount, background activation and layout tests without a polling loop.
     timer = setTimeout(() => {
       timer = 0;
       mutations.disconnect();
-      try { reposition(); } finally { observeMutations(); }
+      const started = performance.now();
+      try { reposition(reason); } finally {
+        const elapsed = performance.now() - started;
+        stats.placementMs += elapsed; stats.maxPlacementMs = Math.max(stats.maxPlacementMs,elapsed);
+        observeMutations();
+      }
     }, 0);
   };
-  const sizes = new ResizeObserver(schedule);
+  const sizes = new ResizeObserver(() => schedule('resize'));
   const watchSizes = elements => {
     const next = Array.from(new Set(elements));
     if (next.length === resizeTargets.length && next.every(el => resizeTargets.includes(el))) return;
     sizes.disconnect(); resizeTargets = next;
     next.forEach(el => sizes.observe(el));
   };
+  const nodeRelevant = node => {
+    if (!(node instanceof Element)) return false;
+    if (node.matches(wakeSelector)) return true;
+    // Only inspect element subtrees; text-token appends (Text nodes) never qualify.
+    if (node.childElementCount && node.querySelector(wakeSelector)) return true;
+    return false;
+  };
+  const targetRelevant = target => {
+    if (!(target instanceof Element)) return false;
+    if (saved.has(target)) return true;
+    if (target.matches(wakeSelector)) return true;
+    if (target.closest(wakeSelector)) return true;
+    return false;
+  };
   const mutations = new MutationObserver(records => {
-    if (records.some(record => record.type === 'childList' || saved.has(record.target) ||
-        record.target.matches?.(triggerSelector + ',' + menuSelector))) schedule();
+    let relevant = false, reason = '';
+    for (const record of records) {
+      if (record.type === 'attributes') {
+        if (targetRelevant(record.target)) { relevant = true; reason = 'attr:' + (record.attributeName || ''); break; }
+        continue;
+      }
+      if (saved.has(record.target) || targetRelevant(record.target)) { relevant = true; reason = 'childlist-target'; break; }
+      for (const node of record.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (nodeRelevant(node)) { relevant = true; reason = 'childlist-added'; break; }
+      }
+      if (relevant) break;
+      for (const node of record.removedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (nodeRelevant(node) || saved.has(node)) { relevant = true; reason = 'childlist-removed'; break; }
+      }
+      if (relevant) break;
+    }
+    if (relevant) schedule(reason);
+    else { stats.skips++; stats.lastReason = 'skip-mutation'; }
   });
-  const observeMutations = () => mutations.observe(document.documentElement,{childList:true,subtree:true,attributes:true,
-    attributeFilter:['style','class','hidden','data-state','aria-expanded','aria-hidden']});
+  const observeMutations = () => {
+    mutations.disconnect();
+    const attributes = {attributes:true, attributeFilter:['style','class','hidden','data-state','aria-expanded','aria-hidden']};
+    if (currentTrigger?.isConnected) mutations.observe(currentTrigger,attributes);
+    for (const box of menuTargets) {
+      if (!box.isConnected) continue;
+      mutations.observe(box,{...attributes,childList:true,subtree:true});
+      if (box.parentElement) mutations.observe(box.parentElement,{childList:true});
+    }
+    // Portal discovery is bounded to an explicit open attempt. Conversation mutations
+    // are never observed while idle; ordinary composer edits cannot cause placement.
+    if (discovering) mutations.observe(document.documentElement,{childList:true,subtree:true});
+  };
+  const beginDiscovery = () => {
+    discovering = true; clearTimeout(discoveryTimer);
+    discoveryTimer = setTimeout(() => { discovering=false; observeMutations(); },1500);
+    observeMutations();
+  };
+  const onScroll = () => schedule('scroll');
+  const onResize = () => schedule('resize');
+  const onViewport = () => schedule('viewport');
+  const onInput = event => { if (event.target instanceof Element && event.target.matches(editorSelector)) schedule('input'); };
+  const trackViewport = enabled => {
+    if (trackingViewport === enabled) return;
+    trackingViewport = enabled;
+    const method = enabled ? 'addEventListener' : 'removeEventListener';
+    document[method]('input',onInput,true);
+    document[method]('scroll',onScroll,true);
+    window[method]('resize',onResize);
+    window.visualViewport?.[method]('resize',onViewport);
+    window.visualViewport?.[method]('scroll',onViewport);
+  };
   const diagnose = () => {
     const triggers = Array.from(document.querySelectorAll(triggerSelector)).filter(visible);
     const menus = triggers.flatMap(findMenus);
-    return {version:2,vw:innerWidth,vh:innerHeight,
+    return {version:4,vw:innerWidth,vh:innerHeight,open:menuOpen,discovering,
+      wakes:stats.wakes,skips:stats.skips,lastReason:stats.lastReason,
+      placementMs:Math.round(stats.placementMs*100)/100,maxPlacementMs:Math.round(stats.maxPlacementMs*100)/100,
       triggers:triggers.map(el => ({label:el.getAttribute('aria-label') || el.id,rect:rectSummary(el.getBoundingClientRect())})),
       menus:menus.map(({box}) => ({kind:'plus',rect:rectSummary(box.getBoundingClientRect()),open:visible(box),fixed:box.dataset.chatgptSwiftPlusFixed || ''})),
       lastClickMsAgo:lastClick ? Date.now()-lastClick : -1,lastFix};
   };
   window.__chatgptSwiftPlusPopoverFix = {reposition:schedule,diagnose};
   document.addEventListener('click',event => {
-    if (event.target instanceof Element && event.target.closest(triggerSelector)) { lastClick=Date.now(); schedule(); }
+    if (event.target instanceof Element && event.target.closest(triggerSelector)) {
+      lastClick=Date.now(); beginDiscovery(); schedule('click');
+    }
   },true);
-  document.addEventListener('toggle',schedule,true);
-  document.addEventListener('input',event => { if (event.target instanceof Element && event.target.matches(editorSelector)) schedule(); },true);
-  document.addEventListener('scroll',schedule,{capture:true,passive:true});
-  window.addEventListener('resize',schedule,{passive:true});
-  window.visualViewport?.addEventListener('resize',schedule);
-  window.visualViewport?.addEventListener('scroll',schedule);
+  document.addEventListener('toggle',event => {
+    if (event.target?.matches?.(menuSelector)) schedule('toggle');
+  },true);
+  window.addEventListener('pagehide',() => { clearTimeout(discoveryTimer); mutations.disconnect(); sizes.disconnect(); trackViewport(false); });
   observeMutations();
-  schedule();
+  schedule('init');
 })();
 """#
 
@@ -1986,6 +2082,7 @@ let popoverChromeFixScript = #"""
     return trigger ? trigger.getBoundingClientRect() : null;
   };
   const positioned = new Set();
+  let hasOpenPanel = false;
   const clearPosition = el => {
     el.removeAttribute('data-swift-popover-positioned');
     el.style.removeProperty('--swift-popover-x'); el.style.removeProperty('--swift-popover-y');
@@ -2036,7 +2133,9 @@ let popoverChromeFixScript = #"""
   };
   const reposition = () => {
     for (const el of [...positioned]) if (!open(el)) clearPosition(el);
-    for (const el of document.querySelectorAll(panelSelector)) {
+    const panels = [...document.querySelectorAll(panelSelector)];
+    hasOpenPanel = panels.some(open);
+    for (const el of panels) {
       if (!open(el)) continue;
       const kind = el.matches(selectionPanel) ? 'selection' : 'tooltip';
       const anchor = kind === 'selection' ? selectedRect() : tooltipAnchor(el);
@@ -2044,8 +2143,9 @@ let popoverChromeFixScript = #"""
     }
   };
   let timer = 0;
-  const schedule = () => {
+  const schedule = (reason = 'unknown') => {
     if (timer) return;
+    if (!hasOpenPanel && ['selection', 'scroll', 'resize', 'viewport'].includes(reason)) return;
     timer = setTimeout(() => { timer=0; reposition(); },0);
   };
   document.addEventListener('beforetoggle',event => {
@@ -2063,13 +2163,13 @@ let popoverChromeFixScript = #"""
       schedule();
     });
   },true);
-  document.addEventListener('selectionchange',schedule,true);
-  document.addEventListener('toggle',schedule,true);
-  document.addEventListener('scroll',schedule,{capture:true,passive:true});
-  window.addEventListener('resize',schedule,{passive:true});
-  window.visualViewport?.addEventListener('resize',schedule);
-  window.visualViewport?.addEventListener('scroll',schedule);
-  document.fonts?.ready.then(schedule);
+  document.addEventListener('selectionchange',() => schedule('selection'),true);
+  document.addEventListener('toggle',() => schedule('toggle'),true);
+  document.addEventListener('scroll',() => schedule('scroll'),{capture:true,passive:true});
+  window.addEventListener('resize',() => schedule('resize'),{passive:true});
+  window.visualViewport?.addEventListener('resize',() => schedule('viewport'));
+  window.visualViewport?.addEventListener('scroll',() => schedule('viewport'));
+  document.fonts?.ready.then(() => schedule('fonts'));
   window.__chatgptSwiftPopoverCompatibility = {diagnose:() => ({
     selectionLength:String(getSelection()).length,selectionRect:rectSummary(selectedRect()),
     panels:[...document.querySelectorAll(panelSelector)].filter(open).map(el => ({
