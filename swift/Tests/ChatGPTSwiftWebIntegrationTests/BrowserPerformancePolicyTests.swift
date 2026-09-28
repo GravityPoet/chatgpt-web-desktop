@@ -77,4 +77,28 @@ final class BrowserPerformancePolicyTests: XCTestCase {
         )
         XCTAssertEqual(BrowserWindowController.statusLocationText(for: nil), "未载入")
     }
+
+    func testNormalToolbarStatusDoesNotExposeWebViewZoomAsLoadProgress() {
+        let controller = BrowserWindowController(
+            initialURL: nil,
+            title: "Status zoom fixture",
+            isPopup: true,
+            persistent: false,
+            profileID: nil
+        )
+        defer { controller.dispose() }
+        controller.statusLabel = NSTextField(labelWithString: "")
+        controller.currentZoom = 1.05
+        controller.webView.loadHTMLString("<html><body>fixture</body></html>", baseURL: URL(string: "https://notice.test/"))
+        let settled = expectation(description: "fixture navigation settles")
+        let observation = controller.webView.observe(\.isLoading, options: [.initial, .new]) { view, _ in
+            if !view.isLoading { settled.fulfill() }
+        }
+        wait(for: [settled], timeout: 5)
+        withExtendedLifetime(observation) {}
+        controller.updateNativeChromeStatus()
+        XCTAssertFalse(controller.lastPresentedStatusText?.contains("105%") == true)
+        XCTAssertFalse(controller.lastPresentedStatusText?.contains("100%") == true)
+        XCTAssertEqual(controller.lastPresentedStatusText, "notice.test")
+    }
 }

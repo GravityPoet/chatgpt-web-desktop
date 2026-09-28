@@ -142,7 +142,7 @@ final class ToolbarLayoutTests: XCTestCase {
         let navigationItems = toolbar.items.filter(\.isNavigational)
         for width in [900, 1038, 1280] {
             controller.window.setContentSize(NSSize(width: width, height: 680))
-            for (message, progress, quiet) in [("chatgpt.com · 100%", false, true), ("加载中 99%", true, false),
+            for (message, progress, quiet) in [("chatgpt.com", false, true), ("加载中 99%", true, false),
                 ("网络已断开", false, false), ("正在完成人机验证…", false, false)] {
                 controller.setStatus(message, showsProgress: progress, quiet: quiet)
                 let ready = expectation(description: "toolbar layout")

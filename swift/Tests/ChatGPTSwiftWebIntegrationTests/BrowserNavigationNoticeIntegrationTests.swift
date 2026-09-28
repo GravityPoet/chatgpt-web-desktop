@@ -149,7 +149,7 @@ final class BrowserNavigationNoticeIntegrationTests: XCTestCase {
         controller.webView.loadHTMLString(Self.pageHTML, baseURL: Self.baseURL)
         wait(for: [loaded], timeout: 5)
         XCTAssertNil(controller.blockedNavigationStatus)
-        XCTAssertEqual(controller.lastPresentedStatusText, "notice.test · 100%")
+        XCTAssertEqual(controller.lastPresentedStatusText, "notice.test")
     }
 
     func testCredentialAndHTTPFailuresAreDistinctAndRedacted() throws {

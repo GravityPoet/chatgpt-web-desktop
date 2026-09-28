@@ -279,8 +279,11 @@ extension BrowserWindowController {
             setStatus("页面空白，点击恢复", showsProgress: false)
         } else {
             let location = Self.statusLocationText(for: webView.url)
+            // The normal state must never display the WebView zoom as if it were
+            // a loading percentage. Loading progress is shown only above while
+            // WebKit is actually loading.
             let zoom = Int(round(currentZoom * 100))
-            setStatus("\(location) · \(zoom)%", showsProgress: false,
+            setStatus(location, showsProgress: false,
                       quiet: Self.canInjectPromptContent(into: webView.url) && zoom == 100)
         }
 
@@ -460,12 +463,12 @@ extension BrowserWindowController {
         progress.setContentCompressionResistancePriority(.required, for: .horizontal)
         progress.translatesAutoresizingMaskIntoConstraints = false
 
-        let label = NSTextField(labelWithString: "chatgpt.com · 100%")
+        let label = NSTextField(labelWithString: "chatgpt.com")
         label.font = .systemFont(ofSize: 12, weight: .regular)
         label.textColor = .secondaryLabelColor
         label.alignment = .center
         label.lineBreakMode = .byTruncatingMiddle
-        label.setAccessibilityLabel("chatgpt.com · 100%")
+        label.setAccessibilityLabel("chatgpt.com")
         label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         label.setContentHuggingPriority(.defaultHigh, for: .horizontal)
         label.translatesAutoresizingMaskIntoConstraints = false
@@ -479,7 +482,7 @@ extension BrowserWindowController {
         container.translatesAutoresizingMaskIntoConstraints = false
         container.setAccessibilityElement(true)
         container.setAccessibilityRole(.staticText)
-        container.setAccessibilityLabel("chatgpt.com · 100%")
+        container.setAccessibilityLabel("chatgpt.com")
         container.addSubview(progress)
         container.addSubview(label)
 
