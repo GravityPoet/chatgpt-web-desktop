@@ -172,6 +172,35 @@ final class RefreshFeedbackTests: XCTestCase {
         XCTAssertTrue(BrowserWindowController.isCloudflareChallengeResponse(challenge))
         XCTAssertFalse(BrowserWindowController.isCloudflareChallengeResponse(ordinaryForbidden))
         XCTAssertEqual(BrowserWindowController.navigationHTTPFailureMessage(for: ordinaryForbidden.statusCode), "页面请求未完成（HTTP 403），可以重试")
+        let challengeURLResponse = try XCTUnwrap(HTTPURLResponse(
+            url: URL(string: "https://chatgpt.com/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1?ray=fixture")!,
+            statusCode: 403,
+            httpVersion: "HTTP/2",
+            headerFields: [:]
+        ))
+        XCTAssertTrue(BrowserWindowController.isCloudflareChallengeResponse(challengeURLResponse))
+    }
+
+    func testCloudflareChallengeNavigationPreservesShortLivedURLAndSessionState() throws {
+        let challenge = try XCTUnwrap(URL(string: "https://chatgpt.com/cdn-cgi/challenge-platform/h/g/orchestrate/jsch/v1?ray=abc&cf_chl_tk=short-lived"))
+        let iframe = try XCTUnwrap(URL(string: "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"))
+        let ordinary = try XCTUnwrap(URL(string: "https://chatgpt.com/c/fixture?utm_source=campaign"))
+        XCTAssertTrue(BrowserWindowController.isCloudflareChallengeNavigationURL(challenge))
+        XCTAssertTrue(BrowserWindowController.isCloudflareChallengeNavigationURL(iframe))
+        XCTAssertFalse(BrowserWindowController.isCloudflareChallengeNavigationURL(ordinary))
+        XCTAssertEqual(challenge.query, "ray=abc&cf_chl_tk=short-lived")
+
+        let controller = makeController()
+        defer { controller.dispose() }
+        controller.beginCloudflareChallenge(reason: "fixture")
+        XCTAssertTrue(controller.isCloudflareChallengeActive)
+        XCTAssertEqual(controller.cloudflareChallengeCount, 1)
+        XCTAssertEqual(controller.cloudflareChallengeLoopCount, 0)
+        controller.beginCloudflareChallenge(reason: "fixture loop")
+        XCTAssertEqual(controller.cloudflareChallengeLoopCount, 1)
+        controller.completeCloudflareChallenge()
+        XCTAssertFalse(controller.isCloudflareChallengeActive)
+        XCTAssertEqual(controller.cloudflareChallengeResolvedCount, 1)
     }
 
     func testBlankAndChallengeContentCannotProduceCompletion() throws {

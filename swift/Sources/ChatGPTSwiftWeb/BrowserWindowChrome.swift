@@ -270,11 +270,14 @@ extension BrowserWindowController {
             setStatus("网络已断开", showsProgress: false)
         } else if let lastFailureStatus {
             setStatus(lastFailureStatus, showsProgress: false)
+        } else if isCloudflareChallengeActive {
+            let waiting = cloudflareChallengeLastReason.hasPrefix("等待超过")
+                ? "人机验证等待中，请保持当前网络和窗口不变"
+                : "正在完成人机验证…"
+            setStatus(waiting, showsProgress: false)
         } else if webView.isLoading {
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             setStatus("加载中 \(percent)%", showsProgress: true)
-        } else if isCloudflareChallengeActive {
-            setStatus("正在完成人机验证…", showsProgress: false)
         } else if lastRenderProbeWasBlank {
             setStatus("页面空白，点击恢复", showsProgress: false)
         } else {
