@@ -135,6 +135,25 @@ final class RefreshFeedbackTests: XCTestCase {
         }
     }
 
+    func testCloudflareChallengeResponseIsDistinctFromTerminalHTTPFailure() throws {
+        let challenge = try XCTUnwrap(HTTPURLResponse(
+            url: URL(string: "https://chatgpt.com/")!,
+            statusCode: 403,
+            httpVersion: "HTTP/2",
+            headerFields: ["cf-mitigated": "challenge"]
+        ))
+        let ordinaryForbidden = try XCTUnwrap(HTTPURLResponse(
+            url: URL(string: "https://chatgpt.com/")!,
+            statusCode: 403,
+            httpVersion: "HTTP/2",
+            headerFields: [:]
+        ))
+
+        XCTAssertTrue(BrowserWindowController.isCloudflareChallengeResponse(challenge))
+        XCTAssertFalse(BrowserWindowController.isCloudflareChallengeResponse(ordinaryForbidden))
+        XCTAssertEqual(BrowserWindowController.navigationHTTPFailureMessage(for: ordinaryForbidden.statusCode), "页面请求未完成（HTTP 403），可以重试")
+    }
+
     func testBlankAndChallengeContentCannotProduceCompletion() throws {
         for html in ["<html><body></body></html>",
                      "<html><body><div id='challenge-stage'>Verify you are human</div></body></html>"] {

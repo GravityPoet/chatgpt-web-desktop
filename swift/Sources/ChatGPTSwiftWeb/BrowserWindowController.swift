@@ -1146,7 +1146,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
         if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
-            navigationHTTPFailure = Self.navigationHTTPFailureMessage(for: response.statusCode)
+            if Self.isCloudflareChallengeResponse(response) {
+                // Cloudflare challenge pages commonly arrive as HTTP 403. They are an
+                // intermediate page that WebKit must render so its JavaScript can issue
+                // the clearance cookie; treating the response as a terminal failure
+                // replaces that page with our retry overlay before the challenge runs.
+                navigationHTTPFailure = nil
+                isCloudflareChallengeActive = true
+            } else {
+                navigationHTTPFailure = Self.navigationHTTPFailureMessage(for: response.statusCode)
+            }
         }
         if !navigationResponse.canShowMIMEType {
             if navigationResponse.isForMainFrame { refreshFeedback.navigationBecameDownload() }
@@ -1165,6 +1174,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return "页面请求未完成（HTTP \(statusCode)），可以重试"
         }
         return nil
+    }
+
+    static func isCloudflareChallengeResponse(_ response: HTTPURLResponse) -> Bool {
+        response.value(forHTTPHeaderField: "cf-mitigated")?.lowercased() == "challenge"
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

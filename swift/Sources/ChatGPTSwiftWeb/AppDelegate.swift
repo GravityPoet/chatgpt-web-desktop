@@ -804,10 +804,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
                 return
             }
             if enabled {
-                controller?.setStatus("已默认拒绝非必要 Cookie；所有账号空间将在下次加载时继续执行", showsProgress: false)
+                controller?.showToast("已默认拒绝非必要 Cookie；所有账号空间将在下次加载时继续执行")
             } else {
-                controller?.setStatus("已取消默认拒绝；所有账号空间下次加载可在 Cookie Preferences 中选择", showsProgress: false)
+                controller?.showToast("已取消默认拒绝；所有账号空间下次加载可在 Cookie Preferences 中选择")
             }
+            // Consent writes complete asynchronously and can finish after a navigation
+            // failure. Recompute the toolbar status so this informational message cannot
+            // hide an HTTP error or an active Cloudflare challenge.
+            controller?.updateNativeChromeStatus()
             self.refreshNativeUtilityWindows()
         }
     }
