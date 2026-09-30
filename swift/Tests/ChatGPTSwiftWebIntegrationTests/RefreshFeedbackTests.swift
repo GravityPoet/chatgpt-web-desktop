@@ -79,6 +79,26 @@ final class RefreshFeedbackTests: XCTestCase {
         XCTAssertNil(controller.navigationReloadButton?.contentTintColor)
     }
 
+    func testFailedReloadBypassesLocalCache() throws {
+        let handler = RefreshFixtureHandler()
+        let controller = makeController(handler: handler)
+        defer { controller.dispose() }
+        let delegate = RefreshFixtureDelegate(controller: controller)
+        controller.webView.navigationDelegate = delegate
+        let loaded = expectation(description: "fixture loaded")
+        delegate.finished = { loaded.fulfill() }
+        controller.webView.load(URLRequest(url: URL(string: "refresh-fixture://page")!))
+        wait(for: [loaded], timeout: 5)
+
+        controller.hasFailedNavigation = true
+        let reloaded = expectation(description: "failed fixture reloaded")
+        delegate.finished = { reloaded.fulfill() }
+        controller.reload(nil)
+        wait(for: [reloaded], timeout: 5)
+
+        XCTAssertEqual(handler.lastCachePolicy, .reloadIgnoringLocalCacheData)
+    }
+
     func testToolbarRecreationPreservesLoadingAndFailedRetry() throws {
         let controller = makeController()
         defer { controller.dispose() }
@@ -318,10 +338,12 @@ private final class RefreshHTTPFixtureServer {
 @MainActor
 private final class RefreshFixtureHandler: NSObject, WKURLSchemeHandler {
     private(set) var requestCount = 0
+    private(set) var lastCachePolicy: URLRequest.CachePolicy?
     private var pending: [ObjectIdentifier: DispatchWorkItem] = [:]
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         requestCount += 1
+        lastCachePolicy = urlSchemeTask.request.cachePolicy
         let key = ObjectIdentifier(urlSchemeTask)
         let work = DispatchWorkItem { [weak self] in
             guard self?.pending.removeValue(forKey: key) != nil else { return }

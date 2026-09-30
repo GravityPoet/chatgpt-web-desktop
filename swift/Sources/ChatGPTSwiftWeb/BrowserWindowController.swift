@@ -233,7 +233,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     @objc func reload(_ sender: Any?) {
         guard !isDisposing, refreshFeedback.beginRefresh() else { return }
         // Start feedback synchronously, without waiting for JavaScript on a busy page.
-        let navigation = hasFailedNavigation || isShowingBlankContent ? hardReload() : webView.reload()
+        let navigation = hasFailedNavigation || isShowingBlankContent
+            ? hardReload(ignoringCache: true)
+            : webView.reload()
         refreshFeedback.trackRequestedNavigation(navigation)
     }
 
