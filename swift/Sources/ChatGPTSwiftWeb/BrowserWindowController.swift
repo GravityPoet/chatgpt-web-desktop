@@ -63,6 +63,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var lastFailureStatus: String?
     var networkRetryPending = false
     var networkRetryUsed = false
+    var cloudflareChallengeCount = 0
+    var cloudflareChallengeResolvedCount = 0
+    var cloudflareChallengeLoopCount = 0
+    var cloudflareChallengeStartedAt: Date?
+    var cloudflareChallengeLastReason = "无"
+    var cloudflareChallengeCookieStatus = "未检查"
+    var cloudflareChallengeWatchdogGeneration = 0
+    var cloudflareChallengeWatchdogWorkItem: DispatchWorkItem?
     var hasActiveDownload: Bool { !activeDownloads.isEmpty || !remoteImageLoaders.isEmpty }
     var downloadScope: String { persistent ? (profileID ?? defaultProfileID) : privateDownloadID }
     private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
@@ -418,6 +426,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("lastNavigationFinishedAt", Self.diagnosticDateString(lastNavigationFinishedAt)),
             ("lastNavigationDuration", Self.diagnosticDurationString(from: lastNavigationStartedAt, to: lastNavigationFinishedAt)),
             ("cloudflareChallengeActive", isCloudflareChallengeActive ? "true" : "false"),
+            ("cloudflareChallengeCount", "\(cloudflareChallengeCount)"),
+            ("cloudflareChallengeResolvedCount", "\(cloudflareChallengeResolvedCount)"),
+            ("cloudflareChallengeLoopCount", "\(cloudflareChallengeLoopCount)"),
+            ("cloudflareChallengeStartedAt", Self.diagnosticDateString(cloudflareChallengeStartedAt)),
+            ("cloudflareChallengeLastReason", DiagnosticRedactor.text(cloudflareChallengeLastReason)),
+            ("cloudflareChallengeCookieStatus", DiagnosticRedactor.text(cloudflareChallengeCookieStatus)),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -799,6 +813,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         didTearDownWebView = true
+        invalidateCloudflareChallengeTracking()
         refreshFeedback.invalidate()
         navigationReloadSpinner?.stopAnimation(nil)
         stopUtilityObservers()
@@ -902,9 +917,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
             let isChallenge = Self.boolValue(report["cloudflareChallenge"])
             let isBlank = !isChallenge && Self.boolValue(report["blank"])
-            isCloudflareChallengeActive = isChallenge
-            lastRenderProbeWasBlank = isBlank
             let readyState = report["readyState"] as? String ?? "unknown"
+            if isChallenge {
+                beginCloudflareChallenge(reason: "内容探针检测到挑战页")
+            } else if isCloudflareChallengeActive,
+                      readyState == "complete",
+                      let host = webView.url?.host?.lowercased(),
+                      NavigationRules.isChatGPTHost(host) {
+                completeCloudflareChallenge()
+            }
+            lastRenderProbeWasBlank = isBlank
             let textLength = Self.intValue(report["textLength"])
             let visibleElements = Self.intValue(report["visibleElements"])
             let bodyChildren = Self.intValue(report["bodyChildren"])
@@ -1010,7 +1032,6 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastFailureStatus = nil
         clearBlockedNavigationStatus()
         lastRenderProbeWasBlank = false
-        isCloudflareChallengeActive = false
         invalidateRenderedContentProbes()
         if case .recovering = currentOverlayMode {
             statusOverlay?.update(mode: currentOverlayMode)
@@ -1037,7 +1058,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
 
         let sourceURL = webView.url
-        let cleanedURL = Self.cleanTrackingParameters(from: url)
+        let isChallengeNavigation = Self.isCloudflareChallengeNavigationURL(url)
+        let cleanedURL = isChallengeNavigation ? url : Self.cleanTrackingParameters(from: url)
 
         if handleMailNavigation(cleanedURL, action: navigationAction) {
             decisionHandler(.cancel)
@@ -1058,6 +1080,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         if NavigationRules.shouldBlockInsecureThirdPartyNavigation(cleanedURL, sourceURL: sourceURL) {
             setStatus("已阻止明文第三方链接", showsProgress: false)
             decisionHandler(.cancel)
+            return
+        }
+
+        // Cloudflare challenge URLs contain short-lived tokens. Preserve their exact
+        // query/path and let the page run in the current WebKit session; privacy
+        // rewrites or opening the challenge in another app can invalidate the token.
+        if isChallengeNavigation {
+            decisionHandler(.allow)
             return
         }
 
@@ -1154,7 +1184,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 // the clearance cookie; treating the response as a terminal failure
                 // replaces that page with our retry overlay before the challenge runs.
                 navigationHTTPFailure = nil
-                isCloudflareChallengeActive = true
+                beginCloudflareChallenge(reason: "HTTP \(response.statusCode) cf-mitigated=challenge")
             } else {
                 navigationHTTPFailure = Self.navigationHTTPFailureMessage(for: response.statusCode)
             }
@@ -1179,7 +1209,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     static func isCloudflareChallengeResponse(_ response: HTTPURLResponse) -> Bool {
-        response.value(forHTTPHeaderField: "cf-mitigated")?.lowercased() == "challenge"
+        if response.value(forHTTPHeaderField: "cf-mitigated")?.lowercased() == "challenge" {
+            return true
+        }
+        // Some intermediaries preserve the challenge URL but strip the Cloudflare
+        // response header. Keep the challenge page alive when the URL itself is a
+        // Cloudflare challenge, while ordinary HTTP 403 pages remain failures.
+        return response.statusCode == 403
+            && response.url.map(isCloudflareChallengeNavigationURL) == true
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1207,7 +1244,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         if refreshFeedback.navigationFinished(navigation), let navigation {
             verifyRefreshedPage(navigation: navigation)
         }
-        showStatusOverlay(.hidden)
+        if !isCloudflareChallengeActive {
+            showStatusOverlay(.hidden)
+        }
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
         configureDraftExperience()
@@ -1220,6 +1259,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         guard !isDisposing, ProfileStore.pendingDataMutation == nil else {
             return
         }
+        failCloudflareChallenge(reason: "WebKit 渲染进程退出")
         refreshFeedback.processTerminated()
         // The render process died (OOM / WebKit fault), leaving a white view. Reload to restart it so the
         // window self-heals instead of stranding the user on a blank page.
@@ -1245,10 +1285,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         guard refreshFeedback.accepts(navigation) else { return }
         guard !Self.isBenignNavigationError(error) else {
+            failCloudflareChallenge(reason: "挑战页导航被取消")
             refreshFeedback.navigationCancelled(navigation)
             updateNativeChromeStatus()
             return
         }
+
+        failCloudflareChallenge(reason: "挑战页导航被取消")
 
         // Surface the failure so a blank window after a failed load is diagnosable in the unified log.
         navigationFailureCount += 1
@@ -1272,10 +1315,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         guard refreshFeedback.accepts(navigation) else { return }
         guard !Self.isBenignNavigationError(error) else {
+            failCloudflareChallenge(reason: "挑战页导航被取消")
             refreshFeedback.navigationCancelled(navigation)
             updateNativeChromeStatus()
             return
         }
+
+        failCloudflareChallenge(reason: "挑战页导航失败")
 
         navigationFailureCount += 1
         let safeErrorDescription = DiagnosticRedactor.text(error.localizedDescription)

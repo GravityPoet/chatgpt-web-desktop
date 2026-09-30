@@ -23,7 +23,10 @@ extension BrowserWindowController {
         })
         utilityObservers.append(NotificationCenter.default.addObserver(forName: .chatGPTSwiftNetworkDidChange, object: nil, queue: .main) { [weak self] note in
             MainActor.assumeIsolated {
-                self?.networkChanged(restored: note.userInfo?["restored"] as? Bool == true)
+                self?.networkChanged(
+                    restored: note.userInfo?["restored"] as? Bool == true,
+                    interfaceChanged: note.userInfo?["interfaceChanged"] as? Bool == true
+                )
             }
         })
         updateDownloadButton()
@@ -88,8 +91,11 @@ extension BrowserWindowController {
         toolbarItems[.chatGPTProfile]?.menuFormRepresentation?.title = toolTip
     }
 
-    func networkChanged(restored: Bool) {
+    func networkChanged(restored: Bool, interfaceChanged: Bool = false) {
         guard !isDisposing else { return }
+        if interfaceChanged, isCloudflareChallengeActive {
+            noteCloudflareNetworkChange()
+        }
         if NetworkStatusMonitor.shared.availability == .offline {
             networkRetryUsed = false
             if hasFailedNavigation { networkRetryPending = true }

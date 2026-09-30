@@ -1,4 +1,5 @@
 import AppKit
+import ChatGPTSwiftWebCore
 import Foundation
 import WebKit
 
@@ -204,7 +205,14 @@ extension BrowserWindowController {
             let challenge = report["cloudflareChallenge"] as? Bool == true
             let blank = report["blank"] as? Bool != false
             let ready = report["readyState"] as? String == "complete"
-            self.isCloudflareChallengeActive = challenge
+            if challenge {
+                self.beginCloudflareChallenge(reason: "刷新后内容探针检测到挑战页")
+            } else if self.isCloudflareChallengeActive,
+                      ready,
+                      let host = self.webView.url?.host?.lowercased(),
+                      NavigationRules.isChatGPTHost(host) {
+                self.completeCloudflareChallenge()
+            }
             if (!ready || challenge || blank) && attempt < 10 {
                 self.updateNativeChromeStatus()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in

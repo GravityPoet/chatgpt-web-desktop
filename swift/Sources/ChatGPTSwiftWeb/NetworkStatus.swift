@@ -42,10 +42,14 @@ final class NetworkStatusMonitor {
             DispatchQueue.main.async {
                 guard let self else { return }
                 let old = self.availability
+                let oldInterface = self.interfaceDescription
                 self.availability = next
                 self.interfaceDescription = interface.isEmpty ? "无可用接口" : interface
                 NotificationCenter.default.post(name: .chatGPTSwiftNetworkDidChange, object: self,
-                    userInfo: ["restored": old == .offline && next != .offline])
+                    userInfo: [
+                        "restored": old == .offline && next != .offline,
+                        "interfaceChanged": oldInterface != self.interfaceDescription,
+                    ])
             }
         }
         monitor.start(queue: queue)
