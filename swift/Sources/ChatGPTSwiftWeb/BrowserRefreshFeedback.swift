@@ -150,9 +150,13 @@ extension BrowserWindowController {
         let tint: NSColor?
         switch feedback.state {
         case .idle:
-            label = isShowingBlankContent ? "恢复空白页面" : "重新加载"
+            if modelLoadFailureActive {
+                label = "重试加载模型"
+            } else {
+                label = isShowingBlankContent ? "恢复空白页面" : "重新加载"
+            }
             symbol = "arrow.clockwise"
-            tint = nil
+            tint = modelLoadFailureActive ? .systemOrange : nil
         case .loading:
             if isCloudflareChallengeActive {
                 label = "正在验证页面"

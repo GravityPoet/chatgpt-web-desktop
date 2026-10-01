@@ -1075,7 +1075,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
 
     private func makeDiagnosticsState() -> AppDiagnosticsState {
         let generatedAt = Self.timestampString(Date())
-        return AppDiagnosticsState(generatedAt: generatedAt, report: makeDiagnosticsReport(generatedAt: generatedAt))
+        let cloudflareSummary = mainController?.cloudflareDiagnosticsSummary() ?? "主窗口不可用，暂无 Cloudflare 事件"
+        return AppDiagnosticsState(
+            generatedAt: generatedAt,
+            report: makeDiagnosticsReport(generatedAt: generatedAt),
+            cloudflareSummary: cloudflareSummary
+        )
     }
 
     private func exportDiagnosticsPackage(_ state: AppDiagnosticsState) {

@@ -71,6 +71,19 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var cloudflareChallengeCookieStatus = "未检查"
     var cloudflareChallengeWatchdogGeneration = 0
     var cloudflareChallengeWatchdogWorkItem: DispatchWorkItem?
+    var cloudflareLastRayID = "无"
+    var cloudflareLastHTTPStatus = "无"
+    var cloudflareLastEventAt: Date?
+    var cloudflareEgressStatus = "未采样"
+    var cloudflareEgressSampleCount = 0
+    var cloudflareEgressSampledChallengeCount = 0
+    var cloudflareEgressSampleInFlight = false
+    var cloudflareLastEgressFingerprint: String?
+    var modelLoadFailureActive = false
+    var modelLoadFailureCount = 0
+    var modelLoadFailureLastAt: Date?
+    var modelLoadFailureWatchdogGeneration = 0
+    var modelLoadFailureWatchdogWorkItem: DispatchWorkItem?
     var hasActiveDownload: Bool { !activeDownloads.isEmpty || !remoteImageLoaders.isEmpty }
     var downloadScope: String { persistent ? (profileID ?? defaultProfileID) : privateDownloadID }
     private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
@@ -432,6 +445,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("cloudflareChallengeStartedAt", Self.diagnosticDateString(cloudflareChallengeStartedAt)),
             ("cloudflareChallengeLastReason", DiagnosticRedactor.text(cloudflareChallengeLastReason)),
             ("cloudflareChallengeCookieStatus", DiagnosticRedactor.text(cloudflareChallengeCookieStatus)),
+            ("cloudflareLastRayID", DiagnosticRedactor.text(cloudflareLastRayID)),
+            ("cloudflareLastHTTPStatus", cloudflareLastHTTPStatus),
+            ("cloudflareLastEventAt", Self.diagnosticDateString(cloudflareLastEventAt)),
+            ("cloudflareEgressStatus", DiagnosticRedactor.text(cloudflareEgressStatus)),
+            ("cloudflareEgressSampleCount", "\(cloudflareEgressSampleCount)"),
+            ("modelLoadFailureActive", modelLoadFailureActive ? "true" : "false"),
+            ("modelLoadFailureCount", "\(modelLoadFailureCount)"),
+            ("modelLoadFailureLastAt", Self.diagnosticDateString(modelLoadFailureLastAt)),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -482,6 +503,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             && webContentProcessTerminationCount == 0
             && overlayHealthy
             && !isCloudflareChallengeActive
+            && !modelLoadFailureActive
         let passed = windowVisible
             && hasContentAddress
             && !webView.isLoading
@@ -502,6 +524,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "diagnosticsHealthy=\(diagnosticsHealthy)",
             "nativeStatusOverlay=\(DiagnosticRedactor.text(currentOverlayMode.diagnosticDescription))",
             "cloudflareChallengeActive=\(isCloudflareChallengeActive)",
+            "modelLoadFailureActive=\(modelLoadFailureActive)",
             "navigationFailureCount=\(navigationFailureCount)",
             "lastNavigationFailure=\(DiagnosticRedactor.text(lastNavigationFailureDescription))",
             "webContentProcessTerminationCount=\(webContentProcessTerminationCount)",
@@ -814,6 +837,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         didTearDownWebView = true
         invalidateCloudflareChallengeTracking()
+        invalidateModelLoadFailureTracking()
         refreshFeedback.invalidate()
         navigationReloadSpinner?.stopAnimation(nil)
         stopUtilityObservers()
@@ -871,6 +895,55 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         renderProbeGeneration += 1
     }
 
+    private func invalidateModelLoadFailureTracking() {
+        modelLoadFailureWatchdogGeneration &+= 1
+        modelLoadFailureWatchdogWorkItem?.cancel()
+        modelLoadFailureWatchdogWorkItem = nil
+        modelLoadFailureActive = false
+    }
+
+    private func observeModelLoadFailure(_ detected: Bool, confirmed: Bool, generation: Int?) {
+        guard !isDisposing else { return }
+        guard detected else {
+            modelLoadFailureWatchdogGeneration &+= 1
+            modelLoadFailureWatchdogWorkItem?.cancel()
+            modelLoadFailureWatchdogWorkItem = nil
+            modelLoadFailureActive = false
+            updateNativeChromeStatus()
+            return
+        }
+
+        if confirmed {
+            modelLoadFailureWatchdogWorkItem = nil
+            if !modelLoadFailureActive {
+                modelLoadFailureCount += 1
+                modelLoadFailureLastAt = Date()
+            }
+            modelLoadFailureActive = true
+            updateNativeChromeStatus()
+            return
+        }
+
+        guard modelLoadFailureWatchdogWorkItem == nil else { return }
+        let expectedGeneration = generation ?? renderProbeGeneration
+        let expected = modelLoadFailureWatchdogGeneration &+ 1
+        modelLoadFailureWatchdogGeneration = expected
+        let work = DispatchWorkItem { [weak self] in
+            guard let self,
+                  !self.isDisposing,
+                  self.modelLoadFailureWatchdogGeneration == expected,
+                  expectedGeneration == self.renderProbeGeneration else { return }
+            self.modelLoadFailureWatchdogWorkItem = nil
+            self.runRenderedContentProbe(
+                reason: "model load watchdog",
+                generation: expectedGeneration,
+                recoverIfBlank: false
+            )
+        }
+        modelLoadFailureWatchdogWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6, execute: work)
+    }
+
     private func scheduleRenderedContentProbe(reason: String, delay: TimeInterval) {
         guard !isDisposing, !hasFailedNavigation, ProfileStore.pendingDataMutation == nil else {
             return
@@ -918,6 +991,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             let isChallenge = Self.boolValue(report["cloudflareChallenge"])
             let isBlank = !isChallenge && Self.boolValue(report["blank"])
             let readyState = report["readyState"] as? String ?? "unknown"
+            let modelLoadFailure = Self.boolValue(report["modelLoadFailure"])
+            self.observeModelLoadFailure(
+                modelLoadFailure,
+                confirmed: reason == "model load watchdog",
+                generation: generation
+            )
             if isChallenge {
                 beginCloudflareChallenge(reason: "内容探针检测到挑战页")
             } else if isCloudflareChallengeActive,
@@ -1032,6 +1111,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         lastFailureStatus = nil
         clearBlockedNavigationStatus()
         lastRenderProbeWasBlank = false
+        invalidateModelLoadFailureTracking()
         invalidateRenderedContentProbes()
         if case .recovering = currentOverlayMode {
             statusOverlay?.update(mode: currentOverlayMode)
@@ -1183,6 +1263,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 // intermediate page that WebKit must render so its JavaScript can issue
                 // the clearance cookie; treating the response as a terminal failure
                 // replaces that page with our retry overlay before the challenge runs.
+                recordCloudflareChallengeResponse(response)
                 navigationHTTPFailure = nil
                 beginCloudflareChallenge(reason: "HTTP \(response.statusCode) cf-mitigated=challenge")
             } else {
@@ -2471,7 +2552,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
           textLength: 0,
           visibleElements: 0,
           bodyChildren: document.body ? document.body.children.length : 0,
-          domCount: document.getElementsByTagName('*').length
+          domCount: document.getElementsByTagName('*').length,
+          modelLoadFailure: false
         };
       }
 
@@ -2514,6 +2596,23 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
       const bodyChildren = body ? body.children.length : 0;
       const domCount = document.getElementsByTagName('*').length;
+      let modelLoadFailure = false;
+      if (body) {
+        const failureNeedles = [
+          '无法加载 chatgpt 模型',
+          '无法加载模型',
+          'failed to load model',
+          'unable to load model'
+        ];
+        const candidates = body.querySelectorAll('button,[role="button"],[role="status"],p,span');
+        for (const element of Array.from(candidates).slice(0, 240)) {
+          const text = String(element.textContent || '').trim().toLowerCase().slice(0, 160);
+          if (failureNeedles.some((needle) => text.includes(needle))) {
+            modelLoadFailure = true;
+            break;
+          }
+        }
+      }
       return {
         blank: !cloudflareChallenge && (!body || (textLength < 8 && visibleElements === 0)),
         cloudflareChallenge,
@@ -2523,7 +2622,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         textLength,
         visibleElements,
         bodyChildren,
-        domCount
+        domCount,
+        modelLoadFailure
       };
     })()
     """

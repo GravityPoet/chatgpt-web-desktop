@@ -203,6 +203,38 @@ final class RefreshFeedbackTests: XCTestCase {
         XCTAssertEqual(controller.cloudflareChallengeResolvedCount, 1)
     }
 
+    func testPersistentModelLoadFailureGetsNativeRetryEntry() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        let delegate = RefreshFixtureDelegate(controller: controller)
+        controller.webView.navigationDelegate = delegate
+        let loaded = expectation(description: "model failure fixture loaded")
+        delegate.finished = { loaded.fulfill() }
+        _ = controller.webView.loadSimulatedRequest(
+            URLRequest(url: URL(string: "https://chatgpt.com/")!),
+            responseHTML: "<html><body><button>无法加载 ChatGPT 模型</button></body></html>"
+        )
+        wait(for: [loaded], timeout: 5)
+
+        let report = expectation(description: "model failure probe")
+        controller.webView.evaluateJavaScript(BrowserWindowController.renderedContentProbeScript) { value, error in
+            XCTAssertNil(error)
+            XCTAssertEqual((value as? [String: Any])?["modelLoadFailure"] as? Bool, true)
+            report.fulfill()
+        }
+        wait(for: [report], timeout: 3)
+
+        let toolbar = try XCTUnwrap(controller.window.toolbar)
+        _ = controller.toolbar(toolbar, itemForItemIdentifier: .chatGPTNavigation, willBeInsertedIntoToolbar: true)
+        controller.modelLoadFailureActive = true
+        controller.statusLabel = NSTextField(labelWithString: "")
+        controller.updateRefreshButtonAppearance()
+        XCTAssertEqual(controller.navigationReloadButton?.accessibilityLabel(), "重试加载模型")
+        XCTAssertEqual(controller.navigationReloadButton?.toolTip, "重试加载模型")
+        controller.updateNativeChromeStatus()
+        XCTAssertEqual(controller.lastPresentedStatusText, "模型列表加载失败，点击导航栏重试")
+    }
+
     func testBlankAndChallengeContentCannotProduceCompletion() throws {
         for html in ["<html><body></body></html>",
                      "<html><body><div id='challenge-stage'>Verify you are human</div></body></html>"] {

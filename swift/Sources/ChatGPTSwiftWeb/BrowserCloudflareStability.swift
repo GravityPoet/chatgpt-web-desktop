@@ -1,9 +1,42 @@
+import CryptoKit
 import Foundation
 import WebKit
 
 /// Keeps Cloudflare challenge pages inside the normal WebKit session and exposes only
 /// non-sensitive health signals. It deliberately does not solve or bypass challenges.
 extension BrowserWindowController {
+    func cloudflareDiagnosticsSummary() -> String {
+        let state = isCloudflareChallengeActive ? "挑战进行中" : "空闲"
+        let network = NetworkStatusMonitor.shared.availability.title + " · " + NetworkStatusMonitor.shared.interfaceDescription
+        let eventTime = cloudflareLastEventAt.map { date in
+            let formatter = ISO8601DateFormatter()
+            formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            return formatter.string(from: date)
+        } ?? "无"
+        return [
+            "状态：" + state,
+            "挑战：" + String(cloudflareChallengeCount) + " 次，已完成 " + String(cloudflareChallengeResolvedCount) + " 次，循环 " + String(cloudflareChallengeLoopCount) + " 次",
+            "最近事件：HTTP " + cloudflareLastHTTPStatus + "，Ray ID " + cloudflareLastRayID + "，" + eventTime,
+            "挑战 Cookie：" + cloudflareChallengeCookieStatus,
+            "出口采样：" + cloudflareEgressStatus + "（采样 " + String(cloudflareEgressSampleCount) + " 次）",
+            "网络：" + network,
+        ].joined(separator: "\n")
+    }
+
+    func recordCloudflareChallengeResponse(_ response: HTTPURLResponse) {
+        cloudflareLastHTTPStatus = String(response.statusCode)
+        cloudflareLastEventAt = Date()
+        if let rawRayID = response.value(forHTTPHeaderField: "cf-ray") {
+            let safeRayID = rawRayID.unicodeScalars.filter { scalar in
+                CharacterSet.alphanumerics.contains(scalar) || scalar == "-"
+            }
+            cloudflareLastRayID = String(String.UnicodeScalarView(safeRayID).prefix(128))
+        } else {
+            cloudflareLastRayID = "缺失"
+        }
+        sampleCloudflareEgressIfNeeded()
+    }
+
     static func isCloudflareChallengeNavigationURL(_ url: URL) -> Bool {
         guard url.scheme?.lowercased() == "https",
               let host = url.host?.lowercased() else {
@@ -32,6 +65,7 @@ extension BrowserWindowController {
         hasFailedNavigation = false
         cloudflareChallengeLastReason = reason
         refreshCloudflareChallengeCookieStatus()
+        sampleCloudflareEgressIfNeeded()
         scheduleCloudflareChallengeWatchdog()
         updateNativeChromeStatus()
     }
@@ -116,5 +150,74 @@ extension BrowserWindowController {
                 self.updateNativeChromeStatus()
             }
         }
+    }
+
+    private func sampleCloudflareEgressIfNeeded() {
+        guard !cloudflareEgressSampleInFlight,
+              cloudflareEgressSampledChallengeCount != cloudflareChallengeCount else { return }
+        cloudflareEgressSampledChallengeCount = cloudflareChallengeCount
+        cloudflareEgressSampleInFlight = true
+        cloudflareEgressSampleCount += 1
+
+        guard let url = URL(string: "https://cloudflare.com/cdn-cgi/trace") else {
+            cloudflareEgressSampleInFlight = false
+            cloudflareEgressStatus = "采样地址不可用"
+            return
+        }
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 4)
+        request.httpShouldHandleCookies = false
+        request.setValue("text/plain", forHTTPHeaderField: "Accept")
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        let session = URLSession(configuration: configuration)
+        session.dataTask(with: request) { [weak self] data, response, _ in
+            defer { session.finishTasksAndInvalidate() }
+            guard let self,
+                  let httpResponse = response as? HTTPURLResponse,
+                  (200..<300).contains(httpResponse.statusCode),
+                  let data,
+                  let text = String(data: data, encoding: .utf8) else {
+                DispatchQueue.main.async {
+                    guard let self, !self.isDisposing else { return }
+                    self.cloudflareEgressSampleInFlight = false
+                    self.cloudflareEgressStatus = "采样失败（不读取 Cookie）"
+                    self.updateNativeChromeStatus()
+                }
+                return
+            }
+
+            var values: [String: String] = [:]
+            for line in text.split(whereSeparator: { $0.isNewline }) {
+                let parts = line.split(separator: "=", maxSplits: 1).map(String.init)
+                if parts.count == 2 { values[parts[0]] = parts[1] }
+            }
+            guard let ip = values["ip"], !ip.isEmpty else {
+                DispatchQueue.main.async {
+                    guard !self.isDisposing else { return }
+                    self.cloudflareEgressSampleInFlight = false
+                    self.cloudflareEgressStatus = "采样结果缺少出口信息"
+                    self.updateNativeChromeStatus()
+                }
+                return
+            }
+
+            let fingerprint = SHA256.hash(data: Data(ip.utf8)).prefix(8)
+                .map { String(format: "%02x", $0) }.joined()
+            let location = [values["loc"], values["colo"]].compactMap { $0 }.joined(separator: "/")
+            DispatchQueue.main.async {
+                guard !self.isDisposing else { return }
+                let changed: String
+                if let previous = self.cloudflareLastEgressFingerprint {
+                    changed = previous == fingerprint ? "出口未变化" : "出口已变化"
+                } else {
+                    changed = "已建立出口基线"
+                }
+                self.cloudflareLastEgressFingerprint = fingerprint
+                self.cloudflareEgressSampleInFlight = false
+                self.cloudflareEgressStatus = changed + "；位置 " + (location.isEmpty ? "未知" : location)
+                self.updateNativeChromeStatus()
+            }
+        }.resume()
     }
 }

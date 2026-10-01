@@ -275,6 +275,8 @@ extension BrowserWindowController {
                 ? "人机验证等待中，请保持当前网络和窗口不变"
                 : "正在完成人机验证…"
             setStatus(waiting, showsProgress: false)
+        } else if modelLoadFailureActive {
+            setStatus("模型列表加载失败，点击导航栏重试", showsProgress: false)
         } else if webView.isLoading {
             let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
             setStatus("加载中 \(percent)%", showsProgress: true)
