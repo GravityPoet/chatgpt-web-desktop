@@ -155,18 +155,20 @@ final class BrowserNavigationNoticeIntegrationTests: XCTestCase {
     func testCredentialAndHTTPFailuresAreDistinctAndRedacted() throws {
         let (controller, delegate) = try makeHarness()
         defer { controller.window.close() }
-        let credentials = expectation(description: "credential URL rejected")
-        delegate.decided = credentials
         let credentialURL = [
             // Keep this navigation on the local fixture scheme. The policy under test rejects
-            // embedded credentials before routing, while a real https credential URL can make
-            // Intel WebKit enter its network-auth path and terminate the test process (SIGILL).
+            // embedded credentials before routing. Navigating from the loaded fixture keeps
+            // Intel WebKit out of a direct top-level load path that can terminate the test process.
             "notice-test://",
             ["test-user", "test-password"].joined(separator: ":"),
             "@notice.test/auth/private?token=test-token#test-secret"
         ].joined()
-        controller.webView.load(URLRequest(url: try XCTUnwrap(URL(string: credentialURL))))
-        wait(for: [credentials], timeout: 5)
+        let action = try navigate(
+            "location.href = '\(credentialURL)';",
+            controller: controller,
+            delegate: delegate
+        )
+        XCTAssertTrue(action.targetFrame?.isMainFrame == true)
         XCTAssertEqual(delegate.lastPolicy, .cancel)
         XCTAssertEqual(controller.blockedNavigationStatus, "已阻止含用户名或密码的链接")
         let report = controller.diagnosticsReport()
