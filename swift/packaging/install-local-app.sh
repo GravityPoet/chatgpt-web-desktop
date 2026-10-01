@@ -17,9 +17,12 @@ PROCESS_PATTERN='^/Applications/ChatGPT Swift\.app/Contents/MacOS/ChatGPTSwiftWe
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BACKUP_DIR="$HOME/Library/Application Support/Codex/Backups/ChatGPTSwift/$STAMP"
 BACKUP_ZIP="$BACKUP_DIR/$APP_NAME.app.zip"
-STAGE_APP="/Applications/.ChatGPT-Swift-stage-$$"
-DISPLACED_APP="/Applications/.ChatGPT-Swift-displaced-$$"
 VERIFY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/chatgpt-swift-install-verify.XXXXXX")"
+STAGE_APP="/Applications/.ChatGPT-Swift-stage-$$"
+# Keep the rollback copy outside indexed application roots. The suffix is
+# intentionally not `.app`, so Spotlight/LaunchServices cannot register it as
+# a second product while the new bundle is being smoke-tested.
+DISPLACED_APP="$VERIFY_ROOT/.previous-chatgpt-swift-$$"
 SPARKLE_GENERATE_APPCAST_CACHE="$HOME/Library/Caches/Sparkle_generate_appcast"
 HAD_PREVIOUS=0
 DISPLACED_READY=0
@@ -74,7 +77,7 @@ cleanup_or_rollback() {
   status=$?
   trap - EXIT INT TERM
   unregister_app_bundle "$APP_DIR"
-  rm -rf "$APP_DIR" "$STAGE_APP" "$VERIFY_ROOT"
+  rm -rf "$APP_DIR" "$STAGE_APP"
   rm -f "$ROOT/dist/.metadata_never_index"
   if [[ "$status" -ne 0 ]]; then
     if [[ "$INSTALL_REPLACED" -eq 1 ]]; then
@@ -88,6 +91,7 @@ cleanup_or_rollback() {
       /usr/bin/open "$INSTALL_APP" >/dev/null 2>&1 || true
     fi
   fi
+  rm -rf "$VERIFY_ROOT"
   exit "$status"
 }
 trap cleanup_or_rollback EXIT
@@ -154,8 +158,7 @@ if ! /usr/bin/pgrep -f "$PROCESS_PATTERN" >/dev/null; then
   exit 1
 fi
 
-unregister_app_bundle "$APP_DIR"
-rm -rf "$APP_DIR" "$VERIFY_ROOT"
+rm -rf "$APP_DIR"
 rm -f "$ROOT/dist/.metadata_never_index"
 
 physical_paths="$(
@@ -262,7 +265,7 @@ if [[ -n "$dock_paths" && "$dock_paths" != "$INSTALL_APP" ]]; then
   exit 1
 fi
 
-rm -rf "$DISPLACED_APP"
+rm -rf "$VERIFY_ROOT"
 DISPLACED_READY=0
 INSTALL_REPLACED=0
 trap - EXIT INT TERM
