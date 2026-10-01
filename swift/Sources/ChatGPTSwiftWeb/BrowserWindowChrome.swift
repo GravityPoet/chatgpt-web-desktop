@@ -11,43 +11,6 @@ private enum NativeToolbarMetrics {
     static let statusMaxWidth: CGFloat = 112
 }
 
-/// AppKit's textured button intrinsic metrics differ between the Intel and Apple silicon
-/// runners. Keep toolbar hit targets identical on both architectures instead of allowing
-/// the cell's bezel metrics to expand the view after layout.
-private final class FixedToolbarButton: NSButton {
-    private var fixedSize: NSSize
-
-    init(fixedSize: NSSize) {
-        self.fixedSize = fixedSize
-        super.init(frame: NSRect(origin: .zero, size: fixedSize))
-    }
-
-    required init?(coder: NSCoder) {
-        fixedSize = NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
-        super.init(coder: coder)
-    }
-
-#if arch(x86_64)
-    override var intrinsicContentSize: NSSize { fixedSize }
-
-    override func setFrameSize(_ newSize: NSSize) {
-        super.setFrameSize(fixedSize)
-    }
-#endif
-}
-
-private func makeToolbarButton(fixedSize: NSSize, target: AnyObject, action: Selector) -> NSButton {
-#if arch(x86_64)
-    let button = FixedToolbarButton(fixedSize: fixedSize)
-    button.title = ""
-    button.target = target
-    button.action = action
-    return button
-#else
-    return NSButton(title: "", target: target, action: action)
-#endif
-}
-
 enum NativeToolbarLayout {
     static let versionKey = "ChatGPTSwiftWeb.Toolbar.LayoutVersion"
     static let currentVersion = 4
@@ -247,11 +210,8 @@ extension BrowserWindowController {
             item.visibilityPriority = .standard
             // Compact icon-first buttons: full meaning lives in tooltip/AX/menu, not in
             // a persistent long title that squeezes the toolbar at ~900-1038px.
-            let button = makeToolbarButton(
-                fixedSize: NSSize(width: 36, height: 28),
-                target: self,
-                action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:))
-            )
+            let button = NSButton(title: "", target: self,
+                                  action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
             button.bezelStyle = .texturedRounded
             button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
             button.imagePosition = .imageOnly
@@ -436,7 +396,7 @@ extension BrowserWindowController {
         stack.setAccessibilityLabel("导航")
 
         func makeButton(_ label: String, _ symbol: String, _ action: Selector) -> NSButton {
-            let button = makeToolbarButton(fixedSize: NSSize(width: 28, height: 28), target: self, action: action)
+            let button = NSButton(title: "", target: self, action: action)
             button.bezelStyle = .texturedRounded
             button.isBordered = true
             button.showsBorderOnlyWhileMouseInside = true
