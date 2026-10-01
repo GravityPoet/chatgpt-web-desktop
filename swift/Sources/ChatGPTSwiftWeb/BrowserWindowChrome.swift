@@ -30,6 +30,22 @@ private final class FixedToolbarButton: NSButton {
     override var intrinsicContentSize: NSSize { fixedSize }
 }
 
+private func fixedToolbarContainer(for button: NSButton, size: NSSize) -> NSView {
+    let container = NSView(frame: NSRect(origin: .zero, size: size))
+    container.translatesAutoresizingMaskIntoConstraints = false
+    button.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(button)
+    NSLayoutConstraint.activate([
+        container.widthAnchor.constraint(equalToConstant: size.width),
+        container.heightAnchor.constraint(equalToConstant: size.height),
+        button.widthAnchor.constraint(equalToConstant: size.width),
+        button.heightAnchor.constraint(equalToConstant: size.height),
+        button.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+        button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+    ])
+    return container
+}
+
 enum NativeToolbarLayout {
     static let versionKey = "ChatGPTSwiftWeb.Toolbar.LayoutVersion"
     static let currentVersion = 4
@@ -244,7 +260,7 @@ extension BrowserWindowController {
             ])
             button.setAccessibilityLabel(item.label)
             button.toolTip = item.label
-            item.view = button
+            item.view = fixedToolbarContainer(for: button, size: NSSize(width: 36, height: 28))
             if isDownload {
                 let menuItem = NSMenuItem(title: "打开下载中心", action: #selector(showDownloads(_:)), keyEquivalent: "")
                 menuItem.target = self
@@ -460,9 +476,9 @@ extension BrowserWindowController {
             spinner.heightAnchor.constraint(equalToConstant: 16)
         ])
         navigationReloadSpinner = spinner
-        stack.addArrangedSubview(back)
-        stack.addArrangedSubview(forward)
-        stack.addArrangedSubview(reload)
+        stack.addArrangedSubview(fixedToolbarContainer(for: back, size: NSSize(width: 28, height: 28)))
+        stack.addArrangedSubview(fixedToolbarContainer(for: forward, size: NSSize(width: 28, height: 28)))
+        stack.addArrangedSubview(fixedToolbarContainer(for: reload, size: NSSize(width: 28, height: 28)))
         let menu = NSMenu(title: "导航")
         menu.autoenablesItems = false
         for button in [back, forward, reload] {
