@@ -3,6 +3,13 @@ import AppKit
 struct AppDiagnosticsState {
     let generatedAt: String
     let report: String
+    let cloudflareSummary: String
+
+    init(generatedAt: String, report: String, cloudflareSummary: String = "暂无 Cloudflare 事件") {
+        self.generatedAt = generatedAt
+        self.report = report
+        self.cloudflareSummary = cloudflareSummary
+    }
 }
 
 struct AppDiagnosticsCallbacks {
@@ -14,6 +21,7 @@ final class DiagnosticsWindowController: NSWindowController {
     private var state: AppDiagnosticsState
     private let callbacks: AppDiagnosticsCallbacks
     private let generatedLabel = NSTextField(labelWithString: "")
+    private let cloudflareSummaryLabel = NSTextField(wrappingLabelWithString: "")
     private let textView = NSTextView()
 
     init(state: AppDiagnosticsState, callbacks: AppDiagnosticsCallbacks) {
@@ -51,6 +59,7 @@ final class DiagnosticsWindowController: NSWindowController {
     func update(state: AppDiagnosticsState) {
         self.state = state
         generatedLabel.stringValue = "生成时间：\(state.generatedAt) · 账号、会话 URL 与标题已脱敏"
+        cloudflareSummaryLabel.stringValue = state.cloudflareSummary
         textView.string = state.report
     }
 
@@ -100,6 +109,33 @@ final class DiagnosticsWindowController: NSWindowController {
         generatedLabel.textColor = .secondaryLabelColor
         root.addArrangedSubview(generatedLabel)
 
+        let cloudflareCard = NSVisualEffectView()
+        cloudflareCard.material = .sidebar
+        cloudflareCard.blendingMode = .withinWindow
+        cloudflareCard.state = .active
+        cloudflareCard.wantsLayer = true
+        cloudflareCard.layer?.cornerRadius = 8
+        cloudflareCard.translatesAutoresizingMaskIntoConstraints = false
+
+        let cloudflareStack = NSStackView()
+        cloudflareStack.orientation = .vertical
+        cloudflareStack.alignment = .leading
+        cloudflareStack.spacing = 4
+        cloudflareStack.edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
+        cloudflareStack.translatesAutoresizingMaskIntoConstraints = false
+
+        let cloudflareTitle = NSTextField(labelWithString: "Cloudflare 会话")
+        cloudflareTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        cloudflareTitle.textColor = .labelColor
+        cloudflareSummaryLabel.font = .systemFont(ofSize: 12, weight: .regular)
+        cloudflareSummaryLabel.textColor = .secondaryLabelColor
+        cloudflareSummaryLabel.maximumNumberOfLines = 8
+        cloudflareSummaryLabel.lineBreakMode = .byWordWrapping
+        cloudflareStack.addArrangedSubview(cloudflareTitle)
+        cloudflareStack.addArrangedSubview(cloudflareSummaryLabel)
+        cloudflareCard.addSubview(cloudflareStack)
+        root.addArrangedSubview(cloudflareCard)
+
         let scrollView = NSScrollView()
         scrollView.borderType = .bezelBorder
         scrollView.hasVerticalScroller = true
@@ -123,6 +159,11 @@ final class DiagnosticsWindowController: NSWindowController {
             root.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
 
             header.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -40),
+            cloudflareCard.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -40),
+            cloudflareStack.leadingAnchor.constraint(equalTo: cloudflareCard.leadingAnchor),
+            cloudflareStack.trailingAnchor.constraint(equalTo: cloudflareCard.trailingAnchor),
+            cloudflareStack.topAnchor.constraint(equalTo: cloudflareCard.topAnchor),
+            cloudflareStack.bottomAnchor.constraint(equalTo: cloudflareCard.bottomAnchor),
             scrollView.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -40),
             scrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 360)
         ])
