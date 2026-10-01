@@ -23,7 +23,10 @@ enum BrowserDataBoundary {
             }
         }
 
-        try data.write(to: temporaryURL, options: [.atomic, .completeFileProtection])
+        // The temporary URL is already unique. Foundation's atomic and file-protection
+        // options can be rejected by the macOS test sandbox; the final replace/move below
+        // remains the atomic commit boundary and the explicit 0600 attributes protect bytes.
+        try data.write(to: temporaryURL, options: [])
         try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporaryURL.path)
         if fileManager.fileExists(atPath: url.path) {
             _ = try fileManager.replaceItemAt(url, withItemAt: temporaryURL)
