@@ -11,6 +11,25 @@ private enum NativeToolbarMetrics {
     static let statusMaxWidth: CGFloat = 180
 }
 
+/// AppKit's textured button intrinsic metrics differ between the Intel and Apple silicon
+/// runners. Keep toolbar hit targets identical on both architectures instead of allowing
+/// the cell's bezel metrics to expand the view after layout.
+private final class FixedToolbarButton: NSButton {
+    private var fixedSize: NSSize
+
+    init(fixedSize: NSSize) {
+        self.fixedSize = fixedSize
+        super.init(frame: NSRect(origin: .zero, size: fixedSize))
+    }
+
+    required init?(coder: NSCoder) {
+        fixedSize = NSSize(width: NSView.noIntrinsicMetric, height: NSView.noIntrinsicMetric)
+        super.init(coder: coder)
+    }
+
+    override var intrinsicContentSize: NSSize { fixedSize }
+}
+
 enum NativeToolbarLayout {
     static let versionKey = "ChatGPTSwiftWeb.Toolbar.LayoutVersion"
     static let currentVersion = 4
@@ -210,8 +229,10 @@ extension BrowserWindowController {
             item.visibilityPriority = .standard
             // Compact icon-first buttons: full meaning lives in tooltip/AX/menu, not in
             // a persistent long title that squeezes the toolbar at ~900-1038px.
-            let button = NSButton(title: "", target: self,
-                                  action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
+            let button = FixedToolbarButton(fixedSize: NSSize(width: 36, height: 28))
+            button.title = ""
+            button.target = self
+            button.action = isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:))
             button.bezelStyle = .texturedRounded
             button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
             button.imagePosition = .imageOnly
@@ -396,7 +417,10 @@ extension BrowserWindowController {
         stack.setAccessibilityLabel("导航")
 
         func makeButton(_ label: String, _ symbol: String, _ action: Selector) -> NSButton {
-            let button = NSButton(title: "", target: self, action: action)
+            let button = FixedToolbarButton(fixedSize: NSSize(width: 28, height: 28))
+            button.title = ""
+            button.target = self
+            button.action = action
             button.bezelStyle = .texturedRounded
             button.isBordered = true
             button.showsBorderOnlyWhileMouseInside = true
