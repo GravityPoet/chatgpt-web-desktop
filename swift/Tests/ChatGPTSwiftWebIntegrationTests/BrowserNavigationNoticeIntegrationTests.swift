@@ -158,7 +158,10 @@ final class BrowserNavigationNoticeIntegrationTests: XCTestCase {
         let credentials = expectation(description: "credential URL rejected")
         delegate.decided = credentials
         let credentialURL = [
-            "https://",
+            // Keep this navigation on the local fixture scheme. The policy under test rejects
+            // embedded credentials before routing, while a real https credential URL can make
+            // Intel WebKit enter its network-auth path and terminate the test process (SIGILL).
+            "notice-test://",
             ["test-user", "test-password"].joined(separator: ":"),
             "@notice.test/auth/private?token=test-token#test-secret"
         ].joined()
