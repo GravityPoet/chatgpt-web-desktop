@@ -103,6 +103,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     private var lastRenderProbeSummary = "未运行"
     var draftCaptureDiagnostics = "未检查"
     var plusMenuDiagnostics = "未检查"
+    var conversationNavigatorDiagnostics = "未检查"
     var draftNativeMessageCount = 0
     var draftNativeSaveCount = 0
     var draftNativeDropReason = "无"
@@ -399,6 +400,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func diagnosticsReport() -> String {
         refreshDraftDiagnostics()
         refreshPlusMenuDiagnostics()
+        refreshConversationNavigatorDiagnostics()
         let frame = window.frame
         let currentItemURL = webView.backForwardList.currentItem?.url
         let profileLabel = DiagnosticRedactor.profileLabel(
@@ -424,6 +426,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("lastRenderProbe", DiagnosticRedactor.text(lastRenderProbeSummary)),
             ("draftCapture", draftCaptureDiagnostics),
             ("plusMenu", plusMenuDiagnostics),
+            ("conversationNavigator", conversationNavigatorDiagnostics),
             ("draftNativeMessages", "\(draftNativeMessageCount)（已保存 \(draftNativeSaveCount)，最近 \(draftNativeDropReason)）"),
             ("blankRecoveryAttempts", "\(blankRecoveryAttempts)"),
             ("lastBlankRecovery", DiagnosticRedactor.text(lastBlankRecoverySummary)),
@@ -2734,6 +2737,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: conversationNavigatorScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))

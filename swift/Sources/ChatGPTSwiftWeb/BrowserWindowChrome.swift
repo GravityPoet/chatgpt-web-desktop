@@ -9,6 +9,21 @@ private enum NativeToolbarMetrics {
     static let progressSpacing: CGFloat = 8
     static let statusMinWidth: CGFloat = 96
     static let statusMaxWidth: CGFloat = 112
+    static let progressStatusMaxWidth: CGFloat = 180
+}
+
+private func actionToolbarContainer(for button: NSButton) -> NSView {
+    let container = NSView(frame: NSRect(x: 0, y: 0, width: 48, height: 32))
+    container.translatesAutoresizingMaskIntoConstraints = false
+    button.translatesAutoresizingMaskIntoConstraints = false
+    container.addSubview(button)
+    NSLayoutConstraint.activate([
+        container.widthAnchor.constraint(equalTo: button.widthAnchor, constant: 4),
+        container.heightAnchor.constraint(equalToConstant: 32),
+        button.centerXAnchor.constraint(equalTo: container.centerXAnchor),
+        button.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+    ])
+    return container
 }
 
 enum NativeToolbarLayout {
@@ -214,16 +229,20 @@ extension BrowserWindowController {
                                   action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
             button.bezelStyle = .texturedRounded
             button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
+            button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
             button.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
-                button.widthAnchor.constraint(greaterThanOrEqualToConstant: 36),
-                button.heightAnchor.constraint(equalToConstant: 28)
+                button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+                button.heightAnchor.constraint(equalToConstant: 32)
             ])
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
             button.setAccessibilityLabel(item.label)
             button.toolTip = item.label
-            item.view = button
+            // Keep a four-point breathing gap between the two trailing actions while
+            // retaining a minimum 44-point hit target and room for download counts.
+            item.view = actionToolbarContainer(for: button)
             if isDownload {
                 let menuItem = NSMenuItem(title: "打开下载中心", action: #selector(showDownloads(_:)), keyEquivalent: "")
                 menuItem.target = self
@@ -552,6 +571,6 @@ extension BrowserWindowController {
         let contentWidth = measuredText + progressWidth + NativeToolbarMetrics.statusHorizontalPadding * 2 + 4
         let minimumWidth = showsProgress ? 0 : NativeToolbarMetrics.statusMinWidth
         let preferredWidth = max(contentWidth, minimumWidth)
-        return min(preferredWidth, NativeToolbarMetrics.statusMaxWidth)
+        return min(preferredWidth, showsProgress ? NativeToolbarMetrics.progressStatusMaxWidth : NativeToolbarMetrics.statusMaxWidth)
     }
 }
