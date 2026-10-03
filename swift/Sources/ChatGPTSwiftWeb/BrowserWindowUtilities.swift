@@ -83,7 +83,7 @@ extension BrowserWindowController {
         profileButton?.title = displayName.isEmpty ? "▾" : displayName + "  ▾"
         profileButton?.imagePosition = .imageLeading
         profileButton?.image = NSImage(systemSymbolName: "person.crop.circle", accessibilityDescription: "账号空间")
-        profileButton?.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)
+        profileButton?.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: profileButton?.font?.pointSize ?? 13, weight: .regular)
         let toolTip = "账号空间：\(name) — 点击切换"
         let accessibility = "账号空间，当前\(name)，点击切换账号空间"
         profileButton?.toolTip = toolTip
