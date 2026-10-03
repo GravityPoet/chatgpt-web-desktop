@@ -3140,6 +3140,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     static func refreshWindowTitles() {
         controllers.forEach { controller in
             controller.window.title = controller.preferredWindowTitle()
+            controller.updateProfileButton()
         }
     }
 

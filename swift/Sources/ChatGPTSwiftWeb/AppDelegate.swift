@@ -1897,6 +1897,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSMenu
             profiles[idx].name = name
             ProfileStore.save(profiles)
             self.mainController?.window.title = self.mainWindowTitle(for: profiles[idx])
+            self.mainController?.updateProfileButton()
         }
     }
 

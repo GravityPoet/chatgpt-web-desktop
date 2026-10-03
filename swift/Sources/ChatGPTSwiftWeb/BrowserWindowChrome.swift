@@ -28,7 +28,7 @@ private func actionToolbarContainer(for button: NSButton) -> NSView {
 
 enum NativeToolbarLayout {
     static let versionKey = "ChatGPTSwiftWeb.Toolbar.LayoutVersion"
-    static let currentVersion = 4
+    static let currentVersion = 5
 }
 
 extension NSToolbarItem.Identifier {
@@ -63,9 +63,10 @@ extension BrowserWindowController {
         if #available(macOS 11.0, *) {
             window.toolbarStyle = .unifiedCompact
         }
+        window.titleVisibility = toolbar.items.contains(where: { $0.itemIdentifier == .chatGPTProfile }) ? .hidden : .visible
     }
 
-    /// Upgrade stock layouts only. A custom arrangement is user data, not a failed migration.
+    /// Move the account entry once while preserving other customized and removed items.
     func migrateToolbarLayoutIfNeeded(_ toolbar: NSToolbar, defaults: UserDefaults = .standard) {
         let stored = defaults.integer(forKey: NativeToolbarLayout.versionKey)
         if stored >= NativeToolbarLayout.currentVersion {
@@ -83,8 +84,10 @@ extension BrowserWindowController {
             .flexibleSpace, .chatGPTDownloads, .chatGPTProfile, .chatGPTStatus]
         let versionThree: [NSToolbarItem.Identifier] = [.chatGPTBack, .chatGPTForward, .chatGPTReload,
             .flexibleSpace, .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile]
+        let versionFour: [NSToolbarItem.Identifier] = [.chatGPTNavigation, .flexibleSpace,
+            .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile]
         let newOrder = toolbarDefaultItemIdentifiers(toolbar)
-        if currentIDs == original || currentIDs == versionTwo || currentIDs == versionThree {
+        if currentIDs == original || currentIDs == versionTwo || currentIDs == versionThree || currentIDs == versionFour {
             while toolbar.items.count > 0 {
                 toolbar.removeItem(at: 0)
             }
@@ -106,7 +109,28 @@ extension BrowserWindowController {
                 toolbar.insertItem(withItemIdentifier: identifier, at: index)
             }
         }
+        // Move the account entry once, preserving every other customized item.
+        if let profileIndex = toolbar.items.firstIndex(where: { $0.itemIdentifier == .chatGPTProfile }) {
+            let destination = toolbar.items.firstIndex(where: { $0.itemIdentifier == .chatGPTNavigation }).map { $0 + 1 } ?? 0
+            if profileIndex != destination {
+                toolbar.removeItem(at: profileIndex)
+                let insertAt = toolbar.items.firstIndex(where: { $0.itemIdentifier == .chatGPTNavigation }).map { $0 + 1 } ?? 0
+                toolbar.insertItem(withItemIdentifier: .chatGPTProfile, at: insertAt)
+            }
+        }
         defaults.set(NativeToolbarLayout.currentVersion, forKey: NativeToolbarLayout.versionKey)
+    }
+
+    func toolbarWillAddItem(_ notification: Notification) {
+        guard notification.object as? NSToolbar === window.toolbar,
+              let item = notification.userInfo?["item"] as? NSToolbarItem,
+              item.itemIdentifier == .chatGPTProfile else { return }
+        window.titleVisibility = .hidden
+    }
+
+    func toolbarDidRemoveItem(_ notification: Notification) {
+        guard let toolbar = notification.object as? NSToolbar, toolbar === window.toolbar else { return }
+        window.titleVisibility = toolbar.items.contains(where: { $0.itemIdentifier == .chatGPTProfile }) ? .hidden : .visible
     }
 
     func observeWebViewState() {
@@ -171,14 +195,13 @@ extension BrowserWindowController {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        // One coherent leading navigation group, then the flexible separator and compact
-        // trailing actions. This keeps macOS titlebar controls from splitting navigation.
+        // Keep the app identity and account switcher together beside navigation.
         [
             .chatGPTNavigation,
+            .chatGPTProfile,
             .flexibleSpace,
             .chatGPTStatus,
-            .chatGPTDownloads,
-            .chatGPTProfile
+            .chatGPTDownloads
         ]
     }
 
@@ -217,18 +240,19 @@ extension BrowserWindowController {
             )
             item.visibilityPriority = .high
             return item
-        case .chatGPTDownloads, .chatGPTProfile:
-            let isDownload = itemIdentifier == .chatGPTDownloads
+        case .chatGPTProfile:
+            return makeProfileToolbarItem(identifier: itemIdentifier)
+        case .chatGPTDownloads:
             let item = NSToolbarItem(itemIdentifier: itemIdentifier)
-            item.label = isDownload ? "下载中心" : "账号空间"
+            item.label = "下载中心"
             item.paletteLabel = item.label
             item.visibilityPriority = .standard
             // Compact icon-first buttons: full meaning lives in tooltip/AX/menu, not in
             // a persistent long title that squeezes the toolbar at ~900-1038px.
             let button = NSButton(title: "", target: self,
-                                  action: isDownload ? #selector(showDownloads(_:)) : #selector(showProfileSwitcher(_:)))
+                                  action: #selector(showDownloads(_:)))
             button.bezelStyle = .texturedRounded
-            button.image = isDownload ? NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心") : Self.profileColorImage(id: profileID ?? defaultProfileID)
+            button.image = NSImage(systemSymbolName: "arrow.down.circle", accessibilityDescription: "下载中心")
             button.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)
             button.imagePosition = .imageOnly
             button.imageScaling = .scaleProportionallyDown
@@ -240,21 +264,14 @@ extension BrowserWindowController {
             button.setContentCompressionResistancePriority(.required, for: .horizontal)
             button.setAccessibilityLabel(item.label)
             button.toolTip = item.label
-            // Keep a four-point breathing gap between the two trailing actions while
-            // retaining a minimum 44-point hit target and room for download counts.
+            // Keep breathing room around the hit target and download counts.
             item.view = actionToolbarContainer(for: button)
-            if isDownload {
-                let menuItem = NSMenuItem(title: "打开下载中心", action: #selector(showDownloads(_:)), keyEquivalent: "")
-                menuItem.target = self
-                item.menuFormRepresentation = menuItem
-            } else {
-                let menuItem = NSMenuItem(title: "账号空间", action: #selector(showProfileSwitcher(_:)), keyEquivalent: "")
-                menuItem.target = self
-                item.menuFormRepresentation = menuItem
-            }
-            if isDownload { downloadButton = button } else { profileButton = button }
+            let menuItem = NSMenuItem(title: "打开下载中心", action: #selector(showDownloads(_:)), keyEquivalent: "")
+            menuItem.target = self
+            item.menuFormRepresentation = menuItem
+            downloadButton = button
             toolbarItems[itemIdentifier] = item
-            if isDownload { updateDownloadButton() } else { updateProfileButton() }
+            updateDownloadButton()
             return item
         case .chatGPTStatus:
             let item = makeStatusToolbarItem(identifier: itemIdentifier)
@@ -263,6 +280,45 @@ extension BrowserWindowController {
         default:
             return nil
         }
+    }
+
+    private func makeProfileToolbarItem(identifier: NSToolbarItem.Identifier) -> NSToolbarItem {
+        let item = NSToolbarItem(itemIdentifier: identifier)
+        item.label = "账号空间"
+        item.paletteLabel = item.label
+        item.visibilityPriority = .high
+
+        let appName = NSTextField(labelWithString: "ChatGPT Swift")
+        appName.font = .systemFont(ofSize: 13, weight: .semibold)
+        appName.setContentCompressionResistancePriority(.required, for: .horizontal)
+        appName.setContentHuggingPriority(.required, for: .horizontal)
+
+        let button = NSButton(title: "", target: self, action: #selector(showProfileSwitcher(_:)))
+        button.bezelStyle = .texturedRounded
+        button.font = .systemFont(ofSize: 13)
+        button.imageScaling = .scaleProportionallyDown
+        button.cell?.lineBreakMode = .byTruncatingMiddle
+        button.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            button.widthAnchor.constraint(lessThanOrEqualToConstant: isQuickWindow ? 100 : 240),
+            button.heightAnchor.constraint(equalToConstant: 32)
+        ])
+
+        let group = NSStackView(views: [appName, button])
+        group.orientation = .horizontal
+        group.alignment = .centerY
+        group.spacing = 6
+        group.translatesAutoresizingMaskIntoConstraints = false
+        group.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        item.view = group
+        let menuItem = NSMenuItem(title: "账号空间", action: #selector(showProfileSwitcher(_:)), keyEquivalent: "")
+        menuItem.target = self
+        item.menuFormRepresentation = menuItem
+        profileButton = button
+        toolbarItems[identifier] = item
+        updateProfileButton()
+        return item
     }
 
     func updateNativeChromeStatus() {
