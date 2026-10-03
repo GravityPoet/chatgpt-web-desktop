@@ -658,16 +658,96 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(try stringResult("document.querySelector('textarea').value", in: untrusted.webView), "")
     }
 
+    func testConversationNavigatorBuildsQuestionMarkersAndJumps() throws {
+        let html = """
+        <!doctype html><html><head><style>
+          html,body { margin:0; padding:0; }
+          main { width:600px; height:240px; overflow:auto; }
+          [data-message-author-role] { min-height:180px; padding:12px; box-sizing:border-box; }
+        </style></head><body>
+          <main>
+            <section data-message-author-role="user">第一条问题：项目应该如何拆分？</section>
+            <section data-message-author-role="assistant">第一条回答</section>
+            <section data-message-author-role="user">第二条问题：导航应该放在哪里？</section>
+            <section data-message-author-role="assistant">第二条回答</section>
+            <section data-message-author-role="user">第三条问题：怎样验证点击跳转？</section>
+            <section data-message-author-role="assistant">第三条回答</section>
+          </main>
+        </body></html>
+        """
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: html, includeConversationNavigator: true)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        settle(0.5)
+
+        let report = try dictionaryResult("window.__chatgptSwiftConversationNavigator.diagnose()", in: harness.webView)
+        XCTAssertEqual(report["count"] as? Int, 3)
+        XCTAssertEqual(report["visible"] as? Bool, true)
+        XCTAssertEqual(try stringResult("String(document.querySelectorAll('#chatgpt-swift-conversation-navigator button').length)", in: harness.webView), "3")
+        _ = try stringResult("document.querySelector('#chatgpt-swift-conversation-navigator button:nth-child(2)').dispatchEvent(new PointerEvent('pointerenter')); 'hovered'", in: harness.webView)
+        XCTAssertTrue(try stringResult("document.querySelector('#chatgpt-swift-conversation-navigator-preview strong').textContent", in: harness.webView).contains("导航应该放在哪里"))
+        let positions = try stringResult("Array.from(document.querySelectorAll('#chatgpt-swift-conversation-navigator button')).map(button => String(button.getBoundingClientRect().top)).join('|')", in: harness.webView)
+        XCTAssertEqual(positions.split(separator: "|").count, 3)
+        XCTAssertGreaterThan(Set(positions.split(separator: "|")).count, 1)
+
+        _ = try dictionaryResult("(() => { document.querySelector('#chatgpt-swift-conversation-navigator button:nth-child(2)').click(); return { clicked: true }; })()", in: harness.webView)
+        settle(0.45)
+        let jump = try dictionaryResult("({ scrollTop: document.querySelector('main').scrollTop, focused: document.querySelector('#chatgpt-swift-conversation-navigator button:nth-child(2)').getAttribute('aria-current') === 'true' })", in: harness.webView)
+        XCTAssertGreaterThan(jump["scrollTop"] as? Double ?? 0, 0)
+        XCTAssertEqual(jump["focused"] as? Bool, true)
+
+        let fallbackHTML = """
+        <!doctype html><html><head><style>
+          html,body { margin:0; padding:0; }
+          main { width:600px; height:240px; overflow:auto; }
+          article { min-height:180px; padding:12px; box-sizing:border-box; }
+        </style></head><body><main>
+          <article><div class="group/user-message">第一条问题：实际网页选择器</div></article><article>第一条回答</article>
+          <article><div class="group/user-message">第二条问题：仍然可以跳转</div></article><article>第二条回答</article>
+        </main></body></html>
+        """
+        let fallback = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: fallbackHTML, includeConversationNavigator: true)
+        defer { fallback.close() }
+        wait(for: [fallback.navigationExpectation], timeout: 3)
+        settle(0.5)
+        let fallbackReport = try dictionaryResult("window.__chatgptSwiftConversationNavigator.diagnose()", in: fallback.webView)
+        XCTAssertEqual(fallbackReport["count"] as? Int, 2)
+        XCTAssertEqual(try stringResult("String(document.querySelectorAll('#chatgpt-swift-conversation-navigator button').length)", in: fallback.webView), "2")
+
+        let duplicateHTML = """
+        <!doctype html><html><head><style>
+          html,body { margin:0; padding:0; }
+          main { width:600px; height:240px; overflow:auto; }
+          article { min-height:180px; padding:12px; box-sizing:border-box; }
+        </style></head><body><main>
+          <article><div data-message-author-role="user">同一轮问题</div><div data-message-author-role="user">同一轮问题</div></article>
+          <article><div data-message-author-role="assistant">回答</div></article>
+          <article><div data-message-author-role="user">第二轮问题</div></article>
+          <article><div data-message-author-role="assistant">回答</div></article>
+        </main></body></html>
+        """
+        let duplicate = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: duplicateHTML, includeConversationNavigator: true)
+        defer { duplicate.close() }
+        wait(for: [duplicate.navigationExpectation], timeout: 3)
+        settle(0.5)
+        let duplicateReport = try dictionaryResult("window.__chatgptSwiftConversationNavigator.diagnose()", in: duplicate.webView)
+        XCTAssertEqual(duplicateReport["count"] as? Int, 2)
+    }
+
     private func makeHarness(
         sink: ScriptMessageSink,
         html: String,
-        baseURL: URL? = URL(string: "https://chatgpt.com/")
+        baseURL: URL? = URL(string: "https://chatgpt.com/"),
+        includeConversationNavigator: Bool = false
     ) throws -> WebViewHarness {
         let controller = WKUserContentController()
         controller.add(sink, name: "promptDraft")
         controller.add(sink, name: "completionState")
         controller.add(sink, name: "dialogDismissal")
         controller.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        if includeConversationNavigator {
+            controller.addUserScript(WKUserScript(source: BrowserWindowController.conversationNavigatorScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
         controller.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(

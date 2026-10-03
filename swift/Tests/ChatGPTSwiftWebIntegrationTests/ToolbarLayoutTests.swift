@@ -74,6 +74,16 @@ final class ToolbarLayoutTests: XCTestCase {
         // Keyboard focus: buttons remain focusable controls.
         XCTAssertNotNil(controller.downloadButton?.cell)
         XCTAssertNotNil(controller.profileButton?.cell)
+        XCTAssertGreaterThanOrEqual(controller.downloadButton?.fittingSize.width ?? 0, 44)
+        XCTAssertGreaterThanOrEqual(controller.profileButton?.fittingSize.width ?? 0, 44)
+        if let download = controller.downloadButton {
+            download.imagePosition = .imageLeading
+            for count in ["3", "12", "99+"] {
+                download.title = count
+                XCTAssertGreaterThanOrEqual(download.fittingSize.width, download.intrinsicContentSize.width,
+                                            "Download counts must fit beside the enlarged icon")
+            }
+        }
     }
 
     func testStatusWidthStaysWithinCompactBounds() {
@@ -157,12 +167,13 @@ final class ToolbarLayoutTests: XCTestCase {
                 XCTAssertTrue(navigationItems.allSatisfy { $0.visibilityPriority == .high })
                 XCTAssertNotNil(download.superview)
                 XCTAssertNotNil(account.superview)
-                XCTAssertGreaterThanOrEqual(download.fittingSize.width, 36)
-                XCTAssertGreaterThanOrEqual(account.fittingSize.width, 36)
+                XCTAssertGreaterThanOrEqual(download.fittingSize.width, 44)
+                XCTAssertGreaterThanOrEqual(account.fittingSize.width, 44)
                 let downloadRect = download.convert(download.bounds, to: frame)
                 let accountRect = account.convert(account.bounds, to: frame)
                 XCTAssertGreaterThan(downloadRect.minX, frame.bounds.width / 2)
                 XCTAssertLessThanOrEqual(downloadRect.maxX, accountRect.minX)
+                XCTAssertGreaterThanOrEqual(accountRect.minX - downloadRect.maxX, 4)
                 func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
                 let navItem = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier == .chatGPTNavigation })
                 let navView = try XCTUnwrap(navItem.view)
@@ -189,6 +200,10 @@ final class ToolbarLayoutTests: XCTestCase {
                 }
                 print("TOOLBAR_PLACEMENT width=\(width) navigation=\(navView.convert(navView.bounds, to: frame)) download=\(downloadRect) account=\(accountRect) navButtons=\(navButtons.count)")
                 XCTAssertEqual(controller.statusContainer?.isHidden, quiet)
+                if progress, let label = controller.statusLabel {
+                    let width = (label.stringValue as NSString).size(withAttributes: [.font: label.font!]).width
+                    XCTAssertGreaterThanOrEqual(label.bounds.width, width, "Loading percentage must be visible, not an ellipsis")
+                }
                 print("TOOLBAR_GEOMETRY width=\(width) status=\(message) quiet=\(quiet) nav=3 downloads=\(download.bounds) account=\(account.bounds)")
             }
         }
