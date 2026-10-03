@@ -195,7 +195,7 @@ extension BrowserWindowController {
     }
 
     func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
-        // Keep the app identity and account switcher together beside navigation.
+        // Keep the account switcher beside navigation.
         [
             .chatGPTNavigation,
             .chatGPTProfile,
@@ -288,11 +288,6 @@ extension BrowserWindowController {
         item.paletteLabel = item.label
         item.visibilityPriority = .high
 
-        let appName = NSTextField(labelWithString: "ChatGPT Swift")
-        appName.font = .systemFont(ofSize: 13, weight: .semibold)
-        appName.setContentCompressionResistancePriority(.required, for: .horizontal)
-        appName.setContentHuggingPriority(.required, for: .horizontal)
-
         let button = NSButton(title: "", target: self, action: #selector(showProfileSwitcher(_:)))
         button.bezelStyle = .texturedRounded
         button.font = .systemFont(ofSize: 13)
@@ -305,7 +300,7 @@ extension BrowserWindowController {
             button.heightAnchor.constraint(equalToConstant: 32)
         ])
 
-        let group = NSStackView(views: [appName, button])
+        let group = NSStackView(views: [button])
         group.orientation = .horizontal
         group.alignment = .centerY
         group.spacing = 6
