@@ -16,7 +16,7 @@ final class ToolbarLayoutTests: XCTestCase {
         return controller
     }
 
-    func testDefaultOrderPutsNavigationLeftAndStatusLast() {
+    func testDefaultOrderGroupsAccountWithLeadingNavigation() {
         let controller = makeController()
         defer { controller.dispose() }
         let toolbar = NSToolbar(identifier: "ChatGPTSwiftWeb.ToolbarMigrationTests.\(UUID().uuidString)")
@@ -24,8 +24,9 @@ final class ToolbarLayoutTests: XCTestCase {
         let defaults = controller.toolbarDefaultItemIdentifiers(toolbar)
         XCTAssertEqual(defaults, [
             .chatGPTNavigation,
+            .chatGPTProfile,
             .flexibleSpace,
-            .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile,
+            .chatGPTStatus, .chatGPTDownloads,
         ])
     }
 
@@ -43,7 +44,7 @@ final class ToolbarLayoutTests: XCTestCase {
         XCTAssertEqual(item(.chatGPTNavigation).visibilityPriority, .high)
         XCTAssertTrue(item(.chatGPTNavigation).isNavigational)
         XCTAssertEqual(item(.chatGPTDownloads).visibilityPriority, .standard)
-        XCTAssertEqual(item(.chatGPTProfile).visibilityPriority, .standard)
+        XCTAssertEqual(item(.chatGPTProfile).visibilityPriority, .high)
         XCTAssertEqual(item(.chatGPTStatus).visibilityPriority, .low)
         XCTAssertNotNil(item(.chatGPTDownloads).menuFormRepresentation)
         XCTAssertNotNil(item(.chatGPTProfile).menuFormRepresentation)
@@ -65,8 +66,8 @@ final class ToolbarLayoutTests: XCTestCase {
         // Compact invariant: never a persistent long "下载 0" title.
         XCTAssertFalse(controller.downloadButton?.title.hasPrefix("下载 ") ?? true)
         XCTAssertNotEqual(controller.downloadButton?.title, "下载 0")
-        XCTAssertEqual(controller.profileButton?.title, "")
-        XCTAssertEqual(controller.profileButton?.imagePosition, .imageOnly)
+        XCTAssertTrue(controller.profileButton?.title.hasSuffix("▾") ?? false)
+        XCTAssertEqual(controller.profileButton?.imagePosition, .imageLeading)
         XCTAssertTrue(controller.downloadButton?.toolTip?.contains("下载中心") ?? false)
         XCTAssertTrue(controller.profileButton?.toolTip?.contains("账号空间") ?? false)
         XCTAssertTrue(controller.downloadButton?.accessibilityLabel()?.contains("下载中心") ?? false)
@@ -119,10 +120,18 @@ final class ToolbarLayoutTests: XCTestCase {
         }
         controller.migrateToolbarLayoutIfNeeded(toolbar, defaults: defaults)
         XCTAssertEqual(toolbar.items.map(\.itemIdentifier), [
-            .chatGPTNavigation, .flexibleSpace,
-            .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile,
+            .chatGPTNavigation, .chatGPTProfile, .flexibleSpace,
+            .chatGPTStatus, .chatGPTDownloads,
         ])
         XCTAssertEqual(defaults.integer(forKey: NativeToolbarLayout.versionKey), NativeToolbarLayout.currentVersion)
+        // The layout already installed by the preceding fix must also migrate.
+        while toolbar.items.count > 0 { toolbar.removeItem(at: 0) }
+        defaults.set(4, forKey: NativeToolbarLayout.versionKey)
+        for (index, id) in [NSToolbarItem.Identifier.chatGPTNavigation, .flexibleSpace, .chatGPTStatus, .chatGPTDownloads, .chatGPTProfile].enumerated() {
+            toolbar.insertItem(withItemIdentifier: id, at: index)
+        }
+        controller.migrateToolbarLayoutIfNeeded(toolbar, defaults: defaults)
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), [.chatGPTNavigation, .chatGPTProfile, .flexibleSpace, .chatGPTStatus, .chatGPTDownloads])
         // Second run is idempotent and preserves user-removed items.
         while toolbar.items.count > 0 { toolbar.removeItem(at: 0) }
         defaults.set(0, forKey: NativeToolbarLayout.versionKey)
@@ -131,9 +140,28 @@ final class ToolbarLayoutTests: XCTestCase {
             toolbar.insertItem(withItemIdentifier: id, at: index)
         }
         controller.migrateToolbarLayoutIfNeeded(toolbar, defaults: defaults)
-        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), partialIDs)
+        let groupedPartialIDs: [NSToolbarItem.Identifier] = [.chatGPTNavigation, .chatGPTProfile, .flexibleSpace]
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), groupedPartialIDs)
+        controller.migrateToolbarLayoutIfNeeded(toolbar, defaults: defaults)
+        XCTAssertEqual(toolbar.items.map(\.itemIdentifier), groupedPartialIDs)
+        // Later customizations remain the user's choice after the one-time migration.
+        while toolbar.items.count > 0 { toolbar.removeItem(at: 0) }
+        for (index, id) in partialIDs.enumerated() { toolbar.insertItem(withItemIdentifier: id, at: index) }
         controller.migrateToolbarLayoutIfNeeded(toolbar, defaults: defaults)
         XCTAssertEqual(toolbar.items.map(\.itemIdentifier), partialIDs)
+    }
+
+    func testAccountGroupReplacesTheVisibleTitleAndRestoresItWhenRemoved() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        let toolbar = try XCTUnwrap(controller.window.toolbar)
+        XCTAssertEqual(controller.window.titleVisibility, .hidden)
+        let index = try XCTUnwrap(toolbar.items.firstIndex { $0.itemIdentifier == .chatGPTProfile })
+        toolbar.removeItem(at: index)
+        XCTAssertEqual(controller.window.titleVisibility, .visible)
+        toolbar.insertItem(withItemIdentifier: .chatGPTProfile, at: index)
+        XCTAssertEqual(controller.window.titleVisibility, .hidden)
+        XCTAssertEqual(controller.window.title, "Toolbar fixture")
     }
 
     func testActualToolbarGeometryAcrossWindowWidthsAndStatuses() throws {
@@ -148,6 +176,8 @@ final class ToolbarLayoutTests: XCTestCase {
         for (index, id) in controller.toolbarDefaultItemIdentifiers(toolbar).enumerated() {
             toolbar.insertItem(withItemIdentifier: id, at: index)
         }
+        // Long account names must truncate inside the account control.
+        controller.profileButton?.title = String(repeating: "long-account-name", count: 4) + "@example.com  ▾"
         controller.window.makeKeyAndOrderFront(nil)
         let navigationItems = toolbar.items.filter(\.isNavigational)
         for width in [900, 1038, 1280] {
@@ -172,8 +202,10 @@ final class ToolbarLayoutTests: XCTestCase {
                 let downloadRect = download.convert(download.bounds, to: frame)
                 let accountRect = account.convert(account.bounds, to: frame)
                 XCTAssertGreaterThan(downloadRect.minX, frame.bounds.width / 2)
-                XCTAssertLessThanOrEqual(downloadRect.maxX, accountRect.minX)
-                XCTAssertGreaterThanOrEqual(accountRect.minX - downloadRect.maxX, 4)
+                XCTAssertLessThan(accountRect.minX, frame.bounds.width / 2)
+                XCTAssertLessThanOrEqual(accountRect.maxX, downloadRect.minX)
+                XCTAssertLessThanOrEqual(account.bounds.width, 240)
+                XCTAssertEqual(controller.window.titleVisibility, .hidden)
                 func descendants(_ view: NSView) -> [NSView] { [view] + view.subviews.flatMap(descendants) }
                 let navItem = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier == .chatGPTNavigation })
                 let navView = try XCTUnwrap(navItem.view)
@@ -206,6 +238,36 @@ final class ToolbarLayoutTests: XCTestCase {
                 }
                 print("TOOLBAR_GEOMETRY width=\(width) status=\(message) quiet=\(quiet) nav=3 downloads=\(download.bounds) account=\(account.bounds)")
             }
+        }
+    }
+
+    func testQuickWindowKeepsAccountVisibleAndDownloadAccessibleAtMinimumWidth() throws {
+        let controller = BrowserWindowController(initialURL: nil, title: "Quick window fixture",
+                                                 isPopup: true, persistent: false, isQuickWindow: true)
+        defer { controller.dispose() }
+        controller.window.orderFront(nil)
+        let toolbar = NSToolbar(identifier: "ChatGPTSwiftWeb.QuickToolbarTests.\(UUID().uuidString)")
+        toolbar.delegate = controller
+        toolbar.autosavesConfiguration = false
+        controller.window.toolbar = toolbar
+        controller.profileButton?.title = "very.long.account-name@example.com  ▾"
+        controller.window.makeKeyAndOrderFront(nil)
+        for width in [480, 580] {
+            controller.window.setContentSize(NSSize(width: width, height: 680))
+            controller.setStatus("加载中 99%", showsProgress: true)
+            let ready = expectation(description: "quick toolbar layout")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { ready.fulfill() }
+            wait(for: [ready], timeout: 2)
+            let visible = try XCTUnwrap(toolbar.visibleItems).map(\.itemIdentifier)
+            XCTAssertTrue(visible.contains(.chatGPTNavigation))
+            XCTAssertTrue(visible.contains(.chatGPTProfile))
+            // At minimum width, AppKit may move trailing actions into its overflow menu.
+            let downloads = try XCTUnwrap(toolbar.items.first { $0.itemIdentifier == .chatGPTDownloads })
+            XCTAssertEqual(downloads.menuFormRepresentation?.action, NSSelectorFromString("showDownloads:"))
+            XCTAssertTrue(downloads.menuFormRepresentation?.target === controller)
+            if width == 580 { XCTAssertTrue(visible.contains(.chatGPTDownloads)) }
+            XCTAssertTrue(controller.profileButton?.window === controller.window)
+            XCTAssertLessThanOrEqual(controller.profileButton?.bounds.width ?? 9999, 100)
         }
     }
 

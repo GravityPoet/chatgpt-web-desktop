@@ -74,12 +74,14 @@ extension BrowserWindowController {
 
     func updateProfileButton() {
         let currentID = profileID ?? defaultProfileID
-        let name = ProfileStore.loadProfiles().first(where: { $0.id == currentID })?.name
-            ?? (currentID == defaultProfileID ? "默认" : "账号空间")
-        // Compact icon/dot: full space name lives in tooltip/AX/menu, never as a
-        // persistent long toolbar title.
-        profileButton?.title = ""
-        profileButton?.imagePosition = .imageOnly
+        let name = persistent ? (ProfileStore.loadProfiles().first(where: { $0.id == currentID })?.name
+            ?? (currentID == defaultProfileID ? "默认" : "账号空间")) : "无痕"
+        let formatted = ProfileWindowTitle.format(profileName: name, isDefault: persistent && currentID == defaultProfileID,
+                                                 mode: WindowTitleSettings.mode())
+        let prefix = "ChatGPT Swift — "
+        let displayName = formatted.hasPrefix(prefix) ? String(formatted.dropFirst(prefix.count)) : ""
+        profileButton?.title = displayName.isEmpty ? "▾" : displayName + "  ▾"
+        profileButton?.imagePosition = .imageLeading
         profileButton?.image = NSImage(systemSymbolName: "person.crop.circle", accessibilityDescription: "账号空间")
         profileButton?.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 18, weight: .medium)
         let toolTip = "账号空间：\(name) — 点击切换"
