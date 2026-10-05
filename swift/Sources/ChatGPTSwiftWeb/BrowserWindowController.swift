@@ -469,6 +469,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("modelLoadFailureLastAt", Self.diagnosticDateString(modelLoadFailureLastAt)),
             ("dataLoadFailures", dataLoadState.failures.joined(separator: ", ")),
             ("dataLoadVerificationRequired", String(dataLoadState.requiresVerification)),
+            ("dataLoadVerificationPath", dataLoadState.verificationPath),
+            ("dataLoadResponseStatus", dataLoadState.responseStatus.keys.sorted().map { "\($0)=\(dataLoadState.responseStatus[$0]!)" }.joined(separator: ", ")),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -1295,7 +1297,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
         if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
-            if dataVerificationURL != nil { noteDataVerificationResponse(response) }
+            if dataVerificationURL != nil, let policy = dataVerificationResponsePolicy(response) {
+                decisionHandler(policy)
+                return
+            }
             if Self.isCloudflareChallengeResponse(response) {
                 // Cloudflare challenge pages commonly arrive as HTTP 403. They are an
                 // intermediate page that WebKit must render so its JavaScript can issue
