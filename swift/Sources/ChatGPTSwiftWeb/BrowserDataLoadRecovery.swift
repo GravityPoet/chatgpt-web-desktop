@@ -5,6 +5,8 @@ import WebKit
 struct BrowserDataLoadState {
     var failures: [String] = []
     var requiresVerification = false
+    var verificationPath = "/backend-api/models"
+    var responseStatus: [String: Int] = [:]
     var hasFailure: Bool { requiresVerification || !failures.isEmpty }
     var summary: String { failures.isEmpty ? "ChatGPT 数据" : failures.joined(separator: "、") }
 }
@@ -19,6 +21,13 @@ extension BrowserWindowController {
               payload["path"] as? String == webView.url?.path,
               let failures = payload["failures"] as? [String: Bool],
               let challenged = payload["challenged"] as? Bool else { return }
+        if let path = payload["verificationPath"] as? String {
+            guard Self.isAllowedDataVerificationPath(path) else { return }
+            dataLoadState.verificationPath = path
+        }
+        if let statuses = payload["statuses"] as? [String: Int], statuses.count <= 16 {
+            dataLoadState.responseStatus = statuses.filter { Self.isAllowedDataVerificationPath($0.key) && (100...599).contains($0.value) }
+        }
         updateDataLoadState(failures: failures, challenged: challenged)
     }
 
@@ -64,7 +73,8 @@ extension BrowserWindowController {
         if let existing = dataVerificationWindow, !existing.isDisposing { existing.show(); return }
         guard let original = webView.url,
               var components = URLComponents(url: original, resolvingAgainstBaseURL: false) else { return }
-        components.path = "/backend-api/models"
+        guard Self.isAllowedDataVerificationPath(dataLoadState.verificationPath) else { return }
+        components.path = dataLoadState.verificationPath
         components.query = nil
         components.fragment = nil
         guard let verificationURL = components.url else { return }
@@ -102,20 +112,35 @@ extension BrowserWindowController {
         child.show()
     }
 
-    /// Inspect only the response metadata. A challenge page or an authentication error cannot
-    /// complete recovery; completion requires JSON from the exact same-origin verification URL.
+    /// Inspect only metadata. A protected endpoint can return 401 after its challenge completes
+    /// because this navigation carries cookies, without replaying the page's bearer headers.
     func noteDataVerificationResponse(_ response: HTTPURLResponse) {
         dataVerificationResponseReady = response.url == dataVerificationURL
-            && response.statusCode == 200
+            && (response.statusCode == 200 || (response.statusCode == 401 && cloudflareChallengeCount > 0))
             && response.mimeType?.lowercased() == "application/json"
             && !Self.isCloudflareChallengeResponse(response)
     }
 
+    func dataVerificationResponsePolicy(_ response: HTTPURLResponse) -> WKNavigationResponsePolicy? {
+        noteDataVerificationResponse(response)
+        guard dataVerificationResponseReady else { return nil }
+        // Authentication JSON can contain session material. Finish from headers and cancel
+        // this navigation before WebKit can render or download any response body.
+        DispatchQueue.main.async { [weak self] in _ = self?.finishDataVerificationIfReady() }
+        return .cancel
+    }
+
     func finishDataVerificationIfReady() -> Bool {
-        guard dataVerificationResponseReady, let complete = dataVerificationCompleted else { return false }
+        guard !isDisposing, dataVerificationResponseReady, let complete = dataVerificationCompleted else { return false }
         dataVerificationCompleted = nil
         complete()
         return true
+    }
+
+    static let dataVerificationPathPattern = #"^/(?:api/auth/session|backend-api/(?:models|me|conversations|accounts/check/v[0-9A-Za-z_-]+|gizmos/snorlax/sidebar|projects|flat_projects))$"#
+
+    static func isAllowedDataVerificationPath(_ path: String) -> Bool {
+        path.count <= 160 && path.range(of: dataVerificationPathPattern, options: .regularExpression) != nil
     }
 
     func reloadDataPagePreservingDraft() {
@@ -213,21 +238,25 @@ extension BrowserWindowController {
       if(window!==window.top || location.protocol!=='https:' || (location.port && location.port!=='443') ||
          !['chatgpt.com','chat.openai.com'].includes(host) || window.__chatgptSwiftDataLoadMonitor) return;
       const readFailures=()=>\(dataLoadFailureProbeScript);
+      const allowedPath=new RegExp('\(dataVerificationPathPattern)');
       const blocked=()=>location.pathname.startsWith('/cdn-cgi/') || !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
-      const challenges=new Set();let timer=0,last='',disposed=false,observer;
+      const challenges=new Set(),statuses={};let timer=0,last='',disposed=false,observer;
       const report=()=>{
         timer=0;if(disposed || blocked()) return;
-        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0};
+        const paths=[...challenges];
+        const verificationPath=paths.find(path=>path==='/api/auth/session') || paths.find(path=>path.startsWith('/backend-api/accounts/check/')) || paths[0] || '/backend-api/models';
+        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,verificationPath,statuses};
         const key=JSON.stringify(payload);if(key===last) return;last=key;
         try{window.webkit.messageHandlers.dataLoad.postMessage(payload);}catch(_){}
       };
       const schedule=()=>{if(!timer && !disposed) timer=setTimeout(report,200);};
       const responsePath=(raw,method)=>{
         try{const url=new URL(raw,location.href);return String(method||'GET').toUpperCase()==='GET' &&
-          url.origin===location.origin && url.pathname.startsWith('/backend-api/') ? url.pathname : null;}catch(_){return null;}
+          url.origin===location.origin && allowedPath.test(url.pathname) ? url.pathname : null;}catch(_){return null;}
       };
       const observeResponse=(path,status,header)=>{
         if(!path || disposed) return;
+        if(Object.keys(statuses).length<16 || path in statuses) statuses[path]=status;
         if(String(header||'').toLowerCase()==='challenge') challenges.add(path);
         else if(status>=200 && status<300) challenges.delete(path);
         schedule();

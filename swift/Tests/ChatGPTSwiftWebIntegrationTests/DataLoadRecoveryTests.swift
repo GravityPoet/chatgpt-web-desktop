@@ -144,6 +144,57 @@ final class DataLoadRecoveryTests: XCTestCase {
         waitUntil { !controller.dataLoadState.requiresVerification }
     }
 
+    func testVerificationUsesChallengedAccountEndpointAndRejectsOtherPaths() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/api/auth/session');'requested'", in: controller)
+        waitUntil { controller.dataLoadState.requiresVerification }
+        XCTAssertEqual(controller.dataLoadState.verificationPath, "/api/auth/session")
+        try evaluate("fetch('/backend-api/models');'requested'", in: controller)
+        settle()
+        XCTAssertEqual(controller.dataLoadState.verificationPath, "/api/auth/session")
+        XCTAssertTrue(BrowserWindowController.isAllowedDataVerificationPath("/backend-api/accounts/check/v4-2026-10-05"))
+        for path in ["/backend-api/logout", "/api/auth/signout", "/backend-api/models?code=fixture", "/backend-api/../logout", "https://example.com/backend-api/models"] {
+            XCTAssertFalse(BrowserWindowController.isAllowedDataVerificationPath(path))
+        }
+        try evaluate("window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/api/auth/session');fetch('/backend-api/models');'requested'", in: controller)
+        waitUntil { !controller.dataLoadState.requiresVerification }
+        try evaluate("window.webkit.messageHandlers.dataLoad.postMessage({path:location.pathname,failures:{},challenged:true,verificationPath:'/api/auth/signout'});'posted'", in: controller)
+        settle()
+        XCTAssertFalse(controller.dataLoadState.requiresVerification)
+    }
+
+    func testProtectedEndpointCanFinishChallengeWith401WithoutClaimingDataLoaded() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        let url = URL(string: "https://chatgpt.com/backend-api/accounts/check/v4-2026-10-05")!
+        controller.dataVerificationURL = url
+        controller.dataLoadState.failures = ["账户"]
+        let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 401, httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        var finished = false
+        controller.dataVerificationCompleted = { finished = true }
+        controller.noteDataVerificationResponse(response)
+        XCTAssertFalse(controller.finishDataVerificationIfReady())
+        controller.cloudflareChallengeCount = 1
+        controller.noteDataVerificationResponse(response)
+        XCTAssertTrue(controller.finishDataVerificationIfReady())
+        XCTAssertTrue(finished)
+        XCTAssertTrue(controller.dataLoadState.hasFailure)
+    }
+
+    func testAuthenticationJSONIsCancelledBeforeDisplayOrDownload() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        let url = URL(string: "https://chatgpt.com/api/auth/session")!
+        controller.dataVerificationURL = url
+        var finished = false
+        controller.dataVerificationCompleted = { finished = true }
+        let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        let policy = controller.dataVerificationResponsePolicy(response)
+        XCTAssertEqual(policy, .cancel)
+        waitUntil { finished }
+    }
+
     func testVerificationCompletionRequiresExactSuccessfulJSONResponse() throws {
         let controller = makeController()
         defer { controller.dispose() }
