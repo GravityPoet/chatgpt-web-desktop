@@ -115,7 +115,13 @@ extension BrowserWindowController {
     /// Inspect only metadata. A protected endpoint can return 401 after its challenge completes
     /// because this navigation carries cookies, without replaying the page's bearer headers.
     func noteDataVerificationResponse(_ response: HTTPURLResponse) {
-        dataVerificationResponseReady = response.url == dataVerificationURL
+        guard let target = dataVerificationURL, let url = response.url else { dataVerificationResponseReady = false; return }
+        // Cloudflare can retain its short-lived query after the challenge. Match the
+        // requested origin/path, while never forwarding or exposing that query.
+        let matchesTarget = url.scheme == target.scheme && url.host == target.host
+            && (url.port ?? 443) == (target.port ?? 443) && url.path == target.path
+            && url.user == nil && url.password == nil
+        dataVerificationResponseReady = matchesTarget
             && (response.statusCode == 200 || (response.statusCode == 401 && cloudflareChallengeCount > 0))
             && response.mimeType?.lowercased() == "application/json"
             && !Self.isCloudflareChallengeResponse(response)
