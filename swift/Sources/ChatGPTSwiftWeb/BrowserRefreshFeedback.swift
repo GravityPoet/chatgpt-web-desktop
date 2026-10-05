@@ -102,6 +102,11 @@ final class BrowserRefreshFeedback {
         transition(.failed)
     }
 
+    func dataLoadFailed() {
+        guard isManualRefresh else { return }
+        transition(.failed)
+    }
+
     func navigationCancelled(_ candidate: WKNavigation?) {
         guard accepts(candidate), state == .loading else { return }
         transition(.idle)
@@ -150,13 +155,17 @@ extension BrowserWindowController {
         let tint: NSColor?
         switch feedback.state {
         case .idle:
-            if modelLoadFailureActive {
+            if dataLoadState.requiresVerification {
+                label = "完成安全验证并重试"
+            } else if dataLoadState.hasFailure {
+                label = "重试加载\(dataLoadState.summary)"
+            } else if modelLoadFailureActive {
                 label = "重试加载模型"
             } else {
                 label = isShowingBlankContent ? "恢复空白页面" : "重新加载"
             }
             symbol = "arrow.clockwise"
-            tint = modelLoadFailureActive ? .systemOrange : nil
+            tint = modelLoadFailureActive || dataLoadState.hasFailure ? .systemOrange : nil
         case .loading:
             if isCloudflareChallengeActive {
                 label = "正在验证页面"
@@ -173,7 +182,7 @@ extension BrowserWindowController {
             symbol = "checkmark.circle.fill"
             tint = .systemGreen
         case .failed:
-            label = "\(verb)未完成，点击重试"
+            label = dataLoadState.requiresVerification ? "完成安全验证并重试" : "\(verb)未完成，点击重试"
             symbol = "exclamationmark.triangle.fill"
             tint = .systemOrange
         }
@@ -224,7 +233,9 @@ extension BrowserWindowController {
                 }
             } else {
                 self.lastRenderProbeWasBlank = blank && !challenge
-                self.refreshFeedback.verified(navigation, generation: expected, success: ready && !challenge && !blank)
+                self.refreshFeedback.verified(navigation, generation: expected,
+                                              success: ready && !challenge && !blank && !self.dataLoadState.hasFailure
+                                                && report["dataLoadFailure"] as? Bool != true)
                 self.updateNativeChromeStatus()
             }
         }
