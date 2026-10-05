@@ -84,6 +84,14 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var modelLoadFailureLastAt: Date?
     var modelLoadFailureWatchdogGeneration = 0
     var modelLoadFailureWatchdogWorkItem: DispatchWorkItem?
+    var dataLoadState = BrowserDataLoadState()
+    var dataVerificationWindow: BrowserWindowController?
+    var dataVerificationURL: URL?
+    var dataVerificationResponseReady = false
+    var dataVerificationCompleted: (() -> Void)?
+    var dataRecoveryCapturePending = false
+    var dataRecoveryCaptureGeneration = 0
+    var dataRecoveryDraft: (url: URL, text: String)?
     var hasActiveDownload: Bool { !activeDownloads.isEmpty || !remoteImageLoaders.isEmpty }
     var downloadScope: String { persistent ? (profileID ?? defaultProfileID) : privateDownloadID }
     private var remoteImageLoaders: [UUID: RemoteImageLoader] = [:]
@@ -201,7 +209,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.translatesAutoresizingMaskIntoConstraints = false
         statusOverlay = BrowserStatusOverlayView()
         statusOverlay.primaryAction = { [weak self] in
-            self?.reload(nil)
+            guard let self else { return }
+            if self.dataLoadState.hasFailure { self.recoverDataLoad() }
+            else { self.reload(nil) }
         }
         contentContainer.addSubview(webView)
         contentContainer.addSubview(statusOverlay)
@@ -253,6 +263,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func reload(_ sender: Any?) {
+        if dataLoadState.hasFailure { recoverDataLoad(); return }
         guard !isDisposing, refreshFeedback.beginRefresh() else { return }
         // Start feedback synchronously, without waiting for JavaScript on a busy page.
         let navigation = hasFailedNavigation || isShowingBlankContent
@@ -456,6 +467,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("modelLoadFailureActive", modelLoadFailureActive ? "true" : "false"),
             ("modelLoadFailureCount", "\(modelLoadFailureCount)"),
             ("modelLoadFailureLastAt", Self.diagnosticDateString(modelLoadFailureLastAt)),
+            ("dataLoadFailures", dataLoadState.failures.joined(separator: ", ")),
+            ("dataLoadVerificationRequired", String(dataLoadState.requiresVerification)),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -493,7 +506,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         switch currentOverlayMode {
         case .hidden:
             overlayHealthy = true
-        case .recovering, .failed, .blank:
+        case .recovering, .failed, .blank, .dataLoadFailed:
             overlayHealthy = false
         }
 
@@ -507,6 +520,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             && overlayHealthy
             && !isCloudflareChallengeActive
             && !modelLoadFailureActive
+            && !dataLoadState.hasFailure
         let passed = windowVisible
             && hasContentAddress
             && !webView.isLoading
@@ -528,6 +542,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             "nativeStatusOverlay=\(DiagnosticRedactor.text(currentOverlayMode.diagnosticDescription))",
             "cloudflareChallengeActive=\(isCloudflareChallengeActive)",
             "modelLoadFailureActive=\(modelLoadFailureActive)",
+            "dataLoadFailures=\(dataLoadState.failures.joined(separator: ","))",
+            "dataLoadVerificationRequired=\(dataLoadState.requiresVerification)",
             "navigationFailureCount=\(navigationFailureCount)",
             "lastNavigationFailure=\(DiagnosticRedactor.text(lastNavigationFailureDescription))",
             "webContentProcessTerminationCount=\(webContentProcessTerminationCount)",
@@ -839,6 +855,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         didTearDownWebView = true
+        dataVerificationWindow?.dispose()
+        dataVerificationWindow = nil
+        dataVerificationCompleted = nil
+        dataRecoveryDraft = nil
         invalidateCloudflareChallengeTracking()
         invalidateModelLoadFailureTracking()
         refreshFeedback.invalidate()
@@ -852,7 +872,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         let userContentController = webView.configuration.userContentController
-        for name in ["downloadBlob", "promptDraft", "completionState", "pageState", "dialogDismissal"] {
+        for name in ["downloadBlob", "promptDraft", "completionState", "pageState", "dialogDismissal", "dataLoad"] {
             userContentController.removeScriptMessageHandler(forName: name)
         }
         userContentController.removeAllUserScripts()
@@ -863,9 +883,18 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         statusOverlay?.update(mode: mode)
     }
 
+    func showDataLoadOverlay(_ mode: BrowserStatusOverlayMode) {
+        if case .recovering = currentOverlayMode { return }
+        showStatusOverlay(mode)
+    }
+
+    func hideDataLoadOverlay() {
+        if case .dataLoadFailed = currentOverlayMode { showStatusOverlay(.hidden) }
+    }
+
     private func hideStatusOverlayIfTransient() {
         switch currentOverlayMode {
-        case .hidden, .failed, .blank:
+        case .hidden, .failed, .blank, .dataLoadFailed:
             return
         case .recovering:
             showStatusOverlay(.hidden)
@@ -1000,6 +1029,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
                 confirmed: reason == "model load watchdog",
                 generation: generation
             )
+            if let failures = report["dataLoadFailures"] as? [String: Bool] {
+                updateDataLoadState(failures: failures)
+            }
             if isChallenge {
                 beginCloudflareChallenge(reason: "内容探针检测到挑战页")
             } else if isCloudflareChallengeActive,
@@ -1107,6 +1139,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         guard refreshFeedback.navigationStarted(navigation) else { return }
+        dataLoadState = BrowserDataLoadState()
+        dataVerificationResponseReady = false
         navigationHTTPFailure = nil
         isAssistantResponseInProgress = false
         lastNavigationStartedAt = Date()
@@ -1261,6 +1295,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     func webView(_ webView: WKWebView, decidePolicyFor navigationResponse: WKNavigationResponse,
                  decisionHandler: @escaping @MainActor @Sendable (WKNavigationResponsePolicy) -> Void) {
         if navigationResponse.isForMainFrame, let response = navigationResponse.response as? HTTPURLResponse {
+            if dataVerificationURL != nil { noteDataVerificationResponse(response) }
             if Self.isCloudflareChallengeResponse(response) {
                 // Cloudflare challenge pages commonly arrive as HTTP 403. They are an
                 // intermediate page that WebKit must render so its JavaScript can issue
@@ -1309,6 +1344,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         guard refreshFeedback.accepts(navigation) else { return }
         lastNavigationFinishedAt = Date()
+        if finishDataVerificationIfReady() { return }
         if let navigationHTTPFailure {
             hasFailedNavigation = true
             lastFailureStatus = navigationHTTPFailure
@@ -1334,9 +1370,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.pageZoom = currentZoom
         clearInjectedZoomState()
         configureDraftExperience()
+        restoreDataRecoveryDraft()
         restorePagePosition()
         scheduleRenderedContentProbe(reason: "navigation finished", delay: 2.0)
         updateNativeChromeStatus()
+        updateDataLoadOverlay()
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -1696,6 +1734,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "dataLoad" { handleDataLoadMessage(message); return }
         if message.name == "pageState" { handlePageStateMessage(message); return }
         if message.name == "promptDraft" {
             handlePromptDraftMessage(message)
@@ -2599,23 +2638,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
       const bodyChildren = body ? body.children.length : 0;
       const domCount = document.getElementsByTagName('*').length;
-      let modelLoadFailure = false;
-      if (body) {
-        const failureNeedles = [
-          '无法加载 chatgpt 模型',
-          '无法加载模型',
-          'failed to load model',
-          'unable to load model'
-        ];
-        const candidates = body.querySelectorAll('button,[role="button"],[role="status"],p,span');
-        for (const element of Array.from(candidates).slice(0, 240)) {
-          const text = String(element.textContent || '').trim().toLowerCase().slice(0, 160);
-          if (failureNeedles.some((needle) => text.includes(needle))) {
-            modelLoadFailure = true;
-            break;
-          }
-        }
-      }
+      const dataLoadFailures = \(dataLoadFailureProbeScript);
+      const modelLoadFailure = dataLoadFailures.models;
       return {
         blank: !cloudflareChallenge && (!body || (textLength < 8 && visibleElements === 0)),
         cloudflareChallenge,
@@ -2626,7 +2650,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         visibleElements,
         bodyChildren,
         domCount,
-        modelLoadFailure
+        modelLoadFailure,
+        dataLoadFailures,
+        dataLoadFailure: Object.values(dataLoadFailures).some(Boolean)
       };
     })()
     """
@@ -2721,6 +2747,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.add(messageHandler, name: "pageState")
         userContentController.add(messageHandler, name: "completionState")
         userContentController.add(messageHandler, name: "dialogDismissal")
+        userContentController.add(messageHandler, name: "dataLoad")
         let fingerprint = ProfileStore.fingerprint(for: profileID)
         let enhancedPrivacyEnabled = ProfileStore.isEnhancedPrivacyEnabled(for: profileID)
         let webRTCProtectionEnabled = PrivacySettings.isWebRTCProtectionEnabled()
@@ -2738,6 +2765,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         userContentController.addUserScript(WKUserScript(source: completionStateObserverScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: chatDialogDismissalRecoveryScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: conversationNavigatorScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
+        userContentController.addUserScript(WKUserScript(source: dataLoadMonitorScript, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         userContentController.addUserScript(WKUserScript(source: passkeyLimitationNoticeScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))

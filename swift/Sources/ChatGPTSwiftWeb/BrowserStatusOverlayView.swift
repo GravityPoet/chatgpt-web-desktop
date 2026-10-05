@@ -5,6 +5,7 @@ enum BrowserStatusOverlayMode: Equatable {
     case recovering(String)
     case blank(String)
     case failed(String)
+    case dataLoadFailed(String, verification: Bool)
 
     var isVisible: Bool {
         self != .hidden
@@ -20,6 +21,8 @@ enum BrowserStatusOverlayMode: Equatable {
             return "页面显示为空"
         case .failed:
             return "页面加载失败"
+        case let .dataLoadFailed(_, verification):
+            return verification ? "需要完成安全验证" : "ChatGPT 数据加载失败"
         }
     }
 
@@ -33,6 +36,8 @@ enum BrowserStatusOverlayMode: Equatable {
             return reason
         case let .failed(message):
             return message
+        case let .dataLoadFailed(message, _):
+            return message
         }
     }
 
@@ -40,7 +45,7 @@ enum BrowserStatusOverlayMode: Equatable {
         switch self {
         case .recovering:
             return true
-        case .hidden, .blank, .failed:
+        case .hidden, .blank, .failed, .dataLoadFailed:
             return false
         }
     }
@@ -53,6 +58,8 @@ enum BrowserStatusOverlayMode: Equatable {
             return "重新加载"
         case .recovering, .blank:
             return "恢复"
+        case let .dataLoadFailed(_, verification):
+            return verification ? "验证并重试" : "重新加载"
         }
     }
 
@@ -66,6 +73,8 @@ enum BrowserStatusOverlayMode: Equatable {
             return "blank \(reason)"
         case let .failed(message):
             return "failed \(message)"
+        case let .dataLoadFailed(message, verification):
+            return "dataLoadFailed verification=\(verification) \(message)"
         }
     }
 }
