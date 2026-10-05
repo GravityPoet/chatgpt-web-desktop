@@ -189,7 +189,8 @@ final class DataLoadRecoveryTests: XCTestCase {
         controller.dataVerificationURL = url
         var finished = false
         controller.dataVerificationCompleted = { finished = true }
-        let response = try XCTUnwrap(HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        let responseURL = try XCTUnwrap(URL(string: url.absoluteString + "?__cf_chl_tk=fixture"))
+        let response = try XCTUnwrap(HTTPURLResponse(url: responseURL, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
         let policy = controller.dataVerificationResponsePolicy(response)
         XCTAssertEqual(policy, .cancel)
         waitUntil { finished }
