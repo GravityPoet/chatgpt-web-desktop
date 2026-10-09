@@ -28,6 +28,26 @@ HAD_PREVIOUS=0
 DISPLACED_READY=0
 INSTALL_REPLACED=0
 
+prune_backup_archives() {
+  backup_root="$HOME/Library/Application Support/Codex/Backups/ChatGPTSwift"
+  [[ -d "$backup_root" ]] || return 0
+
+  keep_count=0
+  while IFS= read -r backup_dir; do
+    [[ -n "$backup_dir" ]] || continue
+    backup_zip="$backup_dir/$APP_NAME.app.zip"
+    if [[ ! -s "$backup_zip" ]] || ! /usr/bin/unzip -tq "$backup_zip" >/dev/null 2>&1; then
+      rm -rf "$backup_dir"
+      continue
+    fi
+    if [[ "$keep_count" -lt 2 ]]; then
+      keep_count=$((keep_count + 1))
+    else
+      rm -rf "$backup_dir"
+    fi
+  done < <(/usr/bin/find "$backup_root" -mindepth 1 -maxdepth 1 -type d -name '20*' -print | LC_ALL=C /usr/bin/sort -r)
+}
+
 unregister_app_bundle() {
   app_bundle="$1"
   if [[ -d "$app_bundle/Contents" ]]; then
@@ -117,6 +137,7 @@ if [[ -d "$INSTALL_APP" ]]; then
   BACKUP_APP="$VERIFY_ROOT/$APP_NAME.app"
   [[ "$(/usr/bin/plutil -extract CFBundleIdentifier raw "$BACKUP_APP/Contents/Info.plist" 2>/dev/null || true)" == "$BUNDLE_ID" ]]
   /usr/bin/codesign --verify --deep --strict "$BACKUP_APP"
+  prune_backup_archives
 fi
 
 /usr/bin/osascript -e 'tell application id "local.chatgpt-web.swift" to quit' >/dev/null 2>&1 || true
