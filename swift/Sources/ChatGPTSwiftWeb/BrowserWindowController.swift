@@ -89,6 +89,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var dataVerificationURL: URL?
     var dataVerificationResponseReady = false
     var dataVerificationCompleted: (() -> Void)?
+    var dataVerificationAutoOpenGeneration = 0
+    var dataVerificationAutoOpenWorkItem: DispatchWorkItem?
     var dataRecoveryCapturePending = false
     var dataRecoveryCaptureGeneration = 0
     var dataRecoveryDraft: (url: URL, text: String)?
@@ -471,6 +473,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("dataLoadVerificationRequired", String(dataLoadState.requiresVerification)),
             ("dataLoadVerificationPath", dataLoadState.verificationPath),
             ("dataLoadResponseStatus", dataLoadState.responseStatus.keys.sorted().map { "\($0)=\(dataLoadState.responseStatus[$0]!)" }.joined(separator: ", ")),
+            ("dataVerificationWindowOpen", String(dataVerificationWindow != nil)),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -860,6 +863,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         dataVerificationWindow?.dispose()
         dataVerificationWindow = nil
         dataVerificationCompleted = nil
+        dataVerificationAutoOpenGeneration &+= 1
+        dataVerificationAutoOpenWorkItem?.cancel()
+        dataVerificationAutoOpenWorkItem = nil
         dataRecoveryDraft = nil
         invalidateCloudflareChallengeTracking()
         invalidateModelLoadFailureTracking()
@@ -1819,6 +1825,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         let previous = isAssistantResponseInProgress
         isAssistantResponseInProgress = isBusy
         lastCompletionObservationSummary = "\(Self.diagnosticDateString(Date())) busy=\(isBusy), reason=\(reason)"
+
+        if previous, !isBusy, dataLoadState.requiresVerification {
+            scheduleAutomaticDataVerification()
+        }
 
         guard previous, !isBusy, BackgroundCompletionNotifications.isEnabled() else {
             return

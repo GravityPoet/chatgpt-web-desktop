@@ -40,9 +40,34 @@ extension BrowserWindowController {
             modelLoadFailureLastAt = Date()
         }
         modelLoadFailureActive = failures["models"] == true
+        if dataLoadState.requiresVerification {
+            scheduleAutomaticDataVerification()
+        }
         if dataLoadState.hasFailure { refreshFeedback.dataLoadFailed() }
         updateDataLoadOverlay()
         updateNativeChromeStatus()
+    }
+
+    /// Cloudflare challenge responses are already a browser-verification event. Open the
+    /// same-account WebKit window immediately; the toolbar/button remains only as a fallback
+    /// after the automatic window is closed or if the first open is interrupted.
+    func scheduleAutomaticDataVerification() {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              !isAssistantResponseInProgress,
+              Self.canInjectPromptContent(into: webView.url), dataVerificationWindow == nil else { return }
+        dataVerificationAutoOpenGeneration &+= 1
+        let generation = dataVerificationAutoOpenGeneration
+        dataVerificationAutoOpenWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.isDisposing,
+                  self.dataVerificationAutoOpenGeneration == generation,
+                  self.dataLoadState.requiresVerification,
+                  self.dataVerificationWindow == nil else { return }
+            self.dataVerificationAutoOpenWorkItem = nil
+            self.openDataVerificationWindow()
+        }
+        dataVerificationAutoOpenWorkItem = work
+        DispatchQueue.main.async(execute: work)
     }
 
     func updateDataLoadOverlay() {
@@ -108,6 +133,7 @@ extension BrowserWindowController {
             self.reloadDataPagePreservingDraft()
         }
         dataVerificationWindow = child
+        dataVerificationAutoOpenWorkItem = nil
         child.webView.load(URLRequest(url: verificationURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
         child.show()
     }
