@@ -121,12 +121,28 @@ final class DataLoadRecoveryTests: XCTestCase {
         let samePromise = try evaluate("window.__fixtureChallenge=true;fetch(new URL('/backend-api/models',location.origin))===window.__fixturePromise", in: controller)
         XCTAssertEqual(samePromise as? Bool, true)
         waitUntil { controller.dataLoadState.requiresVerification }
+        waitUntil { controller.dataVerificationWindow != nil }
         XCTAssertEqual(controller.navigationReloadButton?.accessibilityLabel(), "完成安全验证并重试")
         try evaluate("window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/conversations');'requested'", in: controller)
         settle()
         XCTAssertTrue(controller.dataLoadState.requiresVerification)
         try evaluate("fetch('/backend-api/models');'requested'", in: controller)
         waitUntil { !controller.dataLoadState.requiresVerification }
+    }
+
+    func testChallengeAutomaticallyOpensSameAccountVerificationWindowWithoutClick() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');'requested'", in: controller)
+        waitUntil { controller.dataLoadState.requiresVerification }
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        XCTAssertEqual(child.window.title, "完成 ChatGPT 安全验证")
+        XCTAssertTrue(child.window.isVisible)
+        XCTAssertTrue(child.webView.configuration.websiteDataStore === controller.webView.configuration.websiteDataStore)
+        XCTAssertEqual(child.dataVerificationURL?.path, "/backend-api/models")
+        child.window.performClose(nil)
+        waitUntil { controller.dataVerificationWindow == nil }
+        XCTAssertTrue(controller.dataLoadState.requiresVerification)
     }
 
     func testReusedXHRUsesCurrentRequestAndCannotTreatPostAsChallengedGet() throws {
@@ -260,6 +276,10 @@ final class DataLoadRecoveryTests: XCTestCase {
         defer { controller.dispose() }
         try evaluate("document.querySelector('textarea').value='仍在编辑';window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');'requested'", in: controller)
         waitUntil { controller.dataLoadState.requiresVerification }
+        if let automaticWindow = controller.dataVerificationWindow {
+            automaticWindow.window.performClose(nil)
+            waitUntil { controller.dataVerificationWindow == nil }
+        }
         controller.isAssistantResponseInProgress = true
         controller.recoverDataLoad()
         XCTAssertNil(controller.dataVerificationWindow)
