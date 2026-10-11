@@ -90,7 +90,19 @@ public enum NavigationRules {
             }
             return nil
         case "about":
-            return url.absoluteString.lowercased() == "about:blank" ? nil : .unsupportedInternalPage
+            let normalized = url.absoluteString.lowercased()
+            if normalized == "about:blank" {
+                return nil
+            }
+            if normalized == "about:srcdoc",
+               let sourceScheme = sourceURL?.scheme?.lowercased(),
+               ["https", "blob", "data", "about"].contains(sourceScheme) {
+                // Standard iframe documents are used by Cloudflare's challenge scripts.
+                // WebKit still applies the parent origin and iframe sandbox; allowing
+                // navigation does not grant native bridge access to a subframe.
+                return nil
+            }
+            return .unsupportedInternalPage
         case "blob", "data":
             let sourceScheme = sourceURL?.scheme?.lowercased()
             return ["https", "blob", "data", "about"].contains(sourceScheme) ? nil : .missingContentSource

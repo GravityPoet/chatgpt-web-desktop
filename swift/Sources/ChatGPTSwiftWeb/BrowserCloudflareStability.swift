@@ -79,6 +79,7 @@ extension BrowserWindowController {
         cancelCloudflareChallengeWatchdog()
         refreshCloudflareChallengeCookieStatus()
         updateNativeChromeStatus()
+        completeDataVerificationIfReady()
     }
 
     func failCloudflareChallenge(reason: String) {

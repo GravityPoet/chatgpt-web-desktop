@@ -87,8 +87,13 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var dataLoadState = BrowserDataLoadState()
     var dataVerificationWindow: BrowserWindowController?
     var dataVerificationURL: URL?
+    var dataVerificationTargetPath: String?
     var dataVerificationResponseReady = false
     var dataVerificationCompleted: (() -> Void)?
+    private var dataVerificationContent: NSView?
+    weak var dataVerificationParent: BrowserWindowController?
+    var ownsDataVerificationMessageHandler = false
+    var dataVerificationReloadURL: URL?
     var dataVerificationAutoOpenGeneration = 0
     var dataVerificationAutoOpenWorkItem: DispatchWorkItem?
     var dataRecoveryCapturePending = false
@@ -265,7 +270,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     @objc func reload(_ sender: Any?) {
-        if dataLoadState.hasFailure { recoverDataLoad(); return }
+        if let verification = dataVerificationWindow { verification.reload(sender); return }
+        if dataVerificationURL == nil, dataLoadState.hasFailure { recoverDataLoad(); return }
         guard !isDisposing, refreshFeedback.beginRefresh() else { return }
         // Start feedback synchronously, without waiting for JavaScript on a busy page.
         let navigation = hasFailedNavigation || isShowingBlankContent
@@ -292,16 +298,16 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     var canGoBack: Bool {
-        webView.canGoBack
+        dataVerificationWindow == nil && webView.canGoBack
     }
 
     var canGoForward: Bool {
-        webView.canGoForward
+        dataVerificationWindow == nil && webView.canGoForward
     }
 
     @objc func goBack(_ sender: Any?) {
         guard !isDisposing else { return }
-        guard webView.canGoBack else {
+        guard canGoBack else {
             return
         }
         webView.goBack()
@@ -309,7 +315,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
 
     @objc func goForward(_ sender: Any?) {
         guard !isDisposing else { return }
-        guard webView.canGoForward else {
+        guard canGoForward else {
             return
         }
         webView.goForward()
@@ -474,6 +480,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("dataLoadVerificationPath", dataLoadState.verificationPath),
             ("dataLoadResponseStatus", dataLoadState.responseStatus.keys.sorted().map { "\($0)=\(dataLoadState.responseStatus[$0]!)" }.joined(separator: ", ")),
             ("dataVerificationWindowOpen", String(dataVerificationWindow != nil)),
+            ("dataVerificationPresentation", dataVerificationContent == nil ? "none" : "in-window"),
+            ("dataVerificationReloadPending", String(dataVerificationReloadURL != nil)),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -511,7 +519,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         switch currentOverlayMode {
         case .hidden:
             overlayHealthy = true
-        case .recovering, .failed, .blank, .dataLoadFailed:
+        case .recovering, .failed, .blank, .dataLoadFailed, .verifying:
             overlayHealthy = false
         }
 
@@ -850,6 +858,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         }
         didFinishWindowClose = true
         Self.controllers.removeAll { $0 === self }
+        if let parent = dataVerificationParent, parent.dataVerificationWindow === self {
+            parent.dismissDataVerification()
+        }
         let handler = closeHandler
         closeHandler = nil
         handler?()
@@ -860,9 +871,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         didTearDownWebView = true
-        dataVerificationWindow?.dispose()
-        dataVerificationWindow = nil
+        dismissDataVerification()
         dataVerificationCompleted = nil
+        dataVerificationURL = nil
+        dataVerificationTargetPath = nil
+        dataVerificationResponseReady = false
+        dataVerificationReloadURL = nil
         dataVerificationAutoOpenGeneration &+= 1
         dataVerificationAutoOpenWorkItem?.cancel()
         dataVerificationAutoOpenWorkItem = nil
@@ -876,6 +890,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         webView.stopLoading()
         webView.navigationDelegate = nil
         webView.uiDelegate = nil
+        if ownsDataVerificationMessageHandler {
+            webView.configuration.userContentController.removeScriptMessageHandler(forName: "dataLoad")
+            webView.configuration.userContentController.removeAllUserScripts()
+            ownsDataVerificationMessageHandler = false
+        }
         guard ownsNativeMessageHandlers else {
             return
         }
@@ -897,12 +916,49 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     func hideDataLoadOverlay() {
-        if case .dataLoadFailed = currentOverlayMode { showStatusOverlay(.hidden) }
+        switch currentOverlayMode {
+        case .dataLoadFailed, .verifying: showStatusOverlay(.hidden)
+        default: break
+        }
+    }
+
+    func presentDataVerification(_ child: BrowserWindowController) {
+        guard let content = child.window.contentView else { return }
+        child.window.contentView = nil
+        content.translatesAutoresizingMaskIntoConstraints = false
+        contentContainer.addSubview(content, positioned: .above, relativeTo: nil)
+        NSLayoutConstraint.activate([
+            content.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor),
+            content.topAnchor.constraint(equalTo: contentContainer.topAnchor),
+            content.bottomAnchor.constraint(equalTo: contentContainer.bottomAnchor)
+        ])
+        dataVerificationContent = content
+        child.dataVerificationParent = self
+        webView.isHidden = true
+        showStatusOverlay(.hidden)
+        window.makeFirstResponder(child.webView)
+        updateNativeChromeStatus()
+    }
+
+    func dismissDataVerification() {
+        let child = dataVerificationWindow
+        dataVerificationContent?.removeFromSuperview()
+        dataVerificationContent = nil
+        dataVerificationWindow = nil
+        child?.dataVerificationParent = nil
+        child?.dispose()
+        webView.isHidden = false
+        if !isDisposing {
+            if child != nil { window.makeFirstResponder(webView) }
+            updateDataLoadOverlay()
+            updateNativeChromeStatus()
+        }
     }
 
     private func hideStatusOverlayIfTransient() {
         switch currentOverlayMode {
-        case .hidden, .failed, .blank, .dataLoadFailed:
+        case .hidden, .failed, .blank, .dataLoadFailed, .verifying:
             return
         case .recovering:
             showStatusOverlay(.hidden)
@@ -1147,6 +1203,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             return
         }
         guard refreshFeedback.navigationStarted(navigation) else { return }
+        dataVerificationAutoOpenGeneration &+= 1
+        dataVerificationAutoOpenWorkItem?.cancel()
+        dataVerificationAutoOpenWorkItem = nil
+        dismissDataVerification()
+        dataVerificationReloadURL = nil
         dataLoadState = BrowserDataLoadState()
         dataVerificationResponseReady = false
         navigationHTTPFailure = nil
@@ -1812,7 +1873,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     }
 
     private func handleCompletionStateMessage(_ message: WKScriptMessage) {
-        guard persistent, !isDisposing, ProfileStore.pendingDataMutation == nil,
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              message.webView === webView,
               message.frameInfo.isMainFrame,
               Self.isTrustedChatGPTBridgeOrigin(message.frameInfo.securityOrigin),
               let payload = message.body as? [String: Any]
@@ -1826,11 +1888,11 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         isAssistantResponseInProgress = isBusy
         lastCompletionObservationSummary = "\(Self.diagnosticDateString(Date())) busy=\(isBusy), reason=\(reason)"
 
-        if previous, !isBusy, dataLoadState.requiresVerification {
-            scheduleAutomaticDataVerification()
+        if previous, !isBusy {
+            resumeDataRecoveryWhenIdle()
         }
 
-        guard previous, !isBusy, BackgroundCompletionNotifications.isEnabled() else {
+        guard persistent, previous, !isBusy, BackgroundCompletionNotifications.isEnabled() else {
             return
         }
 

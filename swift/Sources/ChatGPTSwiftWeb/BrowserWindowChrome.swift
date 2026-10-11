@@ -324,14 +324,14 @@ extension BrowserWindowController {
             return
         }
 
-        navigationBackButton?.isEnabled = webView.canGoBack
-        navigationForwardButton?.isEnabled = webView.canGoForward
-        toolbarItems[.chatGPTBack]?.isEnabled = webView.canGoBack
-        toolbarItems[.chatGPTForward]?.isEnabled = webView.canGoForward
+        navigationBackButton?.isEnabled = canGoBack
+        navigationForwardButton?.isEnabled = canGoForward
+        toolbarItems[.chatGPTBack]?.isEnabled = canGoBack
+        toolbarItems[.chatGPTForward]?.isEnabled = canGoForward
         updateRefreshButtonAppearance()
         if let menuItems = toolbarItems[.chatGPTNavigation]?.menuFormRepresentation?.submenu?.items {
-            menuItems[0].isEnabled = webView.canGoBack
-            menuItems[1].isEnabled = webView.canGoForward
+            menuItems[0].isEnabled = canGoBack
+            menuItems[1].isEnabled = canGoForward
         }
 
         if let blockedNavigationStatus {
@@ -345,6 +345,12 @@ extension BrowserWindowController {
                 ? "人机验证等待中，请保持当前网络和窗口不变"
                 : "正在完成人机验证…"
             setStatus(waiting, showsProgress: false)
+        } else if dataVerificationWindow != nil {
+            setStatus(dataVerificationWindow?.lastFailureStatus ?? "正在自动验证，完成后继续", showsProgress: false)
+        } else if dataVerificationReloadURL != nil || (dataLoadState.requiresVerification && isAssistantResponseInProgress) {
+            setStatus("等待回答结束后自动继续", showsProgress: false)
+        } else if dataVerificationAutoOpenWorkItem != nil {
+            setStatus("正在打开安全验证…", showsProgress: false)
         } else if dataLoadState.requiresVerification {
             setStatus("需要完成安全验证，点击验证并重试", showsProgress: false)
         } else if dataLoadState.hasFailure {
@@ -367,6 +373,7 @@ extension BrowserWindowController {
         }
 
         window.toolbar?.validateVisibleItems()
+        dataVerificationParent?.updateNativeChromeStatus()
     }
 
     static func statusLocationText(for url: URL?) -> String {

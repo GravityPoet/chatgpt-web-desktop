@@ -40,30 +40,35 @@ extension BrowserWindowController {
             modelLoadFailureLastAt = Date()
         }
         modelLoadFailureActive = failures["models"] == true
-        if dataLoadState.requiresVerification {
+        if dataLoadState.requiresVerification, dataVerificationURL == nil {
             scheduleAutomaticDataVerification()
         }
+        completeDataVerificationIfReady()
         if dataLoadState.hasFailure { refreshFeedback.dataLoadFailed() }
         updateDataLoadOverlay()
         updateNativeChromeStatus()
     }
 
-    /// Cloudflare challenge responses are already a browser-verification event. Open the
-    /// same-account WebKit window immediately; the toolbar/button remains only as a fallback
-    /// after the automatic window is closed or if the first open is interrupted.
+    /// Keep verification in this window, with the original document and unsent input alive
+    /// behind it. Repeated response reports share one verification document.
     func scheduleAutomaticDataVerification() {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil,
               !isAssistantResponseInProgress,
-              Self.canInjectPromptContent(into: webView.url), dataVerificationWindow == nil else { return }
+              !dataRecoveryCapturePending,
+              dataVerificationURL == nil, dataVerificationWindow == nil,
+              dataVerificationAutoOpenWorkItem == nil, dataVerificationReloadURL == nil,
+              Self.canInjectPromptContent(into: webView.url) else { return }
         dataVerificationAutoOpenGeneration &+= 1
         let generation = dataVerificationAutoOpenGeneration
-        dataVerificationAutoOpenWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self, !self.isDisposing,
-                  self.dataVerificationAutoOpenGeneration == generation,
+                  self.dataVerificationAutoOpenGeneration == generation else { return }
+            self.dataVerificationAutoOpenWorkItem = nil
+            guard ProfileStore.pendingDataMutation == nil, !self.isAssistantResponseInProgress,
+                  !self.dataRecoveryCapturePending, self.dataVerificationReloadURL == nil,
+                  self.dataVerificationURL == nil, Self.canInjectPromptContent(into: self.webView.url),
                   self.dataLoadState.requiresVerification,
                   self.dataVerificationWindow == nil else { return }
-            self.dataVerificationAutoOpenWorkItem = nil
             self.openDataVerificationWindow()
         }
         dataVerificationAutoOpenWorkItem = work
@@ -71,8 +76,17 @@ extension BrowserWindowController {
     }
 
     func updateDataLoadOverlay() {
+        if dataVerificationWindow != nil { hideDataLoadOverlay(); return }
         guard !isDisposing, !webView.isLoading, !hasFailedNavigation,
               !isCloudflareChallengeActive, Self.canInjectPromptContent(into: webView.url) else { return }
+        if dataVerificationReloadURL != nil || (dataLoadState.requiresVerification && isAssistantResponseInProgress) {
+            showDataLoadOverlay(.verifying("回答结束后将自动继续，当前输入会保留。"))
+            return
+        }
+        if dataLoadState.requiresVerification && dataVerificationAutoOpenWorkItem != nil {
+            showDataLoadOverlay(.verifying("正在打开安全验证，完成后自动继续。"))
+            return
+        }
         if dataLoadState.hasFailure {
             let detail = dataLoadState.requiresVerification
                 ? "安全验证拦截了数据请求。完成验证后会自动重新加载，保留当前输入。"
@@ -87,7 +101,9 @@ extension BrowserWindowController {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil,
               Self.canInjectPromptContent(into: webView.url) else { return }
         guard !isAssistantResponseInProgress else {
-            showToast("回答完成后可重试加载；当前回答会继续")
+            if !dataLoadState.requiresVerification { dataVerificationReloadURL = webView.url }
+            updateDataLoadOverlay()
+            showToast("回答结束后会自动继续加载，当前输入会保留")
             return
         }
         if dataLoadState.requiresVerification { openDataVerificationWindow() }
@@ -95,10 +111,14 @@ extension BrowserWindowController {
     }
 
     func openDataVerificationWindow() {
-        if let existing = dataVerificationWindow, !existing.isDisposing { existing.show(); return }
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil, dataVerificationURL == nil,
+              Self.canInjectPromptContent(into: webView.url) else { return }
+        if dataVerificationWindow != nil { return }
         guard let original = webView.url,
-              var components = URLComponents(url: original, resolvingAgainstBaseURL: false) else { return }
-        guard Self.isAllowedDataVerificationPath(dataLoadState.verificationPath) else { return }
+              var components = URLComponents(url: original, resolvingAgainstBaseURL: false),
+              Self.isAllowedDataVerificationPath(dataLoadState.verificationPath) else { return }
+        // A top-level navigation can render the challenged endpoint's HTML. Verifying the
+        // homepage alone does not establish clearance for a more restricted API endpoint.
         components.path = dataLoadState.verificationPath
         components.query = nil
         components.fragment = nil
@@ -107,35 +127,63 @@ extension BrowserWindowController {
         configuration.websiteDataStore = webView.configuration.websiteDataStore
         configuration.applicationNameForUserAgent = webView.configuration.applicationNameForUserAgent
         configuration.preferences.javaScriptCanOpenWindowsAutomatically = true
-        // Keep the account's fingerprint/privacy shims, without granting this verification
-        // window any of the original page's native data bridges.
+        // Keep the account's fingerprint/privacy shims. Only response metadata is bridged
+        // from the verification document; drafts and downloads stay on the original page.
         let shims = webView.configuration.userContentController.userScripts.filter { !$0.isForMainFrameOnly }.map {
             WKUserScript(source: $0.source, injectionTime: $0.injectionTime, forMainFrameOnly: false)
         }
         shims.forEach { configuration.userContentController.addUserScript($0) }
         let child = BrowserWindowController(initialURL: nil, title: "完成 ChatGPT 安全验证", isPopup: true,
-                                            persistent: persistent, profileID: profileID, configuration: configuration,
-                                            closeHandler: { [weak self] in self?.dataVerificationWindow = nil })
+                                            persistent: persistent, profileID: profileID, configuration: configuration)
         child.webView.customUserAgent = webView.customUserAgent
         child.dataVerificationURL = verificationURL
+        child.dataVerificationTargetPath = dataLoadState.verificationPath
         child.dataVerificationCompleted = { [weak self, weak child] in
-            child?.dispose()
-            self?.dataVerificationWindow = nil
-            guard let self, !self.isDisposing, self.webView.url == original,
+            guard let self, let child, self.dataVerificationWindow === child else { return }
+            self.dismissDataVerification()
+            guard !self.isDisposing, self.webView.url == original,
                   ProfileStore.pendingDataMutation == nil else { return }
-            guard !self.isAssistantResponseInProgress else {
-                self.showToast("安全验证已完成；回答结束后可点击重新加载")
-                self.dataLoadState.requiresVerification = false
-                self.updateDataLoadOverlay()
-                return
-            }
             self.dataLoadState.requiresVerification = false
-            self.reloadDataPagePreservingDraft()
+            self.dataVerificationReloadURL = original
+            self.resumeDataRecoveryWhenIdle()
         }
         dataVerificationWindow = child
         dataVerificationAutoOpenWorkItem = nil
+        child.webView.configuration.userContentController.add(child, name: "dataLoad")
+        child.ownsDataVerificationMessageHandler = true
+        child.webView.configuration.userContentController.addUserScript(WKUserScript(
+            source: Self.dataLoadMonitorScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        ))
+        presentDataVerification(child)
         child.webView.load(URLRequest(url: verificationURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
-        child.show()
+    }
+
+    func resumeDataRecoveryWhenIdle() {
+        guard !isDisposing, ProfileStore.pendingDataMutation == nil else { return }
+        if let pendingURL = dataVerificationReloadURL {
+            guard webView.url == pendingURL else { dataVerificationReloadURL = nil; return }
+            guard !isAssistantResponseInProgress else { updateDataLoadOverlay(); return }
+            dataVerificationReloadURL = nil
+            reloadDataPagePreservingDraft()
+        } else if dataLoadState.requiresVerification {
+            scheduleAutomaticDataVerification()
+        }
+    }
+
+    func completeDataVerificationIfReady() {
+        guard dataVerificationURL != nil,
+              !isDisposing,
+              !isCloudflareChallengeActive,
+              !webView.isLoading,
+              !dataLoadState.requiresVerification,
+              let path = dataVerificationTargetPath,
+              let status = dataLoadState.responseStatus[path],
+              (200..<300).contains(status),
+              let complete = dataVerificationCompleted else { return }
+        dataVerificationCompleted = nil
+        complete()
     }
 
     /// Inspect only metadata. A protected endpoint can return 401 after its challenge completes
@@ -200,7 +248,12 @@ extension BrowserWindowController {
                 guard let self, self.dataRecoveryCaptureGeneration == generation else { return }
                 self.dataRecoveryCapturePending = false
                 guard !self.isDisposing, self.webView.url == original,
-                      !self.isAssistantResponseInProgress, ProfileStore.pendingDataMutation == nil else { return }
+                      ProfileStore.pendingDataMutation == nil else { return }
+                guard !self.isAssistantResponseInProgress else {
+                    self.dataVerificationReloadURL = original
+                    self.updateDataLoadOverlay()
+                    return
+                }
                 guard error == nil else {
                     self.showToast("暂时无法保存输入，当前页面已保留；稍后可再次重试")
                     return

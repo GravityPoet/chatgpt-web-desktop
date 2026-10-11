@@ -147,7 +147,8 @@ final class BrowserRefreshFeedback {
 
 extension BrowserWindowController {
     func updateRefreshButtonAppearance() {
-        let feedback = refreshFeedback
+        let activeController = dataVerificationWindow ?? self
+        let feedback = activeController.refreshFeedback
         let loading = feedback.state == .loading
         let verb = feedback.isManualRefresh ? "刷新" : "加载"
         let label: String
@@ -155,7 +156,9 @@ extension BrowserWindowController {
         let tint: NSColor?
         switch feedback.state {
         case .idle:
-            if dataLoadState.requiresVerification {
+            if dataVerificationWindow != nil {
+                label = "重新加载验证页面"
+            } else if dataLoadState.requiresVerification {
                 label = "完成安全验证并重试"
             } else if dataLoadState.hasFailure {
                 label = "重试加载\(dataLoadState.summary)"
@@ -167,12 +170,12 @@ extension BrowserWindowController {
             symbol = "arrow.clockwise"
             tint = modelLoadFailureActive || dataLoadState.hasFailure ? .systemOrange : nil
         case .loading:
-            if isCloudflareChallengeActive {
+            if activeController.isCloudflareChallengeActive {
                 label = "正在验证页面"
             } else if feedback.isVerifying {
                 label = "正在确认页面内容"
             } else {
-                let percent = max(1, min(99, Int(webView.estimatedProgress * 100)))
+                let percent = max(1, min(99, Int(activeController.webView.estimatedProgress * 100)))
                 label = "正在\(verb)页面（约 \(percent)%）"
             }
             symbol = nil
@@ -182,7 +185,8 @@ extension BrowserWindowController {
             symbol = "checkmark.circle.fill"
             tint = .systemGreen
         case .failed:
-            label = dataLoadState.requiresVerification ? "完成安全验证并重试" : "\(verb)未完成，点击重试"
+            label = dataVerificationWindow != nil ? "重新加载验证页面"
+                : (dataLoadState.requiresVerification ? "完成安全验证并重试" : "\(verb)未完成，点击重试")
             symbol = "exclamationmark.triangle.fill"
             tint = .systemOrange
         }

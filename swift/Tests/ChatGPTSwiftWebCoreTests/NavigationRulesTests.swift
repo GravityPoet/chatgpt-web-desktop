@@ -36,6 +36,11 @@ final class NavigationRulesTests: XCTestCase {
         let trustedSource = try XCTUnwrap(URL(string: "https://chatgpt.com/"))
         XCTAssertTrue(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "https://example.com/")!))
         XCTAssertTrue(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "about:blank")!))
+        XCTAssertTrue(NavigationRules.isAllowedWebViewNavigationURL(
+            URL(string: "about:srcdoc")!,
+            sourceURL: trustedSource
+        ))
+        XCTAssertFalse(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "about:srcdoc")!))
         XCTAssertTrue(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "data:text/html,ok")!, sourceURL: trustedSource))
         XCTAssertTrue(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "blob:https://chatgpt.com/id")!, sourceURL: trustedSource))
         XCTAssertFalse(NavigationRules.isAllowedWebViewNavigationURL(URL(string: "file:///etc/hosts")!))
@@ -76,10 +81,11 @@ final class NavigationRulesTests: XCTestCase {
             NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "custom-scheme://example/"))),
             .unsupportedScheme
         )
-        XCTAssertEqual(
-            NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "about:srcdoc"))),
-            .unsupportedInternalPage
-        )
+        XCTAssertNil(NavigationRules.webViewNavigationBlockReason(
+            try XCTUnwrap(URL(string: "about:srcdoc")),
+            sourceURL: trustedSource
+        ))
+        XCTAssertEqual(NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "about:srcdoc"))), .unsupportedInternalPage)
         XCTAssertEqual(
             NavigationRules.webViewNavigationBlockReason(try XCTUnwrap(URL(string: "data:text/html,ok"))),
             .missingContentSource
