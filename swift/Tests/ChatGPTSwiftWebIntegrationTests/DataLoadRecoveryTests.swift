@@ -243,7 +243,6 @@ final class DataLoadRecoveryTests: XCTestCase {
         controller.dataVerificationCompleted = { completions += 1 }
         for (url, status, headers) in [
             (verification, 403, ["Content-Type":"text/html", "cf-mitigated":"challenge"]),
-            (verification, 401, ["Content-Type":"application/json"]),
             (verification, 200, ["Content-Type":"text/html"]),
             (URL(string: "https://example.com/backend-api/models")!, 200, ["Content-Type":"application/json"])
         ] {
@@ -251,10 +250,14 @@ final class DataLoadRecoveryTests: XCTestCase {
             XCTAssertFalse(controller.finishDataVerificationIfReady())
         }
         XCTAssertEqual(completions, 0)
+        controller.noteDataVerificationResponse(try XCTUnwrap(HTTPURLResponse(url: verification, statusCode: 401, httpVersion: nil, headerFields: ["Content-Type":"application/json"])))
+        XCTAssertTrue(controller.finishDataVerificationIfReady())
+        XCTAssertEqual(completions, 1)
+        controller.dataVerificationCompleted = { completions += 1 }
         controller.noteDataVerificationResponse(try XCTUnwrap(HTTPURLResponse(url: verification, statusCode: 200, httpVersion: nil, headerFields: ["Content-Type":"application/json"])))
         XCTAssertTrue(controller.finishDataVerificationIfReady())
         XCTAssertFalse(controller.finishDataVerificationIfReady())
-        XCTAssertEqual(completions, 1)
+        XCTAssertEqual(completions, 2)
     }
 
     func testAutomaticVerificationReloadsOriginalPageAndRestoresDraftWithoutAnyAppClick() throws {

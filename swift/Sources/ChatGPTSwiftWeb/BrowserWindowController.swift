@@ -88,6 +88,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var dataVerificationWindow: BrowserWindowController?
     var dataVerificationURL: URL?
     var dataVerificationTargetPath: String?
+    var dataVerificationAutomaticAttempted = false
+    var dataVerificationChallengeSeen = false
+    var dataVerificationRecoveryPaths = Set<String>()
     var dataVerificationResponseReady = false
     var dataVerificationCompleted: (() -> Void)?
     private var dataVerificationContent: NSView?
@@ -482,6 +485,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("dataVerificationWindowOpen", String(dataVerificationWindow != nil)),
             ("dataVerificationPresentation", dataVerificationContent == nil ? "none" : "in-window"),
             ("dataVerificationReloadPending", String(dataVerificationReloadURL != nil)),
+            ("dataVerificationAutomaticAttempted", String(dataVerificationAutomaticAttempted)),
+            ("dataVerificationChallengeSeen", String(dataVerificationChallengeSeen)),
+            ("dataVerificationRecoveryPaths", dataVerificationRecoveryPaths.sorted().joined(separator: ", ")),
+            ("dataVerificationResponseStatus", dataVerificationWindow?.dataLoadState.responseStatus.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ") ?? ""),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -1207,7 +1214,12 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         dataVerificationAutoOpenWorkItem?.cancel()
         dataVerificationAutoOpenWorkItem = nil
         dismissDataVerification()
+        let isVerificationRecoveryNavigation = dataVerificationReloadURL != nil
         dataVerificationReloadURL = nil
+        if !isVerificationRecoveryNavigation {
+            dataVerificationAutomaticAttempted = false
+            dataVerificationRecoveryPaths.removeAll()
+        }
         dataLoadState = BrowserDataLoadState()
         dataVerificationResponseReady = false
         navigationHTTPFailure = nil

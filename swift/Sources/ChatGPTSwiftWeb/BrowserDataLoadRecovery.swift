@@ -28,6 +28,11 @@ extension BrowserWindowController {
         if let statuses = payload["statuses"] as? [String: Int], statuses.count <= 16 {
             dataLoadState.responseStatus = statuses.filter { Self.isAllowedDataVerificationPath($0.key) && (100...599).contains($0.value) }
         }
+        if challenged, dataVerificationURL == nil {
+            let paths = payload["challengedPaths"] as? [String] ?? [dataLoadState.verificationPath]
+            guard paths.count <= 16, paths.allSatisfy(Self.isAllowedDataVerificationPath) else { return }
+            dataVerificationRecoveryPaths.formUnion(paths)
+        }
         updateDataLoadState(failures: failures, challenged: challenged)
     }
 
@@ -40,6 +45,14 @@ extension BrowserWindowController {
             modelLoadFailureLastAt = Date()
         }
         modelLoadFailureActive = failures["models"] == true
+        // A challenge ending only permits one authenticated retry. Keep the automatic
+        // attempt consumed across reloads until every challenged API actually recovers.
+        if challenged == false, !dataLoadState.hasFailure, dataVerificationWindow == nil,
+           !dataVerificationRecoveryPaths.isEmpty,
+           dataVerificationRecoveryPaths.allSatisfy({ (200..<300).contains(dataLoadState.responseStatus[$0] ?? 0) }) {
+            dataVerificationAutomaticAttempted = false
+            dataVerificationRecoveryPaths.removeAll()
+        }
         if dataLoadState.requiresVerification, dataVerificationURL == nil {
             scheduleAutomaticDataVerification()
         }
@@ -53,6 +66,7 @@ extension BrowserWindowController {
     /// behind it. Repeated response reports share one verification document.
     func scheduleAutomaticDataVerification() {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil,
+              !dataVerificationAutomaticAttempted,
               !isAssistantResponseInProgress,
               !dataRecoveryCapturePending,
               dataVerificationURL == nil, dataVerificationWindow == nil,
@@ -89,7 +103,9 @@ extension BrowserWindowController {
         }
         if dataLoadState.hasFailure {
             let detail = dataLoadState.requiresVerification
-                ? "安全验证拦截了数据请求。完成验证后会自动重新加载，保留当前输入。"
+                ? (dataVerificationAutomaticAttempted
+                    ? "验证后数据请求仍被拦截，已停止重复打开验证页。当前输入已保留，可稍后重试。"
+                    : "安全验证拦截了数据请求。完成验证后会自动重新加载，保留当前输入。")
                 : "\(dataLoadState.summary)未能加载。重新加载会保留当前输入。"
             showDataLoadOverlay(.dataLoadFailed(detail, verification: dataLoadState.requiresVerification))
         } else {
@@ -106,12 +122,15 @@ extension BrowserWindowController {
             showToast("回答结束后会自动继续加载，当前输入会保留")
             return
         }
-        if dataLoadState.requiresVerification { openDataVerificationWindow() }
-        else { reloadDataPagePreservingDraft() }
+        if dataLoadState.requiresVerification {
+            dataVerificationAutomaticAttempted = false
+            openDataVerificationWindow()
+        } else { reloadDataPagePreservingDraft() }
     }
 
     func openDataVerificationWindow() {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil, dataVerificationURL == nil,
+              !dataVerificationAutomaticAttempted,
               Self.canInjectPromptContent(into: webView.url) else { return }
         if dataVerificationWindow != nil { return }
         guard let original = webView.url,
@@ -138,6 +157,9 @@ extension BrowserWindowController {
         child.webView.customUserAgent = webView.customUserAgent
         child.dataVerificationURL = verificationURL
         child.dataVerificationTargetPath = dataLoadState.verificationPath
+        // The challenge may already have run in the original document. A direct 401
+        // here is the origin's API response without the frontend's bearer header.
+        child.dataVerificationChallengeSeen = dataLoadState.requiresVerification
         child.dataVerificationCompleted = { [weak self, weak child] in
             guard let self, let child, self.dataVerificationWindow === child else { return }
             self.dismissDataVerification()
@@ -148,6 +170,8 @@ extension BrowserWindowController {
             self.resumeDataRecoveryWhenIdle()
         }
         dataVerificationWindow = child
+        dataVerificationAutomaticAttempted = true
+        dataVerificationRecoveryPaths.insert(dataLoadState.verificationPath)
         dataVerificationAutoOpenWorkItem = nil
         child.webView.configuration.userContentController.add(child, name: "dataLoad")
         child.ownsDataVerificationMessageHandler = true
@@ -195,9 +219,16 @@ extension BrowserWindowController {
         let matchesTarget = url.scheme == target.scheme && url.host == target.host
             && (url.port ?? 443) == (target.port ?? 443) && url.path == target.path
             && url.user == nil && url.password == nil
-        dataVerificationResponseReady = matchesTarget
-            && (response.statusCode == 200 || (response.statusCode == 401 && cloudflareChallengeCount > 0))
+        if matchesTarget { dataLoadState.responseStatus[target.path] = response.statusCode }
+        if matchesTarget, Self.isCloudflareChallengeResponse(response) {
+            dataVerificationChallengeSeen = true
+        }
+        let isSuccessfulJSON = (200..<300).contains(response.statusCode)
             && response.mimeType?.lowercased() == "application/json"
+        let isExpectedUnauthorized = response.statusCode == 401
+            && (cloudflareChallengeCount > 0 || dataVerificationChallengeSeen)
+        dataVerificationResponseReady = matchesTarget
+            && (isSuccessfulJSON || isExpectedUnauthorized)
             && !Self.isCloudflareChallengeResponse(response)
     }
 
@@ -330,7 +361,7 @@ extension BrowserWindowController {
         timer=0;if(disposed || blocked()) return;
         const paths=[...challenges];
         const verificationPath=paths.find(path=>path==='/api/auth/session') || paths.find(path=>path.startsWith('/backend-api/accounts/check/')) || paths[0] || '/backend-api/models';
-        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,verificationPath,statuses};
+        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,challengedPaths:paths,verificationPath,statuses};
         const key=JSON.stringify(payload);if(key===last) return;last=key;
         try{window.webkit.messageHandlers.dataLoad.postMessage(payload);}catch(_){}
       };
