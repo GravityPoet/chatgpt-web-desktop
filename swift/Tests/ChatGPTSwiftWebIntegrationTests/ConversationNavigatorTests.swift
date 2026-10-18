@@ -181,6 +181,50 @@ final class ConversationNavigatorTests: XCTestCase {
         for gap in try XCTUnwrap(report["gaps"] as? [Double]) { XCTAssertGreaterThanOrEqual(gap, -0.1) }
     }
 
+    func testTableExpandInteractionDismissesDirectoryPreviewAndKeepsPageOverlayAboveRail() throws {
+        let table = """
+        <button id="expand-table" aria-label="展开表格">展开表格</button>
+        <div id="expanded-table" role="dialog" aria-modal="true" hidden style="position:fixed;left:120px;top:80px;width:500px;height:260px;background:white;z-index:1000">
+          <table><tr><td>展开后的表格</td></tr></table>
+        </div>
+        """
+        load(Self.page(Self.turn("表格问题", answer: table)))
+        _ = try js("""
+        (() => {
+          const button=document.querySelector('#chatgpt-swift-conversation-navigator button');
+          button.dispatchEvent(new PointerEvent('pointerenter',{bubbles:true}));
+          return {};
+        })()
+        """)
+        let shown = try js("({hidden:document.getElementById('chatgpt-swift-conversation-navigator-preview').hidden})")
+        XCTAssertEqual(shown["hidden"] as? Bool, false)
+
+        _ = try js("""
+        (() => {
+          const trigger=document.getElementById('expand-table');
+          trigger.dispatchEvent(new PointerEvent('pointerover',{bubbles:true}));
+          return {};
+        })()
+        """)
+        let afterHover = try js("({hidden:document.getElementById('chatgpt-swift-conversation-navigator-preview').hidden})")
+        XCTAssertEqual(afterHover["hidden"] as? Bool, true)
+
+        _ = try js("""
+        (() => {
+          const button=document.querySelector('#chatgpt-swift-conversation-navigator button');
+          button.dispatchEvent(new PointerEvent('pointerenter',{bubbles:true}));
+          const panel=document.getElementById('expanded-table');
+          panel.hidden=false;
+          panel.dispatchEvent(new Event('toggle',{bubbles:true}));
+          return {railZ:getComputedStyle(document.getElementById('chatgpt-swift-conversation-navigator')).zIndex};
+        })()
+        """)
+        let afterOpen = try js("({hidden:document.getElementById('chatgpt-swift-conversation-navigator-preview').hidden})")
+        XCTAssertEqual(afterOpen["hidden"] as? Bool, true)
+        let rail = try js("({z:getComputedStyle(document.getElementById('chatgpt-swift-conversation-navigator')).zIndex})")
+        XCTAssertEqual(rail["z"] as? String, "40")
+    }
+
     func testSiteResponseIndexesUnmountedQuestionsWithoutAnExtraRequestOrConsumingTheResponse() throws {
         let script = """
         window.fixtureFetchCalls=0;

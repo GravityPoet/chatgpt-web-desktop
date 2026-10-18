@@ -33,6 +33,7 @@ extension BrowserWindowController {
       const railID = 'chatgpt-swift-conversation-navigator';
       const messageSelector = '[data-message-author-role="user"],[class~="group/user-message"]';
       const replySelector = '[data-message-author-role="assistant"],.markdown';
+      const pageOverlaySelector = '[role="dialog"],[aria-modal="true"],[popover],[data-state="open"]';
       const excluded = 'button,svg,style,script,nav,form,textarea,input,[aria-hidden="true"],.sr-only,[class*="group-hover/user-message"]';
       const state = {path:location.pathname, entries:[], mounted:[], indexed:[], buttons:[], active:0,
         rail:null, list:null, preview:null, title:null, answer:null, main:null, root:null,
@@ -112,6 +113,21 @@ extension BrowserWindowController {
         state.hover=-1;
         if(state.preview) state.preview.hidden=true;
       };
+      const visiblePageOverlay = () => [...document.querySelectorAll(pageOverlaySelector)].some(node =>
+        node !== state.rail && !node.closest('#'+railID) && visible(node) &&
+        (!node.matches('[data-state="open"]') || node.querySelector('table') ||
+          /表格|table|展开|expand|全屏|fullscreen/i.test(node.getAttribute('aria-label') || '') ||
+          /表格|table|展开|expand|全屏|fullscreen/i.test(node.textContent || '')));
+      const hidePreviewOutsideRail = event => {
+        if(state.hover < 0 || !state.rail || state.rail.contains(event.target)) return;
+        hidePreview();
+      };
+      const hidePreviewForOverlay = event => {
+        const target=event.target;
+        if(target instanceof Element && target.closest('#'+railID)) return;
+        const overlay=target instanceof Element ? target.closest(pageOverlaySelector) : null;
+        if(overlay && visiblePageOverlay()) hidePreview();
+      };
       const ensureChrome = () => {
         if(state.rail?.isConnected) return;
         document.getElementById(railID)?.remove();
@@ -119,7 +135,8 @@ extension BrowserWindowController {
         const style=document.createElement('style');
         style.id=railID+'-style';
         style.textContent=`
-          #${railID} { position:fixed; width:28px; z-index:1000; color:var(--text-primary,#202123); }
+          /* Keep the directory rail above document content but below page-owned dialogs/tables. */
+          #${railID} { position:fixed; width:28px; z-index:40; color:var(--text-primary,#202123); }
           #${railID}[hidden], #${railID} [hidden] { display:none !important; }
           #${railID}-list { display:flex; flex-direction:column; overflow-y:auto; scrollbar-width:none; }
           #${railID}-list::-webkit-scrollbar { display:none; }
@@ -169,6 +186,7 @@ extension BrowserWindowController {
         state.hover=index;
         state.title.textContent=entry.question;
         state.answer.textContent=entry.answer || '点击跳转到这条问题';
+        if(visiblePageOverlay()) { hidePreview(); return; }
         state.preview.hidden=false;
         const rect=button.getBoundingClientRect();
         state.preview.style.left=clamp(rect.right+12,8,innerWidth-state.preview.offsetWidth-8)+'px';
@@ -378,7 +396,14 @@ extension BrowserWindowController {
         state.disposed=true;state.jump++;clearTimeout(state.timer);cancelAnimationFrame(state.frame);
         state.observer?.disconnect();state.sizes?.disconnect();
         state.rail?.remove();document.getElementById(railID+'-style')?.remove();
-        document.removeEventListener('scroll',scheduleLayout,true);window.removeEventListener('resize',scheduleLayout);
+        document.removeEventListener('scroll',scheduleLayout,true);
+        document.removeEventListener('pointerover',hidePreviewOutsideRail,true);
+        document.removeEventListener('pointerdown',hidePreviewOutsideRail,true);
+        document.removeEventListener('click',hidePreviewOutsideRail,true);
+        document.removeEventListener('focusin',hidePreviewOutsideRail,true);
+        document.removeEventListener('toggle',hidePreviewForOverlay,true);
+        document.removeEventListener('beforetoggle',hidePreviewForOverlay,true);
+        window.removeEventListener('resize',scheduleLayout);
         if(window.fetch===navigatorFetch) window.fetch=originalFetch;
         state.entries=[];state.indexed=[];state.mounted=[];state.buttons=[];
         state.messageIndex.clear();
@@ -400,6 +425,13 @@ extension BrowserWindowController {
           if(state.path!==location.pathname) {schedule();return;}
           for(const mutation of mutations) {
             if(mutation.target instanceof Element && mutation.target.closest('#'+railID)) continue;
+            if(mutation.type==='attributes' && mutation.target instanceof Element &&
+                (mutation.target.matches(pageOverlaySelector) || mutation.attributeName === 'aria-modal' ||
+                 mutation.attributeName === 'data-state' || mutation.attributeName === 'popover') &&
+                visiblePageOverlay()) { hidePreview(); }
+            if(mutation.type==='childList' && [...mutation.addedNodes].some(node =>
+                node instanceof Element && (node.matches(pageOverlaySelector) || node.querySelector(pageOverlaySelector))) &&
+                visiblePageOverlay()) { hidePreview(); }
             if(mutation.type==='attributes') {
               if(mutation.target.matches(messageSelector) || mutation.target===state.main) {schedule();return;}
               continue;
@@ -411,8 +443,15 @@ extension BrowserWindowController {
             }
           }
         });
-        state.observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,attributeFilter:['data-message-author-role','hidden']});
+        state.observer.observe(document.documentElement,{subtree:true,childList:true,attributes:true,
+          attributeFilter:['data-message-author-role','hidden','aria-modal','data-state','popover']});
         document.addEventListener('scroll',scheduleLayout,{capture:true,passive:true});
+        document.addEventListener('pointerover',hidePreviewOutsideRail,{capture:true,passive:true});
+        document.addEventListener('pointerdown',hidePreviewOutsideRail,{capture:true,passive:true});
+        document.addEventListener('click',hidePreviewOutsideRail,true);
+        document.addEventListener('focusin',hidePreviewOutsideRail,true);
+        document.addEventListener('toggle',hidePreviewForOverlay,true);
+        document.addEventListener('beforetoggle',hidePreviewForOverlay,true);
         window.addEventListener('resize',scheduleLayout,{passive:true});
         document.addEventListener('wheel',()=>{state.jump++;},{capture:true,passive:true});
         document.addEventListener('keydown',event=>{if(event.key==='Escape') {hidePreview();state.jump++;}},true);
