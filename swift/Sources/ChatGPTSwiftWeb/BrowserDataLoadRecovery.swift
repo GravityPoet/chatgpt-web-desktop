@@ -189,7 +189,6 @@ extension BrowserWindowController {
         if let pendingURL = dataVerificationReloadURL {
             guard webView.url == pendingURL else { dataVerificationReloadURL = nil; return }
             guard !isAssistantResponseInProgress else { updateDataLoadOverlay(); return }
-            dataVerificationReloadURL = nil
             reloadDataPagePreservingDraft()
         } else if dataLoadState.requiresVerification {
             scheduleAutomaticDataVerification()

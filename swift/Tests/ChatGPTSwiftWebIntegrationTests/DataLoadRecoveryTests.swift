@@ -327,7 +327,16 @@ final class DataLoadRecoveryTests: XCTestCase {
         try evaluate("window.webkit.messageHandlers.completionState.postMessage({busy:false,reason:'fixture'});'posted'", in: controller)
         waitUntil { delegate.reloads == 1 && !controller.webView.isLoading && controller.dataRecoveryDraft == nil }
         XCTAssertNil(controller.dataVerificationReloadURL)
+        XCTAssertTrue(controller.dataVerificationAutomaticAttempted)
         XCTAssertEqual(try evaluate("document.querySelector('textarea').value", in: controller) as? String, "回答期间保留的草稿")
+
+        // The recovery reload must keep the automatic-attempt guard. If the page is
+        // challenged again before a successful authenticated API response arrives,
+        // it must stop at the in-page error state instead of opening another window.
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');'requested'", in: controller)
+        waitUntil { controller.dataLoadState.requiresVerification }
+        settle()
+        XCTAssertNil(controller.dataVerificationWindow)
     }
 
     func testSrcdocChallengeSubframeExecutesWithoutNativeRecoveryPrivileges() throws {
