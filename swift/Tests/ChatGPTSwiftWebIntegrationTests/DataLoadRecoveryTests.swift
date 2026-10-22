@@ -352,6 +352,66 @@ final class DataLoadRecoveryTests: XCTestCase {
         XCTAssertNil(controller.dataVerificationWindow)
     }
 
+    func testRecoveryContinuesToNextEndpointOnlyAfterAuthenticatedProgress() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');'requested'", in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let first = try XCTUnwrap(controller.dataVerificationWindow)
+        let delegate = RecoveryReloadDelegate(controller: controller, html: html)
+        controller.webView.navigationDelegate = delegate
+        let response = try XCTUnwrap(HTTPURLResponse(url: XCTUnwrap(first.dataVerificationURL), statusCode: 401,
+                                                   httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        XCTAssertEqual(first.dataVerificationResponsePolicy(response), .cancel)
+        waitUntil { delegate.reloads == 1 && !controller.webView.isLoading }
+        XCTAssertNil(controller.dataVerificationWindow)
+        try evaluate("""
+        window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/models');
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/accounts/check/v4-fixture');'requested';
+        """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let second = try XCTUnwrap(controller.dataVerificationWindow)
+        XCTAssertFalse(second === first)
+        XCTAssertEqual(second.dataVerificationTargetPath, "/backend-api/accounts/check/v4-fixture")
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 2)
+        controller.dismissDataVerification()
+        try evaluate("window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/accounts/check/v4-fixture');'requested'", in: controller)
+        waitUntil { !controller.dataLoadState.hasFailure }
+        XCTAssertFalse(controller.dataVerificationAutomaticAttempted)
+        XCTAssertTrue(controller.dataVerificationAttemptedPaths.isEmpty)
+    }
+
+    func testAnotherEndpointCannotReopenVerificationWithoutProgress() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        settle()
+        controller.dataVerificationAutomaticAttempted = true
+        controller.dataVerificationAttemptedPaths = ["/backend-api/models"]
+        controller.dataVerificationCompletedPath = "/backend-api/models"
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');fetch('/backend-api/accounts/check/v4-fixture');'requested'", in: controller)
+        waitUntil { controller.dataLoadState.requiresVerification }
+        settle()
+        XCTAssertNil(controller.dataVerificationWindow)
+        XCTAssertTrue(controller.dataVerificationAutomaticAttempted)
+    }
+
+    func testRecoveryStopsAfterThreeDistinctEndpointsEvenWithProgress() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        settle()
+        controller.dataVerificationAutomaticAttempted = true
+        controller.dataVerificationAttemptedPaths = ["/backend-api/models", "/backend-api/me", "/backend-api/gizmos/snorlax/sidebar"]
+        controller.dataVerificationCompletedPath = "/backend-api/models"
+        try evaluate("""
+        window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/models');
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/accounts/check/v4-fixture');'requested';
+        """, in: controller)
+        waitUntil { controller.dataLoadState.requiresVerification }
+        settle()
+        XCTAssertNil(controller.dataVerificationWindow)
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 3)
+    }
+
     func testAuthenticationJSONIsCancelledBeforeDisplayOrDownload() throws {
         let controller = makeController()
         defer { controller.dispose() }

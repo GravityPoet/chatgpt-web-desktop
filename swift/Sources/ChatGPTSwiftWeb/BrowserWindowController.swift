@@ -91,6 +91,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var dataVerificationAutomaticAttempted = false
     var dataVerificationChallengeSeen = false
     var dataVerificationRecoveryPaths = Set<String>()
+    var dataVerificationAttemptedPaths = Set<String>()
+    var dataVerificationCompletedPath: String?
     var dataVerificationChallengeDocument: BrowserDataChallengeDocument?
     var dataVerificationSource = "none"
     var dataVerificationLastResponseStatus: [String: Int] = [:]
@@ -491,6 +493,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("dataVerificationAutomaticAttempted", String(dataVerificationAutomaticAttempted)),
             ("dataVerificationChallengeSeen", String(dataVerificationWindow?.dataVerificationChallengeSeen ?? dataVerificationChallengeSeen)),
             ("dataVerificationSource", dataVerificationSource),
+            ("dataVerificationAttemptedPaths", dataVerificationAttemptedPaths.sorted().joined(separator: ", ")),
             ("dataVerificationRecoveryPaths", dataVerificationRecoveryPaths.sorted().joined(separator: ", ")),
             ("dataVerificationResponseStatus", (dataVerificationWindow?.dataLoadState.responseStatus ?? dataVerificationLastResponseStatus).map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ")),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
@@ -1225,6 +1228,8 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         if !isVerificationRecoveryNavigation {
             dataVerificationAutomaticAttempted = false
             dataVerificationRecoveryPaths.removeAll()
+            dataVerificationAttemptedPaths.removeAll()
+            dataVerificationCompletedPath = nil
         }
         dataLoadState = BrowserDataLoadState()
         dataVerificationResponseReady = false

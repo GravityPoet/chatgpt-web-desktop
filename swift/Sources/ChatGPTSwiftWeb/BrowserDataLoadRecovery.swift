@@ -79,13 +79,26 @@ extension BrowserWindowController {
             modelLoadFailureLastAt = Date()
         }
         modelLoadFailureActive = failures["models"] == true
-        // A challenge ending only permits one authenticated retry. Keep the automatic
-        // attempt consumed across reloads until every challenged API actually recovers.
+        // Different protected endpoints can remain challenged after one endpoint clears.
+        // Continue only after real authenticated progress, at most once per path and
+        // three paths per recovery cycle. A repeated 403 cannot re-arm the same path.
+        if challenged == true, dataVerificationWindow == nil,
+           let completed = dataVerificationCompletedPath,
+           (200..<300).contains(dataLoadState.responseStatus[completed] ?? 0),
+           dataVerificationChallengeDocument != nil,
+           !dataVerificationAttemptedPaths.contains(dataLoadState.verificationPath),
+           dataVerificationAttemptedPaths.count < 3 {
+            dataVerificationAutomaticAttempted = false
+        }
+        // Ending a challenge only permits an authenticated retry. Reset the whole
+        // recovery cycle only when every challenged API actually recovers.
         if challenged == false, !dataLoadState.hasFailure, dataVerificationWindow == nil,
            !dataVerificationRecoveryPaths.isEmpty,
            dataVerificationRecoveryPaths.allSatisfy({ (200..<300).contains(dataLoadState.responseStatus[$0] ?? 0) }) {
             dataVerificationAutomaticAttempted = false
             dataVerificationRecoveryPaths.removeAll()
+            dataVerificationAttemptedPaths.removeAll()
+            dataVerificationCompletedPath = nil
         }
         if dataLoadState.requiresVerification, dataVerificationURL == nil {
             scheduleAutomaticDataVerification()
@@ -158,6 +171,8 @@ extension BrowserWindowController {
         }
         if dataLoadState.requiresVerification {
             dataVerificationAutomaticAttempted = false
+            dataVerificationAttemptedPaths.removeAll()
+            dataVerificationCompletedPath = nil
             openDataVerificationWindow()
         } else { reloadDataPagePreservingDraft() }
     }
@@ -165,6 +180,8 @@ extension BrowserWindowController {
     func openDataVerificationWindow() {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil, dataVerificationURL == nil,
               !dataVerificationAutomaticAttempted,
+              dataVerificationAttemptedPaths.count < 3,
+              !dataVerificationAttemptedPaths.contains(dataLoadState.verificationPath),
               Self.canInjectPromptContent(into: webView.url) else { return }
         if dataVerificationWindow != nil { return }
         guard let original = webView.url,
@@ -198,6 +215,7 @@ extension BrowserWindowController {
             guard let self, let child, self.dataVerificationWindow === child else { return }
             self.dataVerificationLastResponseStatus = child.dataLoadState.responseStatus
             self.dataVerificationChallengeSeen = child.dataVerificationChallengeSeen
+            self.dataVerificationCompletedPath = child.dataVerificationTargetPath
             self.dismissDataVerification()
             guard !self.isDisposing, self.webView.url == original,
                   ProfileStore.pendingDataMutation == nil else { return }
@@ -210,6 +228,8 @@ extension BrowserWindowController {
         dataVerificationLastResponseStatus = [:]
         dataVerificationChallengeDocument = nil
         dataVerificationAutomaticAttempted = true
+        dataVerificationAttemptedPaths.insert(dataLoadState.verificationPath)
+        dataVerificationCompletedPath = nil
         dataVerificationRecoveryPaths.insert(dataLoadState.verificationPath)
         dataVerificationAutoOpenWorkItem = nil
         child.webView.configuration.userContentController.add(child, name: "dataLoad")
