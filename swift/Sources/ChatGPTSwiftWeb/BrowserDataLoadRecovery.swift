@@ -57,14 +57,31 @@ extension BrowserWindowController {
         if let statuses = payload["statuses"] as? [String: Int], statuses.count <= 16 {
             dataLoadState.responseStatus = statuses.filter { Self.isAllowedDataVerificationPath($0.key) && (100...599).contains($0.value) }
         }
+        let paths = payload["challengedPaths"] as? [String] ?? [dataLoadState.verificationPath]
+        guard paths.count <= 16, paths.allSatisfy(Self.isAllowedDataVerificationPath) else { return }
         if challenged, dataVerificationURL == nil {
-            let paths = payload["challengedPaths"] as? [String] ?? [dataLoadState.verificationPath]
-            guard paths.count <= 16, paths.allSatisfy(Self.isAllowedDataVerificationPath) else { return }
             dataVerificationRecoveryPaths.formUnion(paths)
         }
         if dataVerificationURL == nil, let pageURL = webView.url {
-            dataVerificationChallengeDocument = (payload["challengeDocument"] as? [String: Any]).flatMap {
-                BrowserDataChallengeDocument(payload: $0, pageURL: pageURL, path: dataLoadState.verificationPath)
+            let documents = payload["challengeDocuments"] as? [String: [String: Any]] ?? [:]
+            guard documents.count <= 8,
+                  documents.keys.allSatisfy({ paths.contains($0) }),
+                  Set(documents.keys.map(Self.dataVerificationEndpointKey)).count == documents.count else { return }
+            let preferred = dataLoadState.verificationPath
+            let orderedPaths = [preferred] + paths.filter { $0 != preferred }
+            let candidates = orderedPaths.compactMap { path -> (String, BrowserDataChallengeDocument)? in
+                guard let payload = documents[path],
+                      let document = BrowserDataChallengeDocument(payload: payload, pageURL: pageURL, path: path) else { return nil }
+                return (path, document)
+            }
+            // Select in native code so an already attempted priority endpoint cannot
+            // hide a fresh challenge for another endpoint after real progress.
+            let selected = dataVerificationWindow == nil
+                ? candidates.first(where: { canAttemptDataVerification(path: $0.0) }) ?? candidates.first
+                : candidates.first(where: { $0.0 == preferred })
+            dataVerificationChallengeDocument = selected?.1
+            if let selected {
+                dataLoadState.verificationPath = selected.0
             }
         }
         updateDataLoadState(failures: failures, challenged: challenged)
@@ -80,14 +97,13 @@ extension BrowserWindowController {
         }
         modelLoadFailureActive = failures["models"] == true
         // Different protected endpoints can remain challenged after one endpoint clears.
-        // Continue only after real authenticated progress, at most once per path and
-        // three paths per recovery cycle. A repeated 403 cannot re-arm the same path.
+        // Continue only after real authenticated progress, once for each of the eight
+        // monitored endpoint kinds. Account API versions share the same attempt.
         if challenged == true, dataVerificationWindow == nil,
            let completed = dataVerificationCompletedPath,
            (200..<300).contains(dataLoadState.responseStatus[completed] ?? 0),
            dataVerificationChallengeDocument != nil,
-           !dataVerificationAttemptedPaths.contains(dataLoadState.verificationPath),
-           dataVerificationAttemptedPaths.count < 3 {
+           canAttemptDataVerification(path: dataLoadState.verificationPath) {
             dataVerificationAutomaticAttempted = false
         }
         // Ending a challenge only permits an authenticated retry. Reset the whole
@@ -180,8 +196,7 @@ extension BrowserWindowController {
     func openDataVerificationWindow() {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil, dataVerificationURL == nil,
               !dataVerificationAutomaticAttempted,
-              dataVerificationAttemptedPaths.count < 3,
-              !dataVerificationAttemptedPaths.contains(dataLoadState.verificationPath),
+              canAttemptDataVerification(path: dataLoadState.verificationPath),
               Self.canInjectPromptContent(into: webView.url) else { return }
         if dataVerificationWindow != nil { return }
         guard let original = webView.url,
@@ -334,6 +349,16 @@ extension BrowserWindowController {
         path.count <= 160 && path.range(of: dataVerificationPathPattern, options: .regularExpression) != nil
     }
 
+    static func dataVerificationEndpointKey(_ path: String) -> String {
+        path.hasPrefix("/backend-api/accounts/check/") ? "/backend-api/accounts/check" : path
+    }
+
+    func canAttemptDataVerification(path: String) -> Bool {
+        Self.isAllowedDataVerificationPath(path) && !dataVerificationAttemptedPaths.contains {
+            Self.dataVerificationEndpointKey($0) == Self.dataVerificationEndpointKey(path)
+        }
+    }
+
     func reloadDataPagePreservingDraft() {
         guard !isDisposing, !dataRecoveryCapturePending, !isAssistantResponseInProgress,
               let original = webView.url else { return }
@@ -438,14 +463,19 @@ extension BrowserWindowController {
       // Verification API documents must run the site's original browser code untouched.
       if(allowedPath.test(location.pathname)) return;
       const blocked=()=>location.pathname.startsWith('/cdn-cgi/') || !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
-      const challenges=new Set(),statuses={},documents=new Map(),pending=new Set(),revisions=new Map();let timer=0,last='',disposed=false,observer;
+      const challenges=new Set(),statuses={},documents=new Map(),pending=new Map(),revisions=new Map();let timer=0,last='',disposed=false,observer;
+      const endpointKey=path=>path.startsWith('/backend-api/accounts/check/')?'/backend-api/accounts/check':path;
       const maximumBytes=\(BrowserDataChallengeDocument.maximumBytes);
       const headerNames=['\(BrowserDataChallengeDocument.headerNames.joined(separator: "','"))'];
       const report=()=>{
         timer=0;if(disposed || blocked() || pending.size) return;
         const paths=[...challenges];
         const verificationPath=paths.find(path=>path==='/api/auth/session') || paths.find(path=>path.startsWith('/backend-api/accounts/check/')) || paths[0] || '/backend-api/models';
-        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,challengedPaths:paths,verificationPath,statuses,challengeDocument:documents.get(verificationPath)};
+        const challengeDocuments={},families=new Set();
+        for(const path of [verificationPath,...paths]){
+          const key=endpointKey(path);if(!families.has(key) && documents.has(path) && families.size<8){families.add(key);challengeDocuments[path]=documents.get(path);}
+        }
+        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,challengedPaths:paths,verificationPath,statuses,challengeDocuments};
         const key=JSON.stringify(payload);if(key===last) return;last=key;
         try{window.webkit.messageHandlers.dataLoad.postMessage(payload);}catch(_){}
       };
@@ -454,15 +484,19 @@ extension BrowserWindowController {
         try{const url=new URL(raw,location.href);return String(method||'GET').toUpperCase()==='GET' &&
           url.origin===location.origin && allowedPath.test(url.pathname) ? url.pathname : null;}catch(_){return null;}
       };
-      const observeResponse=(path,status,header)=>{
-        if(!path || disposed) return;
+      const beginRequest=path=>{
+        if(!path || disposed)return;
         const revision=(revisions.get(path)||0)+1;revisions.set(path,revision);
+        return revision;
+      };
+      const observeResponse=(path,revision,status,header)=>{
+        if(!path || disposed || revisions.get(path)!==revision) return false;
         documents.delete(path);pending.delete(path);
         if(Object.keys(statuses).length<16 || path in statuses) statuses[path]=status;
         if(String(header||'').toLowerCase()==='challenge') challenges.add(path);
         else if(status>=200 && status<300) challenges.delete(path);
         schedule();
-        return revision;
+        return true;
       };
       const challengeDocument=(url,status,getHeader,html)=>({url,status,html,headers:Object.fromEntries(headerNames.map(name=>[name,getHeader(name)]).filter(([,value])=>value))});
       const readChallengeHTML=async response=>{
@@ -479,27 +513,30 @@ extension BrowserWindowController {
       const monitoredFetch=function(...args){
         const promise=Reflect.apply(originalFetch,this,args);
         try{
-          const request=args[0],raw=typeof request==='string' || request instanceof URL?String(request):request.url,path=responsePath(raw,args[1]?.method || request?.method);
+          const request=args[0],raw=typeof request==='string' || request instanceof URL?String(request):request.url,path=responsePath(raw,args[1]?.method || request?.method),revision=beginRequest(path);
           if(path) promise.then(async response=>{
-            const header=response.headers.get('cf-mitigated'),revision=observeResponse(path,response.status,header);
+            const header=response.headers.get('cf-mitigated');
+            if(!observeResponse(path,revision,response.status,header))return;
             if(disposed || response.status!==403 || String(header).toLowerCase()!=='challenge' || !/^text\\/html(?:;|$)/i.test(response.headers.get('content-type')||''))return;
-            pending.add(path);
+            pending.set(path,revision);
             try{const html=await readChallengeHTML(response.clone());
               if(!disposed && revisions.get(path)===revision && html)documents.set(path,challengeDocument(response.url||new URL(raw,location.href).href,response.status,name=>response.headers.get(name),html));}
-            finally{if(revisions.get(path)===revision)pending.delete(path);schedule();}
+            finally{if(pending.get(path)===revision)pending.delete(path);schedule();}
           }).catch(()=>{});
         }catch(_){}
         return promise;
       };
       window.fetch=monitoredFetch;
       const originalOpen=XMLHttpRequest.prototype.open;
+      const originalSend=XMLHttpRequest.prototype.send;
       const xhrPaths=new WeakMap();
       const monitoredOpen=function(method,url,...rest){
         const result=Reflect.apply(originalOpen,this,[method,url,...rest]);
         const path=responsePath(url,method);
         if(!xhrPaths.has(this)) this.addEventListener('load',()=>{
           const entry=xhrPaths.get(this);if(!entry)return;
-          const header=this.getResponseHeader('cf-mitigated');observeResponse(entry.path,this.status,header);
+          const header=this.getResponseHeader('cf-mitigated');
+          if(!observeResponse(entry.path,entry.revision,this.status,header))return;
           if(!disposed && this.status===403 && String(header).toLowerCase()==='challenge' && /^text\\/html(?:;|$)/i.test(this.getResponseHeader('content-type')||'') && ['', 'text'].includes(this.responseType||'')){
             const html=this.responseText;
             if(html && new TextEncoder().encode(html).byteLength<=maximumBytes)documents.set(entry.path,challengeDocument(this.responseURL||entry.url,this.status,name=>this.getResponseHeader(name),html));
@@ -508,7 +545,12 @@ extension BrowserWindowController {
         xhrPaths.set(this,path?{path,url:new URL(url,location.href).href}:null);
         return result;
       };
+      const monitoredSend=function(...args){
+        const entry=xhrPaths.get(this);if(entry)entry.revision=beginRequest(entry.path);
+        return Reflect.apply(originalSend,this,args);
+      };
       XMLHttpRequest.prototype.open=monitoredOpen;
+      XMLHttpRequest.prototype.send=monitoredSend;
       const boot=()=>{
         if(disposed || blocked()) return;
         observer=new MutationObserver(mutations=>{
@@ -520,7 +562,7 @@ extension BrowserWindowController {
         observer.observe(document.documentElement,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['hidden','aria-hidden','style','class']});
         schedule();
       };
-      const dispose=()=>{disposed=true;clearTimeout(timer);observer?.disconnect();if(window.fetch===monitoredFetch)window.fetch=originalFetch;if(XMLHttpRequest.prototype.open===monitoredOpen)XMLHttpRequest.prototype.open=originalOpen;};
+      const dispose=()=>{disposed=true;clearTimeout(timer);observer?.disconnect();if(window.fetch===monitoredFetch)window.fetch=originalFetch;if(XMLHttpRequest.prototype.open===monitoredOpen)XMLHttpRequest.prototype.open=originalOpen;if(XMLHttpRequest.prototype.send===monitoredSend)XMLHttpRequest.prototype.send=originalSend;};
       window.__chatgptSwiftDataLoadMonitor={probe:readFailures,dispose};
       window.addEventListener('pagehide',dispose,{once:true});
       if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();

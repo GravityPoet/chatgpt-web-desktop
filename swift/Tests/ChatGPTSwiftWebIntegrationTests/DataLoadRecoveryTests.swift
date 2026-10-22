@@ -33,6 +33,7 @@ final class DataLoadRecoveryTests: XCTestCase {
         window.XMLHttpRequest=class extends EventTarget {
           constructor(){super();this.status=200;this.header='';this.responseType='';this.responseText=window.__fixtureChallengeBody;}
           open(method,url){this.responseURL=new URL(url,location.href).href;}
+          send(){}
           getResponseHeader(name){return name==='cf-mitigated'?this.header:(name==='content-type'?(this.header==='challenge'?'text/html':'application/json'):null);}
         };
         """, injectionTime: .atDocumentStart, forMainFrameOnly: true))
@@ -175,14 +176,41 @@ final class DataLoadRecoveryTests: XCTestCase {
         defer { controller.dispose() }
         try evaluate("""
         window.fixtureXHR=new XMLHttpRequest();fixtureXHR.open('GET','/backend-api/models');
-        fixtureXHR.open('POST','/backend-api/conversation');fixtureXHR.status=403;fixtureXHR.header='challenge';fixtureXHR.dispatchEvent(new Event('load'));
+        fixtureXHR.open('POST','/backend-api/conversation');fixtureXHR.send();fixtureXHR.status=403;fixtureXHR.header='challenge';fixtureXHR.dispatchEvent(new Event('load'));
         """, in: controller)
         settle()
         XCTAssertFalse(controller.dataLoadState.requiresVerification)
-        try evaluate("fixtureXHR.open('GET','/backend-api/models');fixtureXHR.dispatchEvent(new Event('load'))", in: controller)
+        try evaluate("fixtureXHR.open('GET','/backend-api/models');fixtureXHR.send();fixtureXHR.dispatchEvent(new Event('load'))", in: controller)
         waitUntil { controller.dataLoadState.requiresVerification }
-        try evaluate("fixtureXHR.status=200;fixtureXHR.header='';fixtureXHR.dispatchEvent(new Event('load'))", in: controller)
+        try evaluate("fixtureXHR.open('GET','/backend-api/models');fixtureXHR.send();fixtureXHR.status=200;fixtureXHR.header='';fixtureXHR.dispatchEvent(new Event('load'))", in: controller)
         waitUntil { !controller.dataLoadState.requiresVerification }
+    }
+
+    func testXHRTracksSendOrderAndUnsentOpenCannotInvalidateInFlightResponse() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        window.fixtureOpenedFirst=new XMLHttpRequest();
+        window.fixtureSentFirst=new XMLHttpRequest();
+        fixtureOpenedFirst.open('GET','/backend-api/models?fixture=xhr-order');
+        fixtureSentFirst.open('GET','/backend-api/models?fixture=xhr-order');
+        fixtureSentFirst.send();
+        fixtureOpenedFirst.send();
+        window.fixtureNeverSent=new XMLHttpRequest();
+        fixtureNeverSent.open('GET','/backend-api/models?fixture=xhr-order');
+        fixtureOpenedFirst.status=200;fixtureOpenedFirst.header='';
+        fixtureOpenedFirst.dispatchEvent(new Event('load'));'received';
+        """, in: controller)
+        waitUntil { controller.dataLoadState.responseStatus["/backend-api/models"] == 200 }
+        try evaluate("""
+        fixtureSentFirst.status=403;fixtureSentFirst.header='challenge';
+        fixtureSentFirst.dispatchEvent(new Event('load'));'received';
+        """, in: controller)
+        settle()
+        XCTAssertEqual(controller.dataLoadState.responseStatus["/backend-api/models"], 200)
+        XCTAssertFalse(controller.dataLoadState.requiresVerification)
+        XCTAssertNil(controller.dataVerificationChallengeDocument)
+        XCTAssertNil(controller.dataVerificationWindow)
     }
 
     func testVerificationUsesChallengedAccountEndpointAndRejectsOtherPaths() throws {
@@ -287,6 +315,7 @@ final class DataLoadRecoveryTests: XCTestCase {
         try evaluate("""
         const xhr=new XMLHttpRequest();
         xhr.open('GET','/backend-api/accounts/check/v4-fixture');
+        xhr.send();
         xhr.status=403;xhr.header='challenge';
         xhr.responseText='<html><head></head><body id="cf-challenge-running"><script>window.originalXHRChallengeExecuted=true;<\\/script>XHR challenge fixture</body></html>';
         xhr.dispatchEvent(new Event('load'));'requested';
@@ -352,6 +381,28 @@ final class DataLoadRecoveryTests: XCTestCase {
         XCTAssertNil(controller.dataVerificationWindow)
     }
 
+    func testOlderRequestChallengeArrivingAfterNewerSuccessCannotReopenVerification() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        window.__fixtureResponse=new Promise(resolve=>{window.fixtureResolveOlderRequest=resolve;});
+        fetch('/backend-api/models?fixture=request-order');
+        window.__fixtureResponse=null;
+        fetch('/backend-api/models?fixture=request-order');'requested';
+        """, in: controller)
+        waitUntil { controller.dataLoadState.responseStatus["/backend-api/models"] == 200 }
+        try evaluate("""
+        fixtureResolveOlderRequest(new Response(window.__fixtureChallengeBody,{
+          status:403,headers:{'cf-mitigated':'challenge','content-type':'text/html'}
+        }));'resolved';
+        """, in: controller)
+        settle()
+        XCTAssertEqual(controller.dataLoadState.responseStatus["/backend-api/models"], 200)
+        XCTAssertFalse(controller.dataLoadState.requiresVerification)
+        XCTAssertNil(controller.dataVerificationChallengeDocument)
+        XCTAssertNil(controller.dataVerificationWindow)
+    }
+
     func testRecoveryContinuesToNextEndpointOnlyAfterAuthenticatedProgress() throws {
         let controller = makeController()
         defer { controller.dispose() }
@@ -395,7 +446,7 @@ final class DataLoadRecoveryTests: XCTestCase {
         XCTAssertTrue(controller.dataVerificationAutomaticAttempted)
     }
 
-    func testRecoveryStopsAfterThreeDistinctEndpointsEvenWithProgress() throws {
+    func testRecoveryContinuesToFourthDistinctEndpointAfterAuthenticatedProgress() throws {
         let controller = makeController()
         defer { controller.dispose() }
         settle()
@@ -406,10 +457,70 @@ final class DataLoadRecoveryTests: XCTestCase {
         window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/models');
         window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/accounts/check/v4-fixture');'requested';
         """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        XCTAssertEqual(controller.dataVerificationWindow?.dataVerificationTargetPath, "/backend-api/accounts/check/v4-fixture")
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 4)
+    }
+
+    func testAttemptedPriorityEndpointCannotStarveUnattemptedChallenge() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        settle()
+        controller.dataVerificationAutomaticAttempted = true
+        controller.dataVerificationAttemptedPaths = ["/backend-api/models", "/backend-api/accounts/check/v4-fixture"]
+        controller.dataVerificationCompletedPath = "/backend-api/models"
+        try evaluate("""
+        window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/models');
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;
+        fetch('/backend-api/accounts/check/v4-fixture');fetch('/backend-api/conversations');'requested';
+        """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        XCTAssertEqual(controller.dataVerificationWindow?.dataVerificationTargetPath, "/backend-api/conversations")
+        XCTAssertEqual(controller.dataVerificationSource, "original-response")
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 3)
+    }
+
+    func testAccountVersionChangeDoesNotReopenAlreadyAttemptedEndpoint() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        settle()
+        controller.dataVerificationAutomaticAttempted = true
+        controller.dataVerificationAttemptedPaths = ["/backend-api/models", "/backend-api/accounts/check/v4-fixture"]
+        controller.dataVerificationCompletedPath = "/backend-api/models"
+        try evaluate("""
+        window.__fixtureStatus=200;window.__fixtureChallenge=false;fetch('/backend-api/models');
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/accounts/check/v5-fixture');'requested';
+        """, in: controller)
         waitUntil { controller.dataLoadState.requiresVerification }
         settle()
         XCTAssertNil(controller.dataVerificationWindow)
-        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 3)
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths.count, 2)
+        XCTAssertTrue(controller.dataVerificationAutomaticAttempted)
+    }
+
+    func testVerifier200CannotRearmWhenOriginalAuthenticatedRequestStillReturns403() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/conversations?limit=20');'requested'", in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        let delegate = RecoveryReloadDelegate(controller: controller, html: html)
+        controller.webView.navigationDelegate = delegate
+        let responseURL = try XCTUnwrap(URL(string: "https://chatgpt.com/backend-api/conversations?limit=20&__cf_chl_tk=fixture"))
+        let response = try XCTUnwrap(HTTPURLResponse(url: responseURL, statusCode: 200,
+                                                   httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        XCTAssertEqual(child.dataVerificationResponsePolicy(response), .cancel)
+        waitUntil { delegate.reloads == 1 && !controller.webView.isLoading }
+        XCTAssertEqual(controller.dataVerificationLastResponseStatus["/backend-api/conversations"], 200)
+        try evaluate("""
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;
+        fetch('/backend-api/conversations?limit=20');fetch('/backend-api/models');'requested';
+        """, in: controller)
+        waitUntil { controller.dataLoadState.responseStatus["/backend-api/conversations"] == 403 }
+        settle()
+        XCTAssertNil(controller.dataVerificationWindow)
+        XCTAssertEqual(controller.dataVerificationAttemptedPaths, ["/backend-api/conversations"])
+        XCTAssertTrue(controller.dataVerificationAutomaticAttempted)
     }
 
     func testAuthenticationJSONIsCancelledBeforeDisplayOrDownload() throws {
