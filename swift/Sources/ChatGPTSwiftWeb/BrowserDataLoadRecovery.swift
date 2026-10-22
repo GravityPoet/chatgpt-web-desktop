@@ -15,7 +15,7 @@ struct BrowserDataLoadState {
 /// Never transport request headers, cookies, or successful authentication response bodies.
 struct BrowserDataChallengeDocument {
     static let maximumBytes = 131_072
-    static let headerNames = ["content-type", "cf-mitigated", "cf-ray", "content-security-policy",
+    static let headerNames = ["date", "content-type", "cf-mitigated", "cf-ray", "content-security-policy",
                               "content-security-policy-report-only", "referrer-policy", "cross-origin-embedder-policy",
                               "cross-origin-opener-policy", "cross-origin-resource-policy", "origin-agent-cluster",
                               "x-content-type-options", "x-frame-options", "permissions-policy", "cache-control"]

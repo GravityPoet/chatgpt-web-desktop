@@ -328,11 +328,12 @@ final class DataLoadRecoveryTests: XCTestCase {
     }
 
     func testChallengeDocumentRejectsForeignOriginJSONAndOversizedBodies() throws {
-        let headers = ["content-type":"text/html; charset=UTF-8", "cf-mitigated":"challenge",
+        let headers = ["date":"Thu, 22 Oct 2026 20:35:52 GMT", "content-type":"text/html; charset=UTF-8", "cf-mitigated":"challenge",
                        "content-security-policy":"default-src 'self'; script-src 'nonce-fixture'"]
         let payload: [String: Any] = ["url":"https://chatgpt.com/backend-api/models?fixture=original",
                                       "status":403, "headers":headers, "html":"<html>fixture challenge</html>"]
         let document = try XCTUnwrap(BrowserDataChallengeDocument(payload: payload, pageURL: page, path: "/backend-api/models"))
+        XCTAssertEqual(document.response.value(forHTTPHeaderField: "Date"), headers["date"])
         XCTAssertEqual(document.response.value(forHTTPHeaderField: "Content-Security-Policy"), headers["content-security-policy"])
         for (key, value) in [("url", "https://example.com/backend-api/models" as Any),
                              ("url", "https://chatgpt.com/backend-api/me" as Any),
