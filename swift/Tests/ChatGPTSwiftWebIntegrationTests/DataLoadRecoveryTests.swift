@@ -20,17 +20,20 @@ final class DataLoadRecoveryTests: XCTestCase {
         controller.webView.configuration.userContentController.removeAllUserScripts()
         controller.webView.configuration.userContentController.addUserScript(WKUserScript(source: """
         window.__fixtureRequests=[];window.__fixtureStatus=200;window.__fixtureChallenge=false;
+        window.__fixtureChallengeBody='<html><head></head><body id="cf-challenge-running">Fixture browser check</body></html>';
         window.fetch=function(input,options){
           const url=typeof input==='string' || input instanceof URL?String(input):input.url;
           const method=options?.method || input?.method || 'GET';
           window.__fixtureRequests.push({url,method});
-          const headers=window.__fixtureChallenge?{'cf-mitigated':'challenge'}:{};
-          window.__fixturePromise=Promise.resolve(new Response('fixture response body',{status:window.__fixtureStatus,headers}));
+          const headers=window.__fixtureChallenge?{'cf-mitigated':'challenge','Content-Type':'text/html'}:{'Content-Type':'application/json'};
+          if(window.__fixtureChallenge && window.__fixtureChallengeCSP)headers['Content-Security-Policy']=window.__fixtureChallengeCSP;
+          window.__fixturePromise=Promise.resolve(window.__fixtureResponse || new Response(window.__fixtureChallenge?window.__fixtureChallengeBody:'fixture response body',{status:window.__fixtureStatus,headers}));
           return window.__fixturePromise;
         };
         window.XMLHttpRequest=class extends EventTarget {
-          constructor(){super();this.status=200;this.header='';}
-          open(){} getResponseHeader(){return this.header;}
+          constructor(){super();this.status=200;this.header='';this.responseType='';this.responseText=window.__fixtureChallengeBody;}
+          open(method,url){this.responseURL=new URL(url,location.href).href;}
+          getResponseHeader(name){return name==='cf-mitigated'?this.header:(name==='content-type'?(this.header==='challenge'?'text/html':'application/json'):null);}
         };
         """, injectionTime: .atDocumentStart, forMainFrameOnly: true))
         scripts.forEach { controller.webView.configuration.userContentController.addUserScript($0) }
@@ -218,6 +221,135 @@ final class DataLoadRecoveryTests: XCTestCase {
         XCTAssertTrue(controller.finishDataVerificationIfReady())
         XCTAssertTrue(finished)
         XCTAssertTrue(controller.dataLoadState.hasFailure)
+    }
+
+    func testVerifierExecutesOriginalChallengedHTMLWithoutUnauthenticatedRefetch() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        window.__fixtureChallengeBody='<html><head></head><body id="cf-challenge-running"><script>window.originalChallengeExecuted=true;<\\/script>Original challenge fixture</body></html>';
+        document.querySelector('textarea').value='保留原网页草稿';
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;
+        fetch('/backend-api/models?fixture=original').then(response=>response.text()).then(body=>{window.originalResponseReadable=body.includes('Original challenge fixture');});'requested';
+        """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        waitUntil { !child.webView.isLoading }
+        guard controller.dataVerificationWindow === child else {
+            return XCTFail("A new unauthenticated request closed the verifier before the original challenge ran")
+        }
+        XCTAssertEqual(try evaluate("window.originalChallengeExecuted === true", in: child) as? Bool, true)
+        XCTAssertEqual(try evaluate("location.origin + location.pathname + location.search", in: child) as? String,
+                       "https://chatgpt.com/backend-api/models?fixture=original")
+        XCTAssertEqual(try evaluate("typeof window.__chatgptSwiftDataLoadMonitor", in: child) as? String, "undefined")
+        XCTAssertEqual(try evaluate("window.originalResponseReadable", in: controller) as? Bool, true)
+        XCTAssertEqual(try evaluate("document.querySelector('textarea').value", in: controller) as? String, "保留原网页草稿")
+        XCTAssertFalse(controller.diagnosticsReport().contains("Original challenge fixture"))
+    }
+
+    func testUnchallenged401CannotClaimVerificationFinishedOrDisplayAuthenticationJSON() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        settle()
+        controller.dataLoadState.requiresVerification = true
+        controller.openDataVerificationWindow()
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        child.webView.stopLoading()
+        var completed = false
+        child.dataVerificationCompleted = { completed = true }
+        let response = try XCTUnwrap(HTTPURLResponse(url: XCTUnwrap(child.dataVerificationURL), statusCode: 401,
+                                                   httpVersion: nil, headerFields: ["Content-Type":"application/json"]))
+        XCTAssertFalse(child.dataVerificationChallengeSeen)
+        XCTAssertEqual(child.dataVerificationResponsePolicy(response), .cancel)
+        settle()
+        XCTAssertFalse(completed)
+        XCTAssertTrue(controller.dataLoadState.requiresVerification)
+    }
+
+    func testOriginalChallengeRetainsItsContentSecurityPolicy() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        window.__fixtureChallengeCSP="default-src 'none'; script-src 'nonce-fixture'";
+        window.__fixtureChallengeBody='<html><head></head><body id="cf-challenge-running"><script nonce="fixture">window.allowedChallengeScript=true;<\\/script><script>window.disallowedChallengeScript=true;<\\/script>Challenge CSP fixture</body></html>';
+        window.__fixtureStatus=403;window.__fixtureChallenge=true;fetch('/backend-api/models');'requested';
+        """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        waitUntil { !child.webView.isLoading }
+        XCTAssertEqual(try evaluate("window.allowedChallengeScript === true", in: child) as? Bool, true)
+        XCTAssertEqual(try evaluate("window.disallowedChallengeScript === true", in: child) as? Bool, false)
+    }
+
+    func testOriginalXHRChallengeExecutesWithoutIssuingAnotherAPIRequest() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        const xhr=new XMLHttpRequest();
+        xhr.open('GET','/backend-api/accounts/check/v4-fixture');
+        xhr.status=403;xhr.header='challenge';
+        xhr.responseText='<html><head></head><body id="cf-challenge-running"><script>window.originalXHRChallengeExecuted=true;<\\/script>XHR challenge fixture</body></html>';
+        xhr.dispatchEvent(new Event('load'));'requested';
+        """, in: controller)
+        waitUntil { controller.dataVerificationWindow != nil }
+        let child = try XCTUnwrap(controller.dataVerificationWindow)
+        waitUntil { !child.webView.isLoading }
+        XCTAssertEqual(try evaluate("window.originalXHRChallengeExecuted === true", in: child) as? Bool, true)
+        XCTAssertEqual(child.webView.url?.path, "/backend-api/accounts/check/v4-fixture")
+    }
+
+    func testChallengeDocumentRejectsForeignOriginJSONAndOversizedBodies() throws {
+        let headers = ["content-type":"text/html; charset=UTF-8", "cf-mitigated":"challenge",
+                       "content-security-policy":"default-src 'self'; script-src 'nonce-fixture'"]
+        let payload: [String: Any] = ["url":"https://chatgpt.com/backend-api/models?fixture=original",
+                                      "status":403, "headers":headers, "html":"<html>fixture challenge</html>"]
+        let document = try XCTUnwrap(BrowserDataChallengeDocument(payload: payload, pageURL: page, path: "/backend-api/models"))
+        XCTAssertEqual(document.response.value(forHTTPHeaderField: "Content-Security-Policy"), headers["content-security-policy"])
+        for (key, value) in [("url", "https://example.com/backend-api/models" as Any),
+                             ("url", "https://chatgpt.com/backend-api/me" as Any),
+                             ("status", 200 as Any),
+                             ("html", String(repeating: "界", count: BrowserDataChallengeDocument.maximumBytes / 2) as Any),
+                             ("headers", ["content-type":"application/json", "cf-mitigated":"challenge"] as Any),
+                             ("headers", ["content-type":"text/html"] as Any),
+                             ("headers", headers.merging(["set-cookie":"fixture=private"]) { _, new in new } as Any)] {
+            var invalid = payload
+            invalid[key] = value
+            XCTAssertNil(BrowserDataChallengeDocument(payload: invalid, pageURL: page, path: "/backend-api/models"))
+        }
+    }
+
+    func testOrdinaryAuthenticationResponseIsNeverClonedForVerification() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        window.fixtureCloneCount=0;
+        const originalClone=Response.prototype.clone;
+        Response.prototype.clone=function(){window.fixtureCloneCount++;return originalClone.call(this);};
+        fetch('/api/auth/session');'requested';
+        """, in: controller)
+        waitUntil { controller.dataLoadState.responseStatus["/api/auth/session"] == 200 }
+        XCTAssertEqual(try evaluate("window.fixtureCloneCount", in: controller) as? Int, 0)
+        XCTAssertNil(controller.dataVerificationWindow)
+    }
+
+    func testLateChallengeBodyCannotOverrideNewerSuccessfulResponse() throws {
+        let controller = makeController()
+        defer { controller.dispose() }
+        try evaluate("""
+        (()=>{
+          const stream=new ReadableStream({start(reader){window.fixtureChallengeWriter=reader;}});
+          window.__fixtureResponse=new Response(stream,{status:403,headers:{'cf-mitigated':'challenge','content-type':'text/html'}});
+          fetch('/backend-api/models');
+          window.__fixtureResponse=null;
+          fetch('/backend-api/models');
+          setTimeout(()=>{fixtureChallengeWriter.enqueue(new TextEncoder().encode(window.__fixtureChallengeBody));fixtureChallengeWriter.close();},100);
+          return 'requested';
+        })()
+        """, in: controller)
+        waitUntil { controller.dataLoadState.responseStatus["/backend-api/models"] == 200 }
+        settle()
+        XCTAssertFalse(controller.dataLoadState.requiresVerification)
+        XCTAssertNil(controller.dataVerificationWindow)
     }
 
     func testAuthenticationJSONIsCancelledBeforeDisplayOrDownload() throws {

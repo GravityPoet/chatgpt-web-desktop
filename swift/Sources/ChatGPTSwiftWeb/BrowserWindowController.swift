@@ -91,6 +91,9 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
     var dataVerificationAutomaticAttempted = false
     var dataVerificationChallengeSeen = false
     var dataVerificationRecoveryPaths = Set<String>()
+    var dataVerificationChallengeDocument: BrowserDataChallengeDocument?
+    var dataVerificationSource = "none"
+    var dataVerificationLastResponseStatus: [String: Int] = [:]
     var dataVerificationResponseReady = false
     var dataVerificationCompleted: (() -> Void)?
     private var dataVerificationContent: NSView?
@@ -486,9 +489,10 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
             ("dataVerificationPresentation", dataVerificationContent == nil ? "none" : "in-window"),
             ("dataVerificationReloadPending", String(dataVerificationReloadURL != nil)),
             ("dataVerificationAutomaticAttempted", String(dataVerificationAutomaticAttempted)),
-            ("dataVerificationChallengeSeen", String(dataVerificationChallengeSeen)),
+            ("dataVerificationChallengeSeen", String(dataVerificationWindow?.dataVerificationChallengeSeen ?? dataVerificationChallengeSeen)),
+            ("dataVerificationSource", dataVerificationSource),
             ("dataVerificationRecoveryPaths", dataVerificationRecoveryPaths.sorted().joined(separator: ", ")),
-            ("dataVerificationResponseStatus", dataVerificationWindow?.dataLoadState.responseStatus.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ") ?? ""),
+            ("dataVerificationResponseStatus", (dataVerificationWindow?.dataLoadState.responseStatus ?? dataVerificationLastResponseStatus).map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ", ")),
             ("assistantResponseInProgress", isAssistantResponseInProgress ? "true" : "false"),
             ("lastCompletionObservation", lastCompletionObservationSummary),
             ("lastBackgroundCompletionNotificationAt", Self.diagnosticDateString(lastBackgroundCompletionNotificationAt)),
@@ -884,6 +888,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         dataVerificationTargetPath = nil
         dataVerificationResponseReady = false
         dataVerificationReloadURL = nil
+        dataVerificationChallengeDocument = nil
         dataVerificationAutoOpenGeneration &+= 1
         dataVerificationAutoOpenWorkItem?.cancel()
         dataVerificationAutoOpenWorkItem = nil
@@ -1216,6 +1221,7 @@ final class BrowserWindowController: NSObject, NSWindowDelegate, NSToolbarDelega
         dismissDataVerification()
         let isVerificationRecoveryNavigation = dataVerificationReloadURL != nil
         dataVerificationReloadURL = nil
+        dataVerificationChallengeDocument = nil
         if !isVerificationRecoveryNavigation {
             dataVerificationAutomaticAttempted = false
             dataVerificationRecoveryPaths.removeAll()

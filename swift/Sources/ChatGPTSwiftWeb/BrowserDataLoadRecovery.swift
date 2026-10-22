@@ -11,6 +11,35 @@ struct BrowserDataLoadState {
     var summary: String { failures.isEmpty ? "ChatGPT 数据" : failures.joined(separator: "、") }
 }
 
+/// The actual challenged response, kept only in memory within its account's WebKit session.
+/// Never transport request headers, cookies, or successful authentication response bodies.
+struct BrowserDataChallengeDocument {
+    static let maximumBytes = 131_072
+    static let headerNames = ["content-type", "cf-mitigated", "cf-ray", "content-security-policy",
+                              "content-security-policy-report-only", "referrer-policy", "cross-origin-embedder-policy",
+                              "cross-origin-opener-policy", "cross-origin-resource-policy", "origin-agent-cluster",
+                              "x-content-type-options", "x-frame-options", "permissions-policy", "cache-control"]
+    let response: HTTPURLResponse
+    let data: Data
+
+    init?(payload: [String: Any], pageURL: URL, path: String) {
+        guard let rawURL = payload["url"] as? String, rawURL.utf8.count <= 4096,
+              let url = URL(string: rawURL), url.scheme == "https", url.host == pageURL.host,
+              (url.port ?? 443) == (pageURL.port ?? 443), url.user == nil, url.password == nil,
+              url.fragment == nil, url.path == path, BrowserWindowController.isAllowedDataVerificationPath(path),
+              payload["status"] as? Int == 403,
+              let headers = payload["headers"] as? [String: String], headers.count <= Self.headerNames.count,
+              headers.allSatisfy({ Self.headerNames.contains($0.key) && !$0.value.contains("\r") && !$0.value.contains("\n") }),
+              headers.reduce(0, { $0 + $1.value.utf8.count }) <= 16_384,
+              headers["cf-mitigated"]?.lowercased() == "challenge",
+              headers["content-type"]?.lowercased().split(separator: ";").first?.trimmingCharacters(in: .whitespaces) == "text/html",
+              let html = payload["html"] as? String, !html.isEmpty, html.utf8.count <= Self.maximumBytes,
+              let response = HTTPURLResponse(url: url, statusCode: 403, httpVersion: nil, headerFields: headers) else { return nil }
+        self.response = response
+        data = Data(html.utf8)
+    }
+}
+
 extension BrowserWindowController {
     func handleDataLoadMessage(_ message: WKScriptMessage) {
         guard !isDisposing, ProfileStore.pendingDataMutation == nil,
@@ -32,6 +61,11 @@ extension BrowserWindowController {
             let paths = payload["challengedPaths"] as? [String] ?? [dataLoadState.verificationPath]
             guard paths.count <= 16, paths.allSatisfy(Self.isAllowedDataVerificationPath) else { return }
             dataVerificationRecoveryPaths.formUnion(paths)
+        }
+        if dataVerificationURL == nil, let pageURL = webView.url {
+            dataVerificationChallengeDocument = (payload["challengeDocument"] as? [String: Any]).flatMap {
+                BrowserDataChallengeDocument(payload: $0, pageURL: pageURL, path: dataLoadState.verificationPath)
+            }
         }
         updateDataLoadState(failures: failures, challenged: challenged)
     }
@@ -141,7 +175,8 @@ extension BrowserWindowController {
         components.path = dataLoadState.verificationPath
         components.query = nil
         components.fragment = nil
-        guard let verificationURL = components.url else { return }
+        let document = dataVerificationChallengeDocument
+        guard let verificationURL = document?.response.url ?? components.url else { return }
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = webView.configuration.websiteDataStore
         configuration.applicationNameForUserAgent = webView.configuration.applicationNameForUserAgent
@@ -157,11 +192,12 @@ extension BrowserWindowController {
         child.webView.customUserAgent = webView.customUserAgent
         child.dataVerificationURL = verificationURL
         child.dataVerificationTargetPath = dataLoadState.verificationPath
-        // The challenge may already have run in the original document. A direct 401
-        // here is the origin's API response without the frontend's bearer header.
-        child.dataVerificationChallengeSeen = dataLoadState.requiresVerification
+        // A new unauthenticated navigation can return 401 without ever running the
+        // original fetch challenge. Only an observed challenge counts as evidence.
         child.dataVerificationCompleted = { [weak self, weak child] in
             guard let self, let child, self.dataVerificationWindow === child else { return }
+            self.dataVerificationLastResponseStatus = child.dataLoadState.responseStatus
+            self.dataVerificationChallengeSeen = child.dataVerificationChallengeSeen
             self.dismissDataVerification()
             guard !self.isDisposing, self.webView.url == original,
                   ProfileStore.pendingDataMutation == nil else { return }
@@ -170,6 +206,9 @@ extension BrowserWindowController {
             self.resumeDataRecoveryWhenIdle()
         }
         dataVerificationWindow = child
+        dataVerificationSource = document == nil ? "navigation-fallback" : "original-response"
+        dataVerificationLastResponseStatus = [:]
+        dataVerificationChallengeDocument = nil
         dataVerificationAutomaticAttempted = true
         dataVerificationRecoveryPaths.insert(dataLoadState.verificationPath)
         dataVerificationAutoOpenWorkItem = nil
@@ -181,7 +220,17 @@ extension BrowserWindowController {
             forMainFrameOnly: true
         ))
         presentDataVerification(child)
-        child.webView.load(URLRequest(url: verificationURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30))
+        let request = URLRequest(url: verificationURL, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        if let document {
+            // Render the response already received by the authenticated page. This public
+            // WebKit API retains its HTTPS origin and headers without issuing another GET.
+            child.noteDataVerificationResponse(document.response)
+            child.recordCloudflareChallengeResponse(document.response)
+            child.beginCloudflareChallenge(reason: "原始数据请求的挑战页面")
+            child.webView.loadSimulatedRequest(request, response: document.response, responseData: document.data)
+        } else {
+            child.webView.load(request)
+        }
     }
 
     func resumeDataRecoveryWhenIdle() {
@@ -233,7 +282,19 @@ extension BrowserWindowController {
 
     func dataVerificationResponsePolicy(_ response: HTTPURLResponse) -> WKNavigationResponsePolicy? {
         noteDataVerificationResponse(response)
-        guard dataVerificationResponseReady else { return nil }
+        guard dataVerificationResponseReady else {
+            guard response.mimeType?.lowercased() == "application/json" else { return nil }
+            if response.statusCode == 401 {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let parent = self.dataVerificationParent,
+                          parent.dataVerificationWindow === self else { return }
+                    parent.dataVerificationLastResponseStatus = self.dataLoadState.responseStatus
+                    parent.dataVerificationChallengeSeen = self.dataVerificationChallengeSeen
+                    parent.dismissDataVerification()
+                }
+            }
+            return .cancel
+        }
         // Authentication JSON can contain session material. Finish from headers and cancel
         // this navigation before WebKit can render or download any response body.
         DispatchQueue.main.async { [weak self] in _ = self?.finishDataVerificationIfReady() }
@@ -354,13 +415,17 @@ extension BrowserWindowController {
          !['chatgpt.com','chat.openai.com'].includes(host) || window.__chatgptSwiftDataLoadMonitor) return;
       const readFailures=()=>\(dataLoadFailureProbeScript);
       const allowedPath=new RegExp('\(dataVerificationPathPattern)');
+      // Verification API documents must run the site's original browser code untouched.
+      if(allowedPath.test(location.pathname)) return;
       const blocked=()=>location.pathname.startsWith('/cdn-cgi/') || !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
-      const challenges=new Set(),statuses={};let timer=0,last='',disposed=false,observer;
+      const challenges=new Set(),statuses={},documents=new Map(),pending=new Set(),revisions=new Map();let timer=0,last='',disposed=false,observer;
+      const maximumBytes=\(BrowserDataChallengeDocument.maximumBytes);
+      const headerNames=['\(BrowserDataChallengeDocument.headerNames.joined(separator: "','"))'];
       const report=()=>{
-        timer=0;if(disposed || blocked()) return;
+        timer=0;if(disposed || blocked() || pending.size) return;
         const paths=[...challenges];
         const verificationPath=paths.find(path=>path==='/api/auth/session') || paths.find(path=>path.startsWith('/backend-api/accounts/check/')) || paths[0] || '/backend-api/models';
-        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,challengedPaths:paths,verificationPath,statuses};
+        const payload={path:location.pathname,failures:readFailures(),challenged:challenges.size>0,challengedPaths:paths,verificationPath,statuses,challengeDocument:documents.get(verificationPath)};
         const key=JSON.stringify(payload);if(key===last) return;last=key;
         try{window.webkit.messageHandlers.dataLoad.postMessage(payload);}catch(_){}
       };
@@ -371,17 +436,38 @@ extension BrowserWindowController {
       };
       const observeResponse=(path,status,header)=>{
         if(!path || disposed) return;
+        const revision=(revisions.get(path)||0)+1;revisions.set(path,revision);
+        documents.delete(path);pending.delete(path);
         if(Object.keys(statuses).length<16 || path in statuses) statuses[path]=status;
         if(String(header||'').toLowerCase()==='challenge') challenges.add(path);
         else if(status>=200 && status<300) challenges.delete(path);
         schedule();
+        return revision;
+      };
+      const challengeDocument=(url,status,getHeader,html)=>({url,status,html,headers:Object.fromEntries(headerNames.map(name=>[name,getHeader(name)]).filter(([,value])=>value))});
+      const readChallengeHTML=async response=>{
+        if(!response.body || Number(response.headers.get('content-length'))>maximumBytes) return;
+        const reader=response.body.getReader(),decoder=new TextDecoder();let timer,bytes=0,text='';
+        const read=async()=>{
+          for(;;){const {done,value}=await reader.read();if(done)return text+decoder.decode();
+            bytes+=value.byteLength;if(bytes>maximumBytes)return;text+=decoder.decode(value,{stream:true});}
+        };
+        try{return await Promise.race([read(),new Promise(resolve=>{timer=setTimeout(()=>resolve(undefined),2000);})]);}
+        finally{clearTimeout(timer);reader.cancel().catch(()=>{});}
       };
       const originalFetch=window.fetch;
       const monitoredFetch=function(...args){
         const promise=Reflect.apply(originalFetch,this,args);
         try{
-          const request=args[0],path=responsePath(typeof request==='string' || request instanceof URL?String(request):request.url,args[1]?.method || request?.method);
-          if(path) promise.then(response=>observeResponse(path,response.status,response.headers.get('cf-mitigated'))).catch(()=>{});
+          const request=args[0],raw=typeof request==='string' || request instanceof URL?String(request):request.url,path=responsePath(raw,args[1]?.method || request?.method);
+          if(path) promise.then(async response=>{
+            const header=response.headers.get('cf-mitigated'),revision=observeResponse(path,response.status,header);
+            if(disposed || response.status!==403 || String(header).toLowerCase()!=='challenge' || !/^text\\/html(?:;|$)/i.test(response.headers.get('content-type')||''))return;
+            pending.add(path);
+            try{const html=await readChallengeHTML(response.clone());
+              if(!disposed && revisions.get(path)===revision && html)documents.set(path,challengeDocument(response.url||new URL(raw,location.href).href,response.status,name=>response.headers.get(name),html));}
+            finally{if(revisions.get(path)===revision)pending.delete(path);schedule();}
+          }).catch(()=>{});
         }catch(_){}
         return promise;
       };
@@ -391,8 +477,15 @@ extension BrowserWindowController {
       const monitoredOpen=function(method,url,...rest){
         const result=Reflect.apply(originalOpen,this,[method,url,...rest]);
         const path=responsePath(url,method);
-        if(!xhrPaths.has(this)) this.addEventListener('load',()=>observeResponse(xhrPaths.get(this),this.status,this.getResponseHeader('cf-mitigated')));
-        xhrPaths.set(this,path);
+        if(!xhrPaths.has(this)) this.addEventListener('load',()=>{
+          const entry=xhrPaths.get(this);if(!entry)return;
+          const header=this.getResponseHeader('cf-mitigated');observeResponse(entry.path,this.status,header);
+          if(!disposed && this.status===403 && String(header).toLowerCase()==='challenge' && /^text\\/html(?:;|$)/i.test(this.getResponseHeader('content-type')||'') && ['', 'text'].includes(this.responseType||'')){
+            const html=this.responseText;
+            if(html && new TextEncoder().encode(html).byteLength<=maximumBytes)documents.set(entry.path,challengeDocument(this.responseURL||entry.url,this.status,name=>this.getResponseHeader(name),html));
+          }
+        });
+        xhrPaths.set(this,path?{path,url:new URL(url,location.href).href}:null);
         return result;
       };
       XMLHttpRequest.prototype.open=monitoredOpen;
