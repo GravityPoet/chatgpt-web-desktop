@@ -262,6 +262,25 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(restored["parentHeight"] as? Double ?? -1, 26.0, accuracy: 1)
     }
 
+    func testEmptyDecoratedComposerRemainsCompact() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.emptyDecoratedComposerHTML, includeComposerLayoutFix: true)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        settle(0.4)
+        let report = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]'), parent=editor.parentElement;
+          const r=editor.getBoundingClientRect();
+          return {text:editor.textContent || '',height:r.height,parentHeight:parent.getBoundingClientRect().height,
+            indicator:!!document.querySelector('#chatgpt-swift-composer-scrollbar')};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["text"] as? String, "")
+        XCTAssertEqual(report["height"] as? Double ?? -1, 26.0, accuracy: 1)
+        XCTAssertEqual(report["parentHeight"] as? Double ?? -1, 26.0, accuracy: 1)
+        XCTAssertEqual(report["indicator"] as? Bool, false)
+    }
+
     func testChallengePageSkipsAuxiliaryObserversAndIsReportedAsChallenge() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let harness = try makeHarness(sink: sink, html: Self.challengePageHTML)
@@ -918,6 +937,15 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
       #row { display:flex; height:26px; overflow:hidden; }
       #prompt-textarea { display:block; width:545px; height:26px; overflow:hidden; font:16px/26px sans-serif; }
     </style></head><body><div id="shell"><div id="row"><div id="prompt-textarea" role="textbox" contenteditable="true" aria-multiline="true"></div></div></div></body></html>
+    """
+
+    private static let emptyDecoratedComposerHTML = """
+    <!doctype html><html><head><style>
+      html,body { margin:0; padding:0; }
+      #shell { position:absolute; left:50px; top:80px; width:545px; height:52px; overflow:hidden; }
+      #row { display:flex; height:26px; overflow:hidden; }
+      #prompt-textarea { display:block; width:545px; height:26px; overflow:hidden; font:16px/26px sans-serif; }
+    </style></head><body><div id="shell"><div id="row"><div id="prompt-textarea" role="textbox" contenteditable="true" aria-multiline="true"><p><br></p><div class="placeholder-decoration"></div></div></div></div></body></html>
     """
 
     private static let roleTextboxComposerHTML = """

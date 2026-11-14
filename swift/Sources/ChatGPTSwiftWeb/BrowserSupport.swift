@@ -1895,7 +1895,12 @@ let composerLayoutFixScript = #"""
     }
     return chain;
   };
-  const shouldFix = (editor, text) => !!editor && (text.length > 48 || /\\n/.test(text) || editor.childElementCount > 1);
+  const shouldFix = (editor, text) => {
+    if (!editor) return false;
+    const actual = text.replace(/[\\u200B\\uFEFF]/g, '');
+    const meaningful = actual.trim();
+    return meaningful.length > 48 || (meaningful.length > 0 && /\\n/.test(actual));
+  };
   const currentHeight = (editor, chain) => {
     const editorRect = editor.getBoundingClientRect();
     const parentRects = chain.slice(1).filter(el => getComputedStyle(el).display !== 'contents').map(el => el.getBoundingClientRect());
