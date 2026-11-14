@@ -220,6 +220,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
           const parents=[]; for(let n=editor.parentElement;n&&parents.length<3;n=n.parentElement){const r=n.getBoundingClientRect();parents.push([r.height,getComputedStyle(n).overflowY]);}
           const r=editor.getBoundingClientRect();
           return {text:editor.textContent.length,height:r.height,scrollHeight:editor.scrollHeight,scrollTop:editor.scrollTop,
+            editorRight:r.right,shellRight:document.querySelector('#shell').getBoundingClientRect().right,
             overflowY:getComputedStyle(editor).overflowY,parents};
         })()
         """, in: harness.webView)
@@ -228,6 +229,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertLessThanOrEqual(layout["height"] as? Double ?? 999, 220)
         XCTAssertEqual(layout["overflowY"] as? String, "auto")
         XCTAssertGreaterThan(layout["scrollHeight"] as? Double ?? 0, layout["height"] as? Double ?? 0)
+        XCTAssertEqual(layout["editorRight"] as? Double ?? -1, layout["shellRight"] as? Double ?? -2, accuracy: 1)
         for parent in layout["parents"] as? [[Any]] ?? [] {
             XCTAssertGreaterThan(parent.first as? Double ?? 0, 26)
             XCTAssertEqual(parent.dropFirst().first as? String, "visible")

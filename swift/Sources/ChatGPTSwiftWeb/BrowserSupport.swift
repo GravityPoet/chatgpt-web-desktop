@@ -1881,7 +1881,12 @@ let composerLayoutFixScript = #"""
         const intrinsic = Math.max(editor.scrollHeight, editor.getBoundingClientRect().height, minimumHeight);
         const height = Math.min(maximumHeight, Math.max(minimumHeight, Math.ceil(intrinsic)));
         write(editor, 'height', `${height}px`);
-        write(editor, 'width', '100%');
+        const shell = chain.slice(1).find(parent => parent.querySelector(controlSelector)) || chain[1];
+        const editorRect = editor.getBoundingClientRect();
+        const shellRect = shell?.getBoundingClientRect();
+        const scaleX = editorRect.width / (editor.offsetWidth || editorRect.width || 1);
+        const shellWidth = shellRect ? Math.max(editorRect.width, shellRect.right - editorRect.left) : editorRect.width;
+        write(editor, 'width', `${Math.ceil(shellWidth / scaleX)}px`);
         write(editor, 'max-width', 'none');
         write(editor, 'min-height', `${minimumHeight}px`);
         write(editor, 'max-height', `${maximumHeight}px`);
