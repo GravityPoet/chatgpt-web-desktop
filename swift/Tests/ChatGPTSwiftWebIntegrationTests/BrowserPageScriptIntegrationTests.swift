@@ -222,7 +222,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
           const track=document.querySelector('#chatgpt-swift-composer-scrollbar'), thumb=track?.firstElementChild;
           return {text:editor.textContent.length,height:r.height,scrollHeight:editor.scrollHeight,scrollTop:editor.scrollTop,
             editorRight:r.right,shellRight:document.querySelector('#shell').getBoundingClientRect().right,
-            scrollbarRight:track?.getBoundingClientRect().right ?? -1,scrollbarWidth:track?.getBoundingClientRect().width ?? 0,thumbHeight:thumb?.getBoundingClientRect().height ?? 0,
+            scrollbarRight:track?.getBoundingClientRect().right ?? -1,scrollbarWidth:track?.getBoundingClientRect().width ?? 0,thumbHeight:thumb?.getBoundingClientRect().height ?? 0,scrollbarTrackColor:track ? getComputedStyle(track).backgroundColor : '',
             overflowY:getComputedStyle(editor).overflowY,parents};
         })()
         """, in: harness.webView)
@@ -235,6 +235,7 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(layout["scrollbarRight"] as? Double ?? -1, layout["shellRight"] as? Double ?? -2, accuracy: 10)
         XCTAssertGreaterThanOrEqual(layout["scrollbarWidth"] as? Double ?? 0, 10)
         XCTAssertGreaterThanOrEqual(layout["thumbHeight"] as? Double ?? 0, 36)
+        XCTAssertTrue(["rgba(0, 0, 0, 0)", "transparent"].contains(layout["scrollbarTrackColor"] as? String ?? ""))
         for parent in layout["parents"] as? [[Any]] ?? [] {
             XCTAssertGreaterThan(parent.first as? Double ?? 0, 26)
             XCTAssertEqual(parent.dropFirst().first as? String, "visible")

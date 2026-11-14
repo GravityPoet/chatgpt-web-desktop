@@ -1794,7 +1794,7 @@ let composerLayoutFixScript = #"""
         height: 14px !important;
       }
       [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-track {
-        background: rgba(0,0,0,.06) !important;
+        background: transparent !important;
         border-radius: 999px !important;
       }
       [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-thumb {
@@ -1816,15 +1816,14 @@ let composerLayoutFixScript = #"""
         width: 10px !important;
         z-index: 2147483000 !important;
         border-radius: 999px !important;
-        background: rgba(0,0,0,.08) !important;
+        background: transparent !important;
         pointer-events: none !important;
       }
       #chatgpt-swift-composer-scrollbar > div {
         width: 10px !important;
         min-height: 36px !important;
         border-radius: 999px !important;
-        background: rgba(0,0,0,.48) !important;
-        box-shadow: 0 0 0 1px rgba(255,255,255,.24) !important;
+        background: rgba(0,0,0,.34) !important;
       }
       #chatgpt-swift-composer-scrollbar[hidden] {
         display: none !important;
@@ -1932,8 +1931,8 @@ let composerLayoutFixScript = #"""
       track.id = 'chatgpt-swift-composer-scrollbar';
       track.setAttribute('role', 'presentation');
       track.innerHTML = '<div></div>';
-      track.style.cssText = 'display:block !important; position:absolute !important; top:12px !important; right:8px !important; bottom:52px !important; width:10px !important; z-index:2147483000 !important; border-radius:999px !important; background:rgba(0,0,0,.08) !important; pointer-events:none !important;';
-      track.firstElementChild.style.cssText = 'width:10px !important; min-height:36px !important; border-radius:999px !important; background:rgba(0,0,0,.48) !important; box-shadow:0 0 0 1px rgba(255,255,255,.24) !important;';
+      track.style.cssText = 'display:block !important; position:absolute !important; top:12px !important; right:8px !important; bottom:52px !important; width:10px !important; z-index:2147483000 !important; border-radius:999px !important; background:transparent !important; pointer-events:none !important;';
+      track.firstElementChild.style.cssText = 'width:10px !important; min-height:36px !important; border-radius:999px !important; background:rgba(0,0,0,.34) !important;';
       shell.appendChild(track);
       activeScrollbar = track;
     }
