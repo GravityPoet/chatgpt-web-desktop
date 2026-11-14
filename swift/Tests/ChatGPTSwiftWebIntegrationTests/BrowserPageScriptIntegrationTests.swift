@@ -219,8 +219,10 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
           const editor=document.querySelector('[role="textbox"]');
           const parents=[]; for(let n=editor.parentElement;n&&parents.length<3;n=n.parentElement){const r=n.getBoundingClientRect();parents.push([r.height,getComputedStyle(n).overflowY]);}
           const r=editor.getBoundingClientRect();
+          const track=document.querySelector('#chatgpt-swift-composer-scrollbar'), thumb=track?.firstElementChild;
           return {text:editor.textContent.length,height:r.height,scrollHeight:editor.scrollHeight,scrollTop:editor.scrollTop,
             editorRight:r.right,shellRight:document.querySelector('#shell').getBoundingClientRect().right,
+            scrollbarRight:track?.getBoundingClientRect().right ?? -1,scrollbarWidth:track?.getBoundingClientRect().width ?? 0,thumbHeight:thumb?.getBoundingClientRect().height ?? 0,
             overflowY:getComputedStyle(editor).overflowY,parents};
         })()
         """, in: harness.webView)
@@ -230,6 +232,9 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(layout["overflowY"] as? String, "auto")
         XCTAssertGreaterThan(layout["scrollHeight"] as? Double ?? 0, layout["height"] as? Double ?? 0)
         XCTAssertEqual(layout["editorRight"] as? Double ?? -1, layout["shellRight"] as? Double ?? -2, accuracy: 1)
+        XCTAssertEqual(layout["scrollbarRight"] as? Double ?? -1, layout["shellRight"] as? Double ?? -2, accuracy: 10)
+        XCTAssertGreaterThanOrEqual(layout["scrollbarWidth"] as? Double ?? 0, 10)
+        XCTAssertGreaterThanOrEqual(layout["thumbHeight"] as? Double ?? 0, 36)
         for parent in layout["parents"] as? [[Any]] ?? [] {
             XCTAssertGreaterThan(parent.first as? Double ?? 0, 26)
             XCTAssertEqual(parent.dropFirst().first as? String, "visible")

@@ -1785,9 +1785,9 @@ let composerLayoutFixScript = #"""
   const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
   const controlSelector = '#composer-plus-btn,button[data-testid="composer-plus-btn"],button[data-testid="send-button"],button[aria-label*="添加"],button[aria-label*="模型"],button[aria-label*="听写"],button[aria-label*="发送"],button[aria-label*="Send"],button[aria-label*="Dictate"]';
   const ensureScrollbarStyle = () => {
-    if (document.getElementById('chatgpt-swift-composer-scrollbar')) return;
+    if (document.getElementById('chatgpt-swift-composer-scrollbar-style')) return;
     const style = document.createElement('style');
-    style.id = 'chatgpt-swift-composer-scrollbar';
+    style.id = 'chatgpt-swift-composer-scrollbar-style';
     style.textContent = `
       [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar {
         width: 14px !important;
@@ -1807,6 +1807,27 @@ let composerLayoutFixScript = #"""
       [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-thumb:hover {
         background: rgba(0,0,0,.58) !important;
         background-clip: content-box !important;
+      }
+      #chatgpt-swift-composer-scrollbar {
+        position: absolute !important;
+        top: 12px !important;
+        right: 8px !important;
+        bottom: 52px !important;
+        width: 10px !important;
+        z-index: 2147483000 !important;
+        border-radius: 999px !important;
+        background: rgba(0,0,0,.08) !important;
+        pointer-events: none !important;
+      }
+      #chatgpt-swift-composer-scrollbar > div {
+        width: 10px !important;
+        min-height: 36px !important;
+        border-radius: 999px !important;
+        background: rgba(0,0,0,.48) !important;
+        box-shadow: 0 0 0 1px rgba(255,255,255,.24) !important;
+      }
+      #chatgpt-swift-composer-scrollbar[hidden] {
+        display: none !important;
       }
     `;
     (document.head || document.documentElement).appendChild(style);
@@ -1835,6 +1856,7 @@ let composerLayoutFixScript = #"""
   const findEditor = () => candidates().find(visible) || null;
   const saved = new Map();
   let activeEditor = null, activeChain = [], scheduled = 0, applying = false;
+  let activeShell = null, activeScrollbar = null, scrollBoundEditor = null;
   let lastKey = '', lastHeight = 0;
   const remember = (el, property) => {
     let values = saved.get(el);
@@ -1855,8 +1877,15 @@ let composerLayoutFixScript = #"""
     el.removeAttribute('data-chatgpt-swift-composer-layout');
     saved.delete(el);
   };
+  const removeScrollbar = () => {
+    activeScrollbar?.remove();
+    activeScrollbar = null;
+    activeShell = null;
+    scrollBoundEditor = null;
+  };
   const restoreAll = () => {
     for (const el of saved.keys()) restore(el);
+    removeScrollbar();
     activeEditor = null; activeChain = []; lastKey = ''; lastHeight = 0;
   };
   const chainFor = editor => {
@@ -1872,6 +1901,48 @@ let composerLayoutFixScript = #"""
     const editorRect = editor.getBoundingClientRect();
     const parentRects = chain.slice(1).filter(el => getComputedStyle(el).display !== 'contents').map(el => el.getBoundingClientRect());
     return Math.min(editorRect.height, ...parentRects.map(rect => rect.height));
+  };
+  const updateScrollbar = () => {
+    if (!activeScrollbar || !activeEditor || !activeShell) return;
+    const thumb = activeScrollbar.firstElementChild;
+    const trackHeight = activeScrollbar.clientHeight;
+    const scrollRange = activeEditor.scrollHeight - activeEditor.clientHeight;
+    if (!thumb || trackHeight <= 0 || scrollRange <= 0) {
+      if (activeScrollbar) {
+        activeScrollbar.hidden = true;
+        activeScrollbar.style.setProperty('display', 'none', 'important');
+      }
+      return;
+    }
+    activeScrollbar.hidden = false;
+    activeScrollbar.style.setProperty('display', 'block', 'important');
+    const thumbHeight = Math.max(36, Math.round(trackHeight * activeEditor.clientHeight / activeEditor.scrollHeight));
+    const travel = Math.max(0, trackHeight - thumbHeight);
+    const top = Math.round(travel * activeEditor.scrollTop / scrollRange);
+    thumb.style.height = `${thumbHeight}px`;
+    thumb.style.transform = `translateY(${top}px)`;
+  };
+  const ensureScrollbar = (editor, shell) => {
+    if (!shell || getComputedStyle(shell).display === 'contents') return;
+    if (activeScrollbar && activeShell !== shell) removeScrollbar();
+    activeShell = shell;
+    if (!activeScrollbar) {
+      write(shell, 'position', 'relative');
+      const track = document.createElement('div');
+      track.id = 'chatgpt-swift-composer-scrollbar';
+      track.setAttribute('role', 'presentation');
+      track.innerHTML = '<div></div>';
+      track.style.cssText = 'display:block !important; position:absolute !important; top:12px !important; right:8px !important; bottom:52px !important; width:10px !important; z-index:2147483000 !important; border-radius:999px !important; background:rgba(0,0,0,.08) !important; pointer-events:none !important;';
+      track.firstElementChild.style.cssText = 'width:10px !important; min-height:36px !important; border-radius:999px !important; background:rgba(0,0,0,.48) !important; box-shadow:0 0 0 1px rgba(255,255,255,.24) !important;';
+      shell.appendChild(track);
+      activeScrollbar = track;
+    }
+    if (scrollBoundEditor !== editor) {
+      scrollBoundEditor?.removeEventListener('scroll', updateScrollbar);
+      editor.addEventListener('scroll', updateScrollbar, { passive: true });
+      scrollBoundEditor = editor;
+    }
+    updateScrollbar();
   };
   const sync = reason => {
     if (scheduled || blocked()) return;
@@ -1921,6 +1992,7 @@ let composerLayoutFixScript = #"""
         write(editor, 'overflow-y', intrinsic > maximumHeight ? 'auto' : 'hidden');
         ensureScrollbarStyle();
         editor.setAttribute('data-chatgpt-swift-composer-layout', 'active');
+        ensureScrollbar(editor, shell);
         for (let index = 1; index < chain.length; index++) {
           const parent = chain[index];
           if (getComputedStyle(parent).display === 'contents') continue;
@@ -1935,9 +2007,11 @@ let composerLayoutFixScript = #"""
           write(parent, 'overflow-y', 'visible');
           parent.setAttribute('data-chatgpt-swift-composer-layout', 'active');
         }
+        updateScrollbar();
         editor.scrollTop = editor.scrollHeight;
         activeChain = chain;
         lastKey = key; lastHeight = height;
+        setTimeout(updateScrollbar, 0);
       } finally {
         applying = false;
       }
