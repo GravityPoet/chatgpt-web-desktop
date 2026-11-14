@@ -179,6 +179,81 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(sink.payload(named: "completionState")?["busy"] as? Bool, true)
     }
 
+    func testDraftCaptureSupportsRoleTextboxComposer() throws {
+        let promptExpectation = expectation(description: "role textbox draft bridged")
+        let sink = ScriptMessageSink(expectations: ["promptDraft": promptExpectation])
+        let harness = try makeHarness(sink: sink, html: Self.roleTextboxComposerHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        _ = try dictionaryResult("""
+        (() => {
+          const composer=document.querySelector('[role="textbox"]');
+          composer.textContent='role textbox draft';
+          composer.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+          return {length:composer.textContent.length};
+        })()
+        """, in: harness.webView)
+        wait(for: [promptExpectation], timeout: 3)
+        XCTAssertEqual(sink.payload(named: "promptDraft")?["text"] as? String, "role textbox draft")
+    }
+
+    func testComposerLayoutShowsLongRoleTextboxAndKeepsItScrollable() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.collapsedComposerHTML, includeComposerLayoutFix: true)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+
+        let text = String(repeating: "这是一段很长的本地草稿，用来验证 WebKit 输入框不会被裁成空白。", count: 40)
+        let literal = try XCTUnwrap(String(data: try XCTUnwrap(JSONEncoder().encode(text)), encoding: .utf8))
+        let report = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]');
+          editor.textContent=\(literal);
+          editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText'}));
+          return {length:editor.textContent.length};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["length"] as? Int, text.count)
+        settle(0.4)
+        let layout = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]');
+          const parents=[]; for(let n=editor.parentElement;n&&parents.length<3;n=n.parentElement){const r=n.getBoundingClientRect();parents.push([r.height,getComputedStyle(n).overflowY]);}
+          const r=editor.getBoundingClientRect();
+          return {text:editor.textContent.length,height:r.height,scrollHeight:editor.scrollHeight,scrollTop:editor.scrollTop,
+            overflowY:getComputedStyle(editor).overflowY,parents};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(layout["text"] as? Int, text.count)
+        XCTAssertGreaterThan(layout["height"] as? Double ?? 0, 26)
+        XCTAssertLessThanOrEqual(layout["height"] as? Double ?? 999, 220)
+        XCTAssertEqual(layout["overflowY"] as? String, "auto")
+        XCTAssertGreaterThan(layout["scrollHeight"] as? Double ?? 0, layout["height"] as? Double ?? 0)
+        for parent in layout["parents"] as? [[Any]] ?? [] {
+            XCTAssertGreaterThan(parent.first as? Double ?? 0, 26)
+            XCTAssertEqual(parent.dropFirst().first as? String, "visible")
+        }
+
+        let cleared = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]');
+          editor.textContent='';
+          editor.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'deleteContentBackward'}));
+          return {length:editor.textContent.length};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(cleared["length"] as? Int, 0)
+        settle(0.4)
+        let restored = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]'), parent=editor.parentElement;
+          const r=editor.getBoundingClientRect();
+          return {height:r.height,overflowY:getComputedStyle(editor).overflowY,parentHeight:parent.getBoundingClientRect().height,parentOverflow:getComputedStyle(parent).overflowY};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(restored["height"] as? Double ?? -1, 26.0, accuracy: 1)
+        XCTAssertEqual(restored["parentHeight"] as? Double ?? -1, 26.0, accuracy: 1)
+    }
+
     func testChallengePageSkipsAuxiliaryObserversAndIsReportedAsChallenge() throws {
         let sink = ScriptMessageSink(expectations: [:])
         let harness = try makeHarness(sink: sink, html: Self.challengePageHTML)
@@ -738,7 +813,8 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         sink: ScriptMessageSink,
         html: String,
         baseURL: URL? = URL(string: "https://chatgpt.com/"),
-        includeConversationNavigator: Bool = false
+        includeConversationNavigator: Bool = false,
+        includeComposerLayoutFix: Bool = false
     ) throws -> WebViewHarness {
         let controller = WKUserContentController()
         controller.add(sink, name: "promptDraft")
@@ -749,6 +825,9 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
             controller.addUserScript(WKUserScript(source: BrowserWindowController.conversationNavigatorScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         }
         controller.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        if includeComposerLayoutFix {
+            controller.addUserScript(WKUserScript(source: composerLayoutFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
         controller.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
             source: BrowserWindowController.promptDraftCaptureScript,
@@ -822,6 +901,19 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     <!doctype html><html><body>
       <main style="width:600px;height:400px"><textarea></textarea></main>
     </body></html>
+    """
+
+    private static let collapsedComposerHTML = """
+    <!doctype html><html><head><style>
+      html,body { margin:0; padding:0; }
+      #shell { position:absolute; left:50px; top:80px; width:545px; height:52px; overflow:hidden; }
+      #row { display:flex; height:26px; overflow:hidden; }
+      #prompt-textarea { display:block; width:545px; height:26px; overflow:hidden; font:16px/26px sans-serif; }
+    </style></head><body><div id="shell"><div id="row"><div id="prompt-textarea" role="textbox" contenteditable="true" aria-multiline="true"></div></div></div></body></html>
+    """
+
+    private static let roleTextboxComposerHTML = """
+    <!doctype html><html><body><main><div role="textbox" contenteditable="true" aria-multiline="true"></div></main></body></html>
     """
 
 

@@ -7,21 +7,36 @@ extension BrowserWindowController {
         guard !isDisposing, Self.canInjectPromptContent(into: webView.url) else { return }
         // Inspect capture availability only; never include the draft or other page content.
         webView.evaluateJavaScript(#"""
-        (() => ({
-          installed: !!window.__chatgptSwiftPromptDraftBridgeInstalled,
-          bridge: !!window.webkit?.messageHandlers?.promptDraft,
-          knownComposer: !!document.querySelector('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"]'),
-          editableTextbox: !!document.querySelector('[role="textbox"][contenteditable="true"]'),
-          textarea: !!document.querySelector('textarea'),
-          ...window.__chatgptSwiftDraftUI?.diagnostics()
-        }))()
+        (() => {
+          const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
+          const describe = node => {
+            if (!node) return null;
+            const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
+            return {tag:node.tagName,id:node.id || '',rect:[Math.round(rect.x),Math.round(rect.y),Math.round(rect.width),Math.round(rect.height)],
+              client:[node.clientWidth,node.clientHeight],scroll:[node.scrollWidth,node.scrollHeight,node.scrollTop],display:style.display,
+              visibility:style.visibility,opacity:style.opacity,color:style.color,fill:style.webkitTextFillColor,
+              overflow:style.overflow,overflowY:style.overflowY,position:style.position,transform:style.transform,
+              maxHeight:style.maxHeight,height:style.height};
+          };
+          const candidates=[...document.querySelectorAll(selector)];
+          const active=candidates.find(node=>{const r=node.getBoundingClientRect(),s=getComputedStyle(node);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';}) || candidates[0] || null;
+          const ancestors=[]; for(let n=active,i=0;n&&i<7;n=n.parentElement,i++) ancestors.push(describe(n));
+          return {installed:!!window.__chatgptSwiftPromptDraftBridgeInstalled,bridge:!!window.webkit?.messageHandlers?.promptDraft,
+            knownComposer:!!document.querySelector('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]'),
+            editableTextbox:!!document.querySelector('[role="textbox"][contenteditable="true"]'),textarea:!!document.querySelector('textarea'),
+            candidateSummary:JSON.stringify({candidates:candidates.map(node=>({attrs:[...node.attributes].map(a=>[a.name,a.value]),summary:describe(node)})),ancestors}),
+            ...window.__chatgptSwiftDraftUI?.diagnostics()};
+        })()
         """#) { [weak self] result, error in
             guard let self, !self.isDisposing else { return }
-            guard error == nil, let values = result as? [String: Bool] else {
+            guard error == nil, let values = result as? [String: Any] else {
                 self.draftCaptureDiagnostics = "页面捕获状态不可用"
                 return
             }
-            self.draftCaptureDiagnostics = values.keys.sorted().map { "\($0)=\(values[$0]!)" }.joined(separator: ", ")
+            self.draftCaptureDiagnostics = values.keys.sorted().compactMap { key in
+                guard let value=values[key], !(value is [Any]), !(value is [String:Any]) else { return nil }
+                return "\(key)=\(value)"
+            }.joined(separator: ", ")
         }
     }
 
@@ -95,7 +110,7 @@ extension BrowserWindowController {
       const blocked = () => location.pathname.startsWith('/cdn-cgi/') || !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
       if (!trusted || blocked() || window.__chatgptSwiftPromptDraftBridgeInstalled) return;
       window.__chatgptSwiftPromptDraftBridgeInstalled = true;
-      const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"]';
+      const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
       let composer = null, state = { enabled:window.__chatgptSwiftDraftEnabled !== false, pageStateEnabled:window.__chatgptSwiftPersistent !== false, path:location.pathname };
       let pendingInput = null, timer = 0, composing = false, bootstrap = null;
       const textOf = element => {

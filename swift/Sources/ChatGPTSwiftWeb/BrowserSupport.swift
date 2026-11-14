@@ -1769,6 +1769,174 @@ let chatDialogDismissalRecoveryScript = #"""
 """#
 
 // Keep only the composer upload menu aligned with its button and outside the draft.
+// WebKit can leave ChatGPT's ProseMirror editor and its flex/grid wrappers at the
+// one-line height after a long input. Keep the repair local to the visible editor,
+// grow it to a bounded multiline surface, and let the editor itself scroll past the cap.
+let composerLayoutFixScript = #"""
+(() => {
+  const host = location.hostname.toLowerCase();
+  if (window !== window.top || location.protocol !== 'https:' ||
+      (location.port && location.port !== '443') ||
+      !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
+  if (window.__chatgptSwiftComposerLayout) return;
+  const blocked = () => location.pathname.startsWith('/cdn-cgi/') ||
+    !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
+  const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
+  const minimumHeight = 26;
+  const maximumHeight = 220;
+  const visible = el => {
+    if (!el?.isConnected || el.closest('[hidden],[inert],[aria-hidden="true"],[data-state="closed"]')) return false;
+    const rect = el.getBoundingClientRect(), style = getComputedStyle(el);
+    return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  };
+  const textOf = element => {
+    if (!element) return '';
+    if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) return element.value || '';
+    const read = node => {
+      if (node.nodeType === Node.TEXT_NODE) return node.nodeValue || '';
+      if (!(node instanceof Element)) return '';
+      if (node.tagName === 'BR') return '\\n';
+      let result = Array.from(node.childNodes, read).join('');
+      if (/^(P|DIV|LI|PRE)$/.test(node.tagName) && node !== element) result += '\\n';
+      return result;
+    };
+    return read(element).replace(/\\n$/, '');
+  };
+  const candidates = () => Array.from(document.querySelectorAll(selector));
+  const findEditor = () => candidates().find(visible) || null;
+  const saved = new Map();
+  let activeEditor = null, activeChain = [], scheduled = 0, applying = false;
+  let lastKey = '', lastHeight = 0;
+  const remember = (el, property) => {
+    let values = saved.get(el);
+    if (!values) { values = new Map(); saved.set(el, values); }
+    if (!values.has(property)) values.set(property, [el.style.getPropertyValue(property), el.style.getPropertyPriority(property)]);
+  };
+  const write = (el, property, value) => {
+    remember(el, property);
+    if (el.style.getPropertyValue(property) !== value || el.style.getPropertyPriority(property) !== 'important') {
+      el.style.setProperty(property, value, 'important');
+    }
+  };
+  const restore = el => {
+    for (const [property, [value, priority]] of saved.get(el) || []) {
+      if (value) el.style.setProperty(property, value, priority);
+      else el.style.removeProperty(property);
+    }
+    el.removeAttribute('data-chatgpt-swift-composer-layout');
+    saved.delete(el);
+  };
+  const restoreAll = () => {
+    for (const el of saved.keys()) restore(el);
+    activeEditor = null; activeChain = []; lastKey = ''; lastHeight = 0;
+  };
+  const chainFor = editor => {
+    const chain = [];
+    for (let node = editor, i = 0; node && i < 7; node = node.parentElement, i++) {
+      chain.push(node);
+      if (node === document.body || node === document.documentElement) break;
+    }
+    return chain;
+  };
+  const shouldFix = (editor, text) => !!editor && (text.length > 48 || /\\n/.test(text) || editor.childElementCount > 1);
+  const currentHeight = (editor, chain) => {
+    const editorRect = editor.getBoundingClientRect();
+    const parentRects = chain.slice(1).filter(el => getComputedStyle(el).display !== 'contents').map(el => el.getBoundingClientRect());
+    return Math.min(editorRect.height, ...parentRects.map(rect => rect.height));
+  };
+  const sync = reason => {
+    if (scheduled || blocked()) return;
+    scheduled = setTimeout(() => {
+      scheduled = 0;
+      if (blocked() || applying) return;
+      const editor = findEditor();
+      if (!editor) { if (activeEditor) restoreAll(); return; }
+      if (editor !== activeEditor) { if (activeEditor) restoreAll(); activeEditor = editor; }
+      const text = textOf(editor);
+      if (!shouldFix(editor, text)) { if (saved.size) restoreAll(); return; }
+      const chain = chainFor(editor);
+      const key = `${text.length}:${text.slice(-32)}`;
+      if (key === lastKey && lastHeight > 0 && currentHeight(editor, chain) >= lastHeight - 1) return;
+      applying = true;
+      try {
+        // First release the fixed one-line constraints so scrollHeight reflects the
+        // actual wrapped content. The final height is then capped below.
+        write(editor, 'box-sizing', 'border-box');
+        write(editor, 'white-space', 'pre-wrap');
+        write(editor, 'overflow-wrap', 'anywhere');
+        write(editor, 'word-break', 'break-word');
+        write(editor, 'height', 'auto');
+        write(editor, 'max-height', 'none');
+        write(editor, 'overflow', 'visible');
+        for (const parent of chain.slice(1)) {
+          if (getComputedStyle(parent).display === 'contents') continue;
+          write(parent, 'height', 'auto');
+          write(parent, 'max-height', 'none');
+          write(parent, 'min-height', '0');
+          write(parent, 'overflow', 'visible');
+          write(parent, 'overflow-y', 'visible');
+        }
+        const intrinsic = Math.max(editor.scrollHeight, editor.getBoundingClientRect().height, minimumHeight);
+        const height = Math.min(maximumHeight, Math.max(minimumHeight, Math.ceil(intrinsic)));
+        write(editor, 'height', `${height}px`);
+        write(editor, 'min-height', `${minimumHeight}px`);
+        write(editor, 'max-height', `${maximumHeight}px`);
+        write(editor, 'overflow-x', 'hidden');
+        write(editor, 'overflow-y', intrinsic > maximumHeight ? 'auto' : 'hidden');
+        editor.setAttribute('data-chatgpt-swift-composer-layout', 'active');
+        for (let index = 1; index < chain.length; index++) {
+          const parent = chain[index];
+          if (getComputedStyle(parent).display === 'contents') continue;
+          const extra = index >= 4 ? 16 : 8;
+          write(parent, 'height', 'auto');
+          write(parent, 'min-height', `${height + extra}px`);
+          write(parent, 'max-height', `${maximumHeight + extra}px`);
+          write(parent, 'overflow', 'visible');
+          write(parent, 'overflow-y', 'visible');
+          parent.setAttribute('data-chatgpt-swift-composer-layout', 'active');
+        }
+        editor.scrollTop = editor.scrollHeight;
+        activeChain = chain;
+        lastKey = key; lastHeight = height;
+      } finally {
+        applying = false;
+      }
+    });
+  };
+  const observer = new MutationObserver(records => {
+    if (applying) return;
+    for (const record of records) {
+      if (record.type === 'characterData' || record.type === 'childList') { sync('mutation'); return; }
+      if (record.type === 'attributes' && (record.target.matches?.(selector) || activeChain.includes(record.target))) { sync('attribute'); return; }
+      for (const node of record.addedNodes || []) {
+        if (node.nodeType === 1 && (node.matches?.(selector) || node.querySelector?.(selector))) { sync('editor-added'); return; }
+      }
+    }
+  });
+  observer.observe(document.documentElement, {childList:true, subtree:true, characterData:true, attributes:true, attributeFilter:['style','class','hidden','aria-hidden','data-state']});
+  const resize = new ResizeObserver(() => { if (!applying && activeEditor) sync('resize'); });
+  const observeResize = () => { resize.disconnect(); if (activeEditor) [activeEditor, ...activeChain.slice(1, 4)].forEach(el => resize.observe(el)); };
+  document.addEventListener('input', event => { if (event.target instanceof Element && event.target.matches(selector)) { activeEditor = event.target; observeResize(); sync('input'); } }, true);
+  document.addEventListener('focusin', event => { if (event.target instanceof Element && event.target.matches(selector)) { activeEditor = event.target; observeResize(); sync('focus'); } }, true);
+  window.addEventListener('resize', () => sync('window-resize'));
+  window.visualViewport?.addEventListener('resize', () => sync('viewport-resize'));
+  window.__chatgptSwiftComposerLayout = {
+    sync,
+    diagnostics: () => {
+      const editor = activeEditor || findEditor();
+      if (!editor) return {active:false};
+      const rect = editor.getBoundingClientRect();
+      return {active:editor.getAttribute('data-chatgpt-swift-composer-layout') === 'active', textLength:textOf(editor).length,
+        rect:[Math.round(rect.x),Math.round(rect.y),Math.round(rect.width),Math.round(rect.height)],
+        client:[editor.clientWidth,editor.clientHeight],scroll:[editor.scrollWidth,editor.scrollHeight,editor.scrollTop],
+        overflowY:getComputedStyle(editor).overflowY,ancestors:chainFor(editor).slice(1,7).map(el => {const r=el.getBoundingClientRect(); return [Math.round(r.width),Math.round(r.height),getComputedStyle(el).overflowY];})};
+    }
+  };
+  window.addEventListener('pagehide', () => { clearTimeout(scheduled); observer.disconnect(); resize.disconnect(); });
+})();
+"""#
+
 let composerPlusPopoverFixScript = #"""
 (() => {
   const host = location.hostname.toLowerCase();
