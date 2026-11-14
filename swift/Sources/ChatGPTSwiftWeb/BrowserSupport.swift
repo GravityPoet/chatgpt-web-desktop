@@ -1784,6 +1784,33 @@ let composerLayoutFixScript = #"""
     !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
   const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
   const controlSelector = '#composer-plus-btn,button[data-testid="composer-plus-btn"],button[data-testid="send-button"],button[aria-label*="添加"],button[aria-label*="模型"],button[aria-label*="听写"],button[aria-label*="发送"],button[aria-label*="Send"],button[aria-label*="Dictate"]';
+  const ensureScrollbarStyle = () => {
+    if (document.getElementById('chatgpt-swift-composer-scrollbar')) return;
+    const style = document.createElement('style');
+    style.id = 'chatgpt-swift-composer-scrollbar';
+    style.textContent = `
+      [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar {
+        width: 14px !important;
+        height: 14px !important;
+      }
+      [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-track {
+        background: rgba(0,0,0,.06) !important;
+        border-radius: 999px !important;
+      }
+      [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-thumb {
+        min-height: 42px !important;
+        background: rgba(0,0,0,.42) !important;
+        border: 2px solid transparent !important;
+        border-radius: 999px !important;
+        background-clip: content-box !important;
+      }
+      [data-chatgpt-swift-composer-layout="active"]::-webkit-scrollbar-thumb:hover {
+        background: rgba(0,0,0,.58) !important;
+        background-clip: content-box !important;
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  };
   const minimumHeight = 26;
   const maximumHeight = 220;
   const visible = el => {
@@ -1892,6 +1919,7 @@ let composerLayoutFixScript = #"""
         write(editor, 'max-height', `${maximumHeight}px`);
         write(editor, 'overflow-x', 'hidden');
         write(editor, 'overflow-y', intrinsic > maximumHeight ? 'auto' : 'hidden');
+        ensureScrollbarStyle();
         editor.setAttribute('data-chatgpt-swift-composer-layout', 'active');
         for (let index = 1; index < chain.length; index++) {
           const parent = chain[index];
