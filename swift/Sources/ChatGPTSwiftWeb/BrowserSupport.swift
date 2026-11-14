@@ -1783,6 +1783,7 @@ let composerLayoutFixScript = #"""
   const blocked = () => location.pathname.startsWith('/cdn-cgi/') ||
     !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
   const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
+  const controlSelector = '#composer-plus-btn,button[data-testid="composer-plus-btn"],button[data-testid="send-button"],button[aria-label*="添加"],button[aria-label*="模型"],button[aria-label*="听写"],button[aria-label*="发送"],button[aria-label*="Send"],button[aria-label*="Dictate"]';
   const minimumHeight = 26;
   const maximumHeight = 220;
   const visible = el => {
@@ -1880,6 +1881,8 @@ let composerLayoutFixScript = #"""
         const intrinsic = Math.max(editor.scrollHeight, editor.getBoundingClientRect().height, minimumHeight);
         const height = Math.min(maximumHeight, Math.max(minimumHeight, Math.ceil(intrinsic)));
         write(editor, 'height', `${height}px`);
+        write(editor, 'width', '100%');
+        write(editor, 'max-width', 'none');
         write(editor, 'min-height', `${minimumHeight}px`);
         write(editor, 'max-height', `${maximumHeight}px`);
         write(editor, 'overflow-x', 'hidden');
@@ -1888,7 +1891,10 @@ let composerLayoutFixScript = #"""
         for (let index = 1; index < chain.length; index++) {
           const parent = chain[index];
           if (getComputedStyle(parent).display === 'contents') continue;
-          const extra = index >= 4 ? 16 : 8;
+          // A real composer shell also owns the bottom control row. Reserve its
+          // 36px row plus breathing room, otherwise the controls stay below the
+          // rounded shell after the editor grows.
+          const extra = parent.querySelector(controlSelector) ? 52 : 8;
           write(parent, 'height', 'auto');
           write(parent, 'min-height', `${height + extra}px`);
           write(parent, 'max-height', `${maximumHeight + extra}px`);
