@@ -218,6 +218,18 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(settled["work"] as? Bool, true)
     }
 
+    func testWorkComposerLayoutLeavesOfficialSurfaceUntouched() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.workModeComposerHTML, includeComposerLayoutFix: true)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        let text = String(repeating: "工作模式长文本", count: 40)
+        let literal = try XCTUnwrap(String(data: try XCTUnwrap(JSONEncoder().encode(text)), encoding: .utf8))
+        _ = try stringResult("(() => { const editor=document.querySelector('[role=\"textbox\"]'); editor.textContent=\(literal); editor.dispatchEvent(new InputEvent('input',{bubbles:true})); return 'ok'; })()", in: harness.webView)
+        settle(0.4)
+        XCTAssertEqual(try stringResult("document.querySelector('[role=\"textbox\"]')?.getAttribute('data-chatgpt-swift-composer-layout') || ''", in: harness.webView), "")
+        XCTAssertEqual(try stringResult("String(!!document.querySelector('#chatgpt-swift-composer-scrollbar'))", in: harness.webView), "false")
+    }
+
     func testComposerLayoutShowsLongRoleTextboxAndKeepsItScrollable() throws {
         let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.collapsedComposerHTML, includeComposerLayoutFix: true)
         defer { harness.close() }
@@ -974,9 +986,14 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     """
 
     private static let workModeComposerHTML = """
-    <!doctype html><html><body>
+    <!doctype html><html><head><style>
+      html,body { margin:0; padding:0; }
+      #shell { position:absolute; left:50px; top:80px; width:545px; height:130px; }
+      #editor-row { height:78px; padding:12px 18px; box-sizing:border-box; }
+      #editor { display:block; width:509px; height:52px; }
+    </style></head><body>
       <button role="switch" aria-label="工作" aria-checked="true">工作</button>
-      <main><div role="textbox" contenteditable="true" aria-label="使用 ChatGPT Work" aria-multiline="true"> </div></main>
+      <main><div id="shell"><div id="editor-row"><div id="editor" role="textbox" contenteditable="true" aria-label="使用 ChatGPT Work" aria-multiline="true"> </div></div><button>工具</button></div></main>
     </body></html>
     """
 

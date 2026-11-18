@@ -1853,6 +1853,7 @@ let composerLayoutFixScript = #"""
   };
   const candidates = () => Array.from(document.querySelectorAll(selector));
   const findEditor = () => candidates().find(visible) || null;
+  const isWorkEditor = editor => /(?:工作|work)/i.test(String(editor?.getAttribute('aria-label') || ''));
   const saved = new Map();
   let activeEditor = null, activeChain = [], scheduled = 0, applying = false;
   let activeShell = null, activeScrollbar = null, scrollBoundEditor = null;
@@ -1956,6 +1957,11 @@ let composerLayoutFixScript = #"""
       const editor = findEditor();
       if (!editor) { if (activeEditor) restoreAll(); return; }
       if (editor !== activeEditor) { if (activeEditor) restoreAll(); activeEditor = editor; }
+      // ChatGPT Work has its own composer layout, including the reasoning
+      // control row. Leave that official surface untouched; this compatibility
+      // repair is only for the Chat composer whose long drafts can collapse in
+      // WebKit.
+      if (isWorkEditor(editor)) { if (saved.size) restoreAll(); return; }
       const text = textOf(editor);
       if (!shouldFix(editor, text)) { if (saved.size) restoreAll(); return; }
       const chain = chainFor(editor);
