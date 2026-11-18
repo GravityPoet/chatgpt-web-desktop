@@ -127,9 +127,18 @@ extension BrowserWindowController {
         };
         return read(element).replace(/\n$/, '');
       };
+      const workModeActive = () => {
+        if (composer && /(?:工作|work)/i.test(String(composer.getAttribute('aria-label') || ''))) return true;
+        return Array.from(document.querySelectorAll('button,[role="button"],[role="tab"],[role="switch"]')).some(element => {
+        const label = String(element.getAttribute('aria-label') || element.textContent || '').trim();
+        if (!/^(工作|Work)$/i.test(label)) return false;
+        return element.getAttribute('aria-pressed') === 'true' || element.getAttribute('aria-selected') === 'true' ||
+          element.getAttribute('aria-checked') === 'true' || element.getAttribute('data-state') === 'on' || element.classList.contains('active');
+        });
+      };
       const post = payload => { if (blocked()) return; try { window.webkit.messageHandlers.promptDraft.postMessage(payload); } catch (_) {} };
       const focusIfIdle = () => {
-        if (state.autofocus && composer && (!document.activeElement || document.activeElement === document.body)) composer.focus({preventScroll:true});
+        if (state.autofocus && !workModeActive() && composer && (!document.activeElement || document.activeElement === document.body)) composer.focus({preventScroll:true});
       };
       const attach = () => {
         const next = document.getElementById('prompt-textarea') || document.querySelector(selector);
@@ -193,7 +202,7 @@ extension BrowserWindowController {
       },{capture:true,passive:true});
       window.addEventListener('pagehide',pageState);
       window.__chatgptSwiftDraftUI={
-        diagnostics:() => ({enabled:state.enabled,composing,attached:!!composer?.isConnected,blocked:blocked()}),
+        diagnostics:() => ({enabled:state.enabled,composing,attached:!!composer?.isConnected,blocked:blocked(),workMode:workModeActive()}),
         configure:options => {
           if(options.path!==location.pathname) return;
           if(state.path!==options.path) {flush();scrollTarget=document.scrollingElement;}

@@ -197,6 +197,27 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(sink.payload(named: "promptDraft")?["text"] as? String, "role textbox draft")
     }
 
+    func testWorkComposerSkipsAutomaticFocusAndRemainsMounted() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.workModeComposerHTML)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        let report = try dictionaryResult("""
+        (() => {
+          const editor=document.querySelector('[role="textbox"]');
+          window.__chatgptSwiftDraftUI.configure({enabled:true,path:'/',autofocus:true,pageStateEnabled:false});
+          return {mounted:editor.isConnected,focused:document.activeElement===editor};
+        })()
+        """, in: harness.webView)
+        XCTAssertEqual(report["mounted"] as? Bool, true)
+        XCTAssertEqual(report["focused"] as? Bool, false)
+        settle(1.2)
+        let settled = try dictionaryResult("""
+        (() => { const editor=document.querySelector('[role="textbox"]'); return {mounted:!!editor?.isConnected,work:window.__chatgptSwiftDraftUI.diagnostics().workMode}; })()
+        """, in: harness.webView)
+        XCTAssertEqual(settled["mounted"] as? Bool, true)
+        XCTAssertEqual(settled["work"] as? Bool, true)
+    }
+
     func testComposerLayoutShowsLongRoleTextboxAndKeepsItScrollable() throws {
         let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.collapsedComposerHTML, includeComposerLayoutFix: true)
         defer { harness.close() }
@@ -950,6 +971,13 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
 
     private static let roleTextboxComposerHTML = """
     <!doctype html><html><body><main><div role="textbox" contenteditable="true" aria-multiline="true"></div></main></body></html>
+    """
+
+    private static let workModeComposerHTML = """
+    <!doctype html><html><body>
+      <button role="switch" aria-label="工作" aria-checked="true">工作</button>
+      <main><div role="textbox" contenteditable="true" aria-label="使用 ChatGPT Work" aria-multiline="true"> </div></main>
+    </body></html>
     """
 
 
