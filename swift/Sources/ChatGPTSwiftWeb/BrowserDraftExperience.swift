@@ -8,23 +8,19 @@ extension BrowserWindowController {
         // Inspect capture availability only; never include the draft or other page content.
         webView.evaluateJavaScript(#"""
         (() => {
-          const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
-          const describe = node => {
-            if (!node) return null;
-            const rect = node.getBoundingClientRect(), style = getComputedStyle(node);
-            return {tag:node.tagName,id:node.id || '',rect:[Math.round(rect.x),Math.round(rect.y),Math.round(rect.width),Math.round(rect.height)],
-              client:[node.clientWidth,node.clientHeight],scroll:[node.scrollWidth,node.scrollHeight,node.scrollTop],display:style.display,
-              visibility:style.visibility,opacity:style.opacity,color:style.color,fill:style.webkitTextFillColor,
-              overflow:style.overflow,overflowY:style.overflowY,position:style.position,transform:style.transform,
-              maxHeight:style.maxHeight,height:style.height};
+          const e=document.querySelector('[contenteditable="true"][aria-label*="Work" i],[role="textbox"][contenteditable="true"]');
+          const b=[...document.querySelectorAll('button')].find(n=>/模型|model/i.test(n.getAttribute('aria-label') || '') && n.offsetWidth>0);
+          const key=n => n.tagName+'.'+(n.getAttribute('class') || '').slice(0,370);
+          const rect=n=>Array.from(['x','y','width','height'],k=>Math.round(n.getBoundingClientRect()[k]));
+          const data=n=>{
+            const s=getComputedStyle(n), props=['display','visibility','opacity','content-visibility','contain','container-type','position','z-index','position-visibility','position-anchor','overflow','clip','clip-path','mask-image','mask-size','filter','backdrop-filter','transform','scale','translate','perspective','backface-visibility','animation-name','animation-fill-mode','view-transition-name','will-change','isolation','mix-blend-mode','pointer-events'];
+            return [key(n),rect(n),Object.fromEntries(props.map(p=>[p,s.getPropertyValue(p)]).filter(([p,v])=> v && !['auto','visible','none','1','normal','static','no-clip'].includes(v)))];
           };
-          const candidates=[...document.querySelectorAll(selector)];
-          const active=candidates.find(node=>{const r=node.getBoundingClientRect(),s=getComputedStyle(node);return r.width>1&&r.height>1&&s.display!=='none'&&s.visibility!=='hidden';}) || candidates[0] || null;
-          const ancestors=[]; for(let n=active,i=0;n&&i<7;n=n.parentElement,i++) ancestors.push(describe(n));
-          return {installed:!!window.__chatgptSwiftPromptDraftBridgeInstalled,bridge:!!window.webkit?.messageHandlers?.promptDraft,
-            knownComposer:!!document.querySelector('#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]'),
-            editableTextbox:!!document.querySelector('[role="textbox"][contenteditable="true"]'),textarea:!!document.querySelector('textarea'),
-            candidateSummary:JSON.stringify({candidates:candidates.map(node=>({attrs:[...node.attributes].map(a=>[a.name,a.value]),summary:describe(node)})),ancestors}),
+          const ancestor=n=>{let list=[];for(;n;n=n.parentElement)list.push(data(n));return list};
+          const hits=n=>{if(!n)return [];const r=n.getBoundingClientRect();return document.elementsFromPoint(r.x+r.width/2,r.y+r.height/2).slice(0,9).map(data)};
+          return {paintReport:JSON.stringify({editor:ancestor(e),buttons:ancestor(b),hits:hits(b),editorHits:hits(e),
+            animations:document.getAnimations().filter(a=>e&&a.effect?.target?.contains?.(e)).map(a=>[key(a.effect.target),a.animationName||'',a.playState,a.currentTime]),
+            editorEmpty:e ? !e.textContent.trim():null}),
             ...window.__chatgptSwiftDraftUI?.diagnostics()};
         })()
         """#) { [weak self] result, error in

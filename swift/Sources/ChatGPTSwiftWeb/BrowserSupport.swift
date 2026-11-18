@@ -1784,6 +1784,22 @@ let composerLayoutFixScript = #"""
     !!document.querySelector('iframe[src*="challenges.cloudflare.com"],.cf-turnstile,#cf-challenge-running,#challenge-stage,[data-cf-challenge]');
   const selector = '#prompt-textarea,textarea[data-testid="prompt-textarea"],[contenteditable="true"][data-testid="prompt-textarea"],[role="textbox"][contenteditable="true"]';
   const controlSelector = '#composer-plus-btn,button[data-testid="composer-plus-btn"],button[data-testid="send-button"],button[aria-label*="添加"],button[aria-label*="模型"],button[aria-label*="听写"],button[aria-label*="发送"],button[aria-label*="Send"],button[aria-label*="Dictate"]';
+  const repairOfficialComposerPaint = (editor, chain) => {
+    // WebKit 27 can leave the stable composer layer in anchor-visible state even
+    // though the DOM and AX tree remain present. The resulting compositing layer
+    // paints the editor text and footer controls as white. Keep the official
+    // geometry and stacking intact; only neutralize the unsupported visibility
+    // hint and the editor's inherited fade mask on this local surface.
+    for (const element of chain) {
+      if (!element || getComputedStyle(element).display === 'contents') continue;
+      element.style.setProperty('position-visibility', 'always', 'important');
+      const elementStyle = getComputedStyle(element);
+      if (elementStyle.maskImage !== 'none' || elementStyle.webkitMaskImage !== 'none') {
+        element.style.setProperty('mask-image', 'none', 'important');
+        element.style.setProperty('-webkit-mask-image', 'none', 'important');
+      }
+    }
+  };
   const ensureScrollbarStyle = () => {
     if (document.getElementById('chatgpt-swift-composer-scrollbar-style')) return;
     const style = document.createElement('style');
@@ -1957,6 +1973,8 @@ let composerLayoutFixScript = #"""
       const editor = findEditor();
       if (!editor) { if (activeEditor) restoreAll(); return; }
       if (editor !== activeEditor) { if (activeEditor) restoreAll(); activeEditor = editor; }
+      const chain = chainFor(editor);
+      repairOfficialComposerPaint(editor, chain);
       // ChatGPT Work has its own composer layout, including the reasoning
       // control row. Leave that official surface untouched; this compatibility
       // repair is only for the Chat composer whose long drafts can collapse in
@@ -1964,7 +1982,6 @@ let composerLayoutFixScript = #"""
       if (isWorkEditor(editor)) { if (saved.size) restoreAll(); return; }
       const text = textOf(editor);
       if (!shouldFix(editor, text)) { if (saved.size) restoreAll(); return; }
-      const chain = chainFor(editor);
       const key = `${text.length}:${text.slice(-32)}`;
       if (key === lastKey && lastHeight > 0 && currentHeight(editor, chain) >= lastHeight - 1) return;
       applying = true;
@@ -2056,7 +2073,169 @@ let composerLayoutFixScript = #"""
         overflowY:getComputedStyle(editor).overflowY,ancestors:chainFor(editor).slice(1,7).map(el => {const r=el.getBoundingClientRect(); return [Math.round(r.width),Math.round(r.height),getComputedStyle(el).overflowY];})};
     }
   };
+  sync('init');
   window.addEventListener('pagehide', () => { clearTimeout(scheduled); observer.disconnect(); resize.disconnect(); });
+})();
+"""#
+
+// WebKit can paint the official Work composer shell with a white surface and
+// no visible edge, making it disappear against the page even though the editor
+// and its controls are mounted. Add only a subtle boundary to that shell. Do
+// not change its dimensions, overflow, children, or control row.
+let workComposerSurfaceFixScript = #"""
+(() => {
+  const host = location.hostname.toLowerCase();
+  if (window !== window.top || location.protocol !== 'https:' ||
+      (location.port && location.port !== '443') ||
+      !(host === 'chatgpt.com' || host.endsWith('.chatgpt.com') ||
+        host === 'chat.openai.com' || host.endsWith('.chat.openai.com'))) return;
+  if (window.__chatgptSwiftWorkComposerSurfaceFix) return;
+  const selector = '[role="textbox"][contenteditable="true"][aria-label*="Work" i], [role="textbox"][contenteditable="true"][aria-label*="工作"]';
+  const controlSelector = 'button[aria-label*="模型"],button[aria-label*="推理"],button[aria-label*="听写"],button[aria-label*="发送"],button[aria-label*="语音"],button[aria-label*="model" i],button[aria-label*="reason" i],button[aria-label*="dictate" i],button[aria-label*="send" i],button[aria-label*="voice" i],button[data-testid="send-button"],button[data-testid="composer-plus-btn"]';
+  const style = document.createElement('style');
+  style.id = 'chatgpt-swift-work-composer-surface';
+  style.textContent = `
+    [data-chatgpt-swift-work-surface="active"] {
+      border: 1px solid rgba(0,0,0,.12) !important;
+      box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 18px rgba(0,0,0,.025) !important;
+    }
+    [data-chatgpt-swift-work-surface="active"] button,
+    [data-chatgpt-swift-work-surface="active"] [role="button"],
+    [data-chatgpt-swift-work-surface="active"] [role="combobox"] {
+      opacity: 1 !important;
+      visibility: visible !important;
+      filter: none !important;
+      z-index: 12 !important;
+      color: rgb(13,13,13) !important;
+      -webkit-text-fill-color: currentColor !important;
+      transform: translateZ(0) !important;
+      will-change: transform !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+  const visible = element => {
+    if (!element?.isConnected || element.closest('[hidden],[inert],[aria-hidden="true"],[data-state="closed"]')) return false;
+    const rect = element.getBoundingClientRect(), style = getComputedStyle(element);
+    return rect.width > 1 && rect.height > 1 && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  };
+  const ancestors = editor => {
+    const result = [];
+    // The Work composer is nested below several layout/route wrappers. WebKit's
+    // anchor visibility state can be inherited through the whole chain, so a
+    // shallow repair leaves the outer composer surface invisible after reload.
+    for (let node = editor.parentElement, i = 0; node && i < 64; node = node.parentElement, i++) {
+      result.push(node);
+      if (node === document.body || node === document.documentElement) break;
+    }
+    return result;
+  };
+  const saved = new Map();
+  let activeShell = null, timer = 0;
+  const remember = (element, property) => {
+    let values = saved.get(element);
+    if (!values) { values = new Map(); saved.set(element, values); }
+    if (!values.has(property)) values.set(property, [element.style.getPropertyValue(property), element.style.getPropertyPriority(property)]);
+  };
+  const write = (element, property, value) => {
+    remember(element, property);
+    element.style.setProperty(property, value, 'important');
+  };
+  const restore = () => {
+    for (const [element, values] of saved) {
+      for (const [property, [value, priority]] of values) {
+        if (value) element.style.setProperty(property, value, priority);
+        else element.style.removeProperty(property);
+      }
+      element.removeAttribute('data-chatgpt-swift-work-surface');
+    }
+    saved.clear(); activeShell = null;
+  };
+  const findShell = editor => {
+    const editorRect = editor.getBoundingClientRect();
+    const candidates = ancestors(editor).filter(element => {
+      const rect = element.getBoundingClientRect();
+      return rect.width >= editorRect.width - 2 && rect.width <= editorRect.width + 48 &&
+        rect.height >= editorRect.height + 30 && rect.height <= editorRect.height + 180 && visible(element);
+    });
+    return candidates[candidates.length - 1] || null;
+  };
+  const sync = () => {
+    timer = 0;
+    const editor = Array.from(document.querySelectorAll(selector)).find(visible);
+    if (!editor) { if (activeShell) restore(); return; }
+    const shell = findShell(editor);
+    if (!shell) { if (activeShell) restore(); return; }
+    if (activeShell && activeShell !== shell) restore();
+    activeShell = shell;
+    shell.setAttribute('data-chatgpt-swift-work-surface', 'active');
+    write(shell, 'border', '1px solid rgba(0,0,0,.12)');
+    write(shell, 'box-shadow', '0 1px 2px rgba(0,0,0,.04), 0 4px 18px rgba(0,0,0,.025)');
+    write(editor, 'position-visibility', 'always');
+    const rect = shell.getBoundingClientRect();
+    const editorRect = editor.getBoundingClientRect();
+    for (const ancestor of ancestors(editor)) {
+      const r = ancestor.getBoundingClientRect(), s = getComputedStyle(ancestor);
+      if (s.display !== 'contents') write(ancestor, 'position-visibility', 'always');
+      if (r.width + 8 < editorRect.width || r.height < editorRect.height || !/(auto|scroll|clip)/.test(s.overflow)) continue;
+      write(ancestor, 'overflow', 'visible');
+      write(ancestor, 'overflow-x', 'visible');
+      write(ancestor, 'overflow-y', 'visible');
+    }
+    const allControls = Array.from(document.querySelectorAll('button,[role="button"],[role="combobox"],[aria-haspopup]'));
+    const controlVisible = element => {
+      if (!element?.isConnected) return false;
+      const r=element.getBoundingClientRect(), s=getComputedStyle(element);
+      return r.width>1 && r.height>1 && s.display!=='none' && s.visibility!=='hidden' && s.opacity!=='0';
+    };
+    for (const control of allControls.filter(controlVisible).filter(node => /模型|推理|听写|发送|语音|model|reason|dictate|send|voice/i.test(node.getAttribute('aria-label') || node.textContent?.trim() || ''))) {
+      const r = control.getBoundingClientRect();
+      if (r.left < rect.left - 8 || r.right > rect.right + 8 || r.top < rect.top || r.bottom > rect.bottom + 12) continue;
+      for (let parent = control.parentElement, depth = 0; parent && depth < 5; parent = parent.parentElement, depth++) {
+        if (parent === shell.parentElement) break;
+        write(parent, 'position', 'relative');
+        write(parent, 'z-index', '12');
+        write(parent, 'position-visibility', 'always');
+        write(parent, 'opacity', '1');
+        write(parent, 'visibility', 'visible');
+        write(parent, 'filter', 'none');
+      }
+      write(control, 'opacity', '1');
+      write(control, 'visibility', 'visible');
+      write(control, 'filter', 'none');
+      write(control, 'position', 'relative');
+      write(control, 'z-index', '12');
+      write(control, 'position-visibility', 'always');
+      write(control, 'color', 'rgb(13,13,13)');
+      if (/发送|send/i.test(control.getAttribute('aria-label') || '')) write(control, 'color', 'rgb(255,255,255)');
+      for (const child of control.querySelectorAll('*')) {
+        const childStyle = getComputedStyle(child);
+        if (childStyle.visibility === 'hidden' || childStyle.display === 'none' || childStyle.opacity === '0') continue;
+        write(child, 'transform', 'translateZ(0)');
+        write(child, '-webkit-text-fill-color', childStyle.webkitTextFillColor || childStyle.color || 'currentColor');
+      }
+    }
+  };
+  const schedule = () => { if (!timer) timer = setTimeout(sync, 0); };
+  const repaint = () => {
+    if (!activeShell?.isConnected) return;
+    void activeShell.offsetHeight;
+    activeShell.style.setProperty('transform', 'translateZ(0)', 'important');
+    requestAnimationFrame(() => { if (activeShell?.isConnected) void activeShell.getBoundingClientRect(); });
+  };
+  const observer = new MutationObserver(schedule);
+  observer.observe(document.documentElement, { childList:true, subtree:true, attributes:true,
+    attributeFilter:['aria-label','class','style','hidden','aria-hidden','data-state'] });
+  window.addEventListener('resize', schedule);
+  window.visualViewport?.addEventListener('resize', schedule);
+  document.addEventListener('toggle', () => { schedule(); setTimeout(repaint, 0); }, true);
+  document.addEventListener('click', () => { schedule(); setTimeout(repaint, 0); }, true);
+  window.__chatgptSwiftWorkComposerSurfaceFix = { sync, diagnostics: () => ({
+    active:!!activeShell?.isConnected,
+    marked:activeShell?.getAttribute('data-chatgpt-swift-work-surface') || '',
+    rect:activeShell ? (() => { const r=activeShell.getBoundingClientRect(); return [Math.round(r.x),Math.round(r.y),Math.round(r.width),Math.round(r.height)]; })() : null
+  })};
+  sync(); repaint();
+  window.addEventListener('pagehide', () => { clearTimeout(timer); observer.disconnect(); restore(); style.remove(); });
 })();
 """#
 

@@ -230,6 +230,21 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         XCTAssertEqual(try stringResult("String(!!document.querySelector('#chatgpt-swift-composer-scrollbar'))", in: harness.webView), "false")
     }
 
+    func testWorkComposerSurfaceFixOnlyAddsVisibleBoundary() throws {
+        let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.workModeComposerHTML, includeWorkComposerSurfaceFix: true)
+        defer { harness.close() }
+        wait(for: [harness.navigationExpectation], timeout: 3)
+        let report = try dictionaryResult("(() => { const editor=document.querySelector('[role=\"textbox\"]'); const shell=editor.parentElement.parentElement; const s=getComputedStyle(shell); return {border:s.border,shadow:s.boxShadow,height:s.height,width:s.width}; })()", in: harness.webView)
+        XCTAssertTrue((report["border"] as? String)?.contains("0.12") == true)
+        XCTAssertTrue((report["shadow"] as? String)?.contains("0.04") == true)
+        XCTAssertEqual(report["height"] as? String, "130px")
+        XCTAssertEqual(report["width"] as? String, "545px")
+        XCTAssertEqual(try stringResult("getComputedStyle(document.querySelector('#editor-row')).overflow", in: harness.webView), "visible")
+        XCTAssertEqual(try stringResult("getComputedStyle(document.querySelector('#editor')).positionVisibility", in: harness.webView), "always")
+        XCTAssertEqual(try stringResult("getComputedStyle(document.querySelector('#shell')).positionVisibility", in: harness.webView), "always")
+        XCTAssertEqual(try stringResult("getComputedStyle(document.querySelector('#deep-wrapper-12')).positionVisibility", in: harness.webView), "always")
+    }
+
     func testComposerLayoutShowsLongRoleTextboxAndKeepsItScrollable() throws {
         let harness = try makeHarness(sink: ScriptMessageSink(expectations: [:]), html: Self.collapsedComposerHTML, includeComposerLayoutFix: true)
         defer { harness.close() }
@@ -874,7 +889,8 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         html: String,
         baseURL: URL? = URL(string: "https://chatgpt.com/"),
         includeConversationNavigator: Bool = false,
-        includeComposerLayoutFix: Bool = false
+        includeComposerLayoutFix: Bool = false,
+        includeWorkComposerSurfaceFix: Bool = false
     ) throws -> WebViewHarness {
         let controller = WKUserContentController()
         controller.add(sink, name: "promptDraft")
@@ -887,6 +903,9 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
         controller.addUserScript(WKUserScript(source: popoverChromeFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         if includeComposerLayoutFix {
             controller.addUserScript(WKUserScript(source: composerLayoutFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
+        }
+        if includeWorkComposerSurfaceFix {
+            controller.addUserScript(WKUserScript(source: workComposerSurfaceFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         }
         controller.addUserScript(WKUserScript(source: composerPlusPopoverFixScript, injectionTime: .atDocumentEnd, forMainFrameOnly: true))
         controller.addUserScript(WKUserScript(
@@ -989,11 +1008,11 @@ final class BrowserPageScriptIntegrationTests: XCTestCase {
     <!doctype html><html><head><style>
       html,body { margin:0; padding:0; }
       #shell { position:absolute; left:50px; top:80px; width:545px; height:130px; }
-      #editor-row { height:78px; padding:12px 18px; box-sizing:border-box; }
+      #editor-row { height:78px; padding:12px 18px; box-sizing:border-box; overflow:auto; }
       #editor { display:block; width:509px; height:52px; }
     </style></head><body>
       <button role="switch" aria-label="工作" aria-checked="true">工作</button>
-      <main><div id="shell"><div id="editor-row"><div id="editor" role="textbox" contenteditable="true" aria-label="使用 ChatGPT Work" aria-multiline="true"> </div></div><button>工具</button></div></main>
+      <main><div id="deep-wrapper-1"><div id="deep-wrapper-2"><div id="deep-wrapper-3"><div id="deep-wrapper-4"><div id="deep-wrapper-5"><div id="deep-wrapper-6"><div id="deep-wrapper-7"><div id="deep-wrapper-8"><div id="deep-wrapper-9"><div id="deep-wrapper-10"><div id="deep-wrapper-11"><div id="deep-wrapper-12"><div id="shell"><div id="editor-row"><div id="editor" role="textbox" contenteditable="true" aria-label="使用 ChatGPT Work" aria-multiline="true"> </div></div><button>工具</button></div></div></div></div></div></div></div></div></div></div></div></div></div></main>
     </body></html>
     """
 
